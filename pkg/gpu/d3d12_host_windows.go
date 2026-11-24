@@ -11,10 +11,13 @@ import (
 )
 
 var (
-	modD3D12Host            = syscall.NewLazyDLL("d3d12.dll")
-	modDXGIHost             = syscall.NewLazyDLL("dxgi.dll")
-	procD3D12CreateDevice   = modD3D12Host.NewProc("D3D12CreateDevice")
-	procCreateDXGIFactory2  = modDXGIHost.NewProc("CreateDXGIFactory2")
+	modD3D12Host           = syscall.NewLazyDLL("d3d12.dll")
+	modDXGIHost            = syscall.NewLazyDLL("dxgi.dll")
+	modK32Host             = syscall.NewLazyDLL("kernel32.dll")
+	procD3D12CreateDevice  = modD3D12Host.NewProc("D3D12CreateDevice")
+	procCreateDXGIFactory2 = modDXGIHost.NewProc("CreateDXGIFactory2")
+	procCreateEventW       = modK32Host.NewProc("CreateEventW")
+	procWaitForSingleObj   = modK32Host.NewProc("WaitForSingleObject")
 
 	// IID_ID3D12Device = {189819f1-1db6-4b57-be54-1821339b85f7}
 	guidID3D12Device = [16]byte{
@@ -26,23 +29,69 @@ var (
 		0xa6, 0x70, 0xc8, 0x0e, 0x7e, 0x5d, 0x22, 0x4c,
 		0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed,
 	}
+	// IID_ID3D12CommandAllocator = {6102dee4-af59-4b09-b999-b44d73f09b24}
+	guidID3D12CommandAllocator = [16]byte{
+		0xe4, 0xde, 0x02, 0x61, 0x59, 0xaf, 0x09, 0x4b,
+		0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24,
+	}
+	// IID_ID3D12GraphicsCommandList = {5b160d0f-ac1b-4185-8ba8-b3ae42a5a455}
+	guidID3D12GraphicsCommandList = [16]byte{
+		0x0f, 0x0d, 0x16, 0x5b, 0x1b, 0xac, 0x85, 0x41,
+		0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55,
+	}
+	// IID_ID3D12DescriptorHeap = {8efb471d-616c-4f49-90f7-127bb763fa51}
+	guidID3D12DescriptorHeap = [16]byte{
+		0x1d, 0x47, 0xfb, 0x8e, 0x6c, 0x61, 0x49, 0x4f,
+		0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51,
+	}
+	// IID_ID3D12Resource = {696442be-a72e-4059-bc79-5b5c98040fad}
+	guidID3D12Resource = [16]byte{
+		0xbe, 0x42, 0x64, 0x69, 0x2e, 0xa7, 0x59, 0x40,
+		0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad,
+	}
+	// IID_ID3D12Fence = {0a753dcf-c4d8-4b91-adf6-be5a60d95a76}
+	guidID3D12Fence = [16]byte{
+		0xcf, 0x3d, 0x75, 0x0a, 0xd8, 0xc4, 0x91, 0x4b,
+		0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76,
+	}
 	// IID_IDXGIFactory4 = {1bc6ea02-ef36-464f-bf0c-21ca39e5168a}
 	guidIDXGIFactory4 = [16]byte{
 		0x02, 0xea, 0xc6, 0x1b, 0x36, 0xef, 0x4f, 0x46,
 		0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a,
 	}
+	// IID_IDXGISwapChain3 = {94d99bdb-f1f8-4ab0-b236-7da0170edab1}
+	guidIDXGISwapChain3 = [16]byte{
+		0xdb, 0x9b, 0xd9, 0x94, 0xf8, 0xf1, 0xb0, 0x4a,
+		0xb2, 0x36, 0x7d, 0xa0, 0x17, 0x0e, 0xda, 0xb1,
+	}
 )
 
-// HostD3D12 encapsule un vrai ID3D12Device Windows, une CommandQueue directe
-// et une SwapChain DXGI attachée à la fenêtre Win32 ASTRAL.
+// HostD3D12 encapsule un vrai ID3D12Device Windows, une CommandQueue directe,
+// une SwapChain DXGI3 double-buffering, un heap RTV, une command list de présentation
+// et un fence de synchronisation CPU/GPU.
 type HostD3D12 struct {
-	Device    uintptr
-	Queue     uintptr
-	Factory   uintptr
-	SwapChain uintptr
-	HWND      uintptr
-	Width     uint32
-	Height    uint32
+	mu           sync.Mutex
+	Device       uintptr
+	Queue        uintptr
+	Factory      uintptr
+	SwapChain    uintptr
+	SwapChain3   uintptr
+	HWND         uintptr
+	Width        uint32
+	Height       uint32
+	RTVHeap      uintptr
+	RTVStart     uintptr
+	RTVStride    uintptr
+	BackBuffers  [2]uintptr
+	CmdAlloc     uintptr
+	CmdList      uintptr
+	Fence        uintptr
+	FenceEvent   uintptr
+	FenceValue   uint64
+	UploadBuf    uintptr
+	UploadPtr    uintptr
+	UploadPitch  uint32
+	Ready        bool
 }
 
 var (
@@ -55,6 +104,59 @@ type d3d12CommandQueueDesc struct {
 	Priority int32
 	Flags    uint32
 	NodeMask uint32
+}
+
+type d3d12DescriptorHeapDesc struct {
+	Type           uint32
+	NumDescriptors uint32
+	Flags          uint32
+	NodeMask       uint32
+}
+
+type d3d12HeapProperties struct {
+	Type                 uint32
+	CPUPageProperty      uint32
+	MemoryPoolPreference uint32
+	CreationNodeMask     uint32
+	VisibleNodeMask      uint32
+}
+
+type d3d12ResourceDesc struct {
+	Dimension        uint32
+	_pad0            uint32
+	Alignment        uint64
+	Width            uint64
+	Height           uint32
+	DepthOrArraySize uint16
+	MipLevels        uint16
+	Format           uint32
+	SampleCount      uint32
+	SampleQuality    uint32
+	Layout           uint32
+	Flags            uint32
+}
+
+type d3d12ResourceBarrier struct {
+	Type        uint32
+	Flags       uint32
+	Resource    uintptr
+	Subresource uint32
+	StateBefore uint32
+	StateAfter  uint32
+	_pad        uint32
+}
+
+type d3d12TextureCopyLocation struct {
+	Resource  uintptr
+	Type      uint32
+	_pad0     uint32
+	Offset    uint64 // SubresourceIndex (Type=0) ou Footprint.Offset (Type=1)
+	Format    uint32
+	Width     uint32
+	Height    uint32
+	Depth     uint32
+	RowPitch  uint32
+	_pad1     uint32
 }
 
 type dxgiSwapChainDesc1 struct {
@@ -86,7 +188,7 @@ func comCall(obj uintptr, slot uintptr, args ...uintptr) uintptr {
 	return r
 }
 
-// InitHostD3D12 initialise le vrai device D3D12 hôte Windows et attache une SwapChain DXGI à hwnd.
+// InitHostD3D12 initialise le vrai device D3D12 hôte Windows et attache une SwapChain DXGI3 à hwnd.
 func InitHostD3D12(hwnd uintptr, width, height uint32) (*HostD3D12, error) {
 	hostMu.Lock()
 	defer hostMu.Unlock()
@@ -129,7 +231,15 @@ func InitHostD3D12(hwnd uintptr, width, height uint32) (*HostD3D12, error) {
 		return nil, fmt.Errorf("CreateDXGIFactory2 échoué (HRESULT 0x%08X)", uint32(hr))
 	}
 
-	var swapChain uintptr
+	h := &HostD3D12{
+		Device:  device,
+		Queue:   queue,
+		Factory: factory,
+		HWND:    hwnd,
+		Width:   width,
+		Height:  height,
+	}
+
 	if hwnd != 0 {
 		scDesc := dxgiSwapChainDesc1{
 			Width:       width,
@@ -141,31 +251,194 @@ func InitHostD3D12(hwnd uintptr, width, height uint32) (*HostD3D12, error) {
 			SwapEffect:  4, // DXGI_SWAP_EFFECT_FLIP_DISCARD
 		}
 		// IDXGIFactory2::CreateSwapChainForHwnd = slot 15
-		hr = comCall(factory, 15, queue, hwnd, uintptr(unsafe.Pointer(&scDesc)), 0, 0, uintptr(unsafe.Pointer(&swapChain)))
+		hr = comCall(factory, 15, queue, hwnd, uintptr(unsafe.Pointer(&scDesc)), 0, 0, uintptr(unsafe.Pointer(&h.SwapChain)))
 		if int32(hr) < 0 {
 			slog.Warn("CreateSwapChainForHwnd hôte échoué (poursuite sans swapchain)", "hr", fmt.Sprintf("0x%08X", uint32(hr)))
+		} else {
+			// QueryInterface -> IDXGISwapChain3 (slot 0)
+			_ = comCall(h.SwapChain, 0, uintptr(unsafe.Pointer(&guidIDXGISwapChain3[0])), uintptr(unsafe.Pointer(&h.SwapChain3)))
+			h.initPresentPipeline()
 		}
 	}
 
-	hostInstance = &HostD3D12{
-		Device:    device,
-		Queue:     queue,
-		Factory:   factory,
-		SwapChain: swapChain,
-		HWND:      hwnd,
-		Width:     width,
-		Height:    height,
-	}
-	slog.Info("Host D3D12 + SwapChain DXGI initialisés", "device", fmt.Sprintf("0x%X", device), "swapchain", fmt.Sprintf("0x%X", swapChain))
+	hostInstance = h
+	slog.Info("Host D3D12 + SwapChain DXGI initialisés",
+		"device", fmt.Sprintf("0x%X", device),
+		"swapchain", fmt.Sprintf("0x%X", h.SwapChain),
+		"presentReady", h.Ready,
+	)
 	return hostInstance, nil
 }
 
-// Present présente la trame courante sur la SwapChain DXGI hôte (slot 8 = IDXGISwapChain::Present).
-func (h *HostD3D12) Present(syncInterval uint32) {
+func (h *HostD3D12) initPresentPipeline() {
+	if h.Device == 0 || h.SwapChain3 == 0 {
+		return
+	}
+	// 1. Heap RTV (2 descripteurs pour le double-buffering)
+	rtvDesc := d3d12DescriptorHeapDesc{Type: 2 /* RTV */, NumDescriptors: 2}
+	if int32(comCall(h.Device, 14, uintptr(unsafe.Pointer(&rtvDesc)), uintptr(unsafe.Pointer(&guidID3D12DescriptorHeap[0])), uintptr(unsafe.Pointer(&h.RTVHeap)))) < 0 || h.RTVHeap == 0 {
+		return
+	}
+	h.RTVStride = comCall(h.Device, 15, 2 /* RTV */)
+	// ID3D12DescriptorHeap::GetCPUDescriptorHandleForHeapStart (MSVC sret dans rdx)
+	var rtvStart uintptr
+	_ = comCall(h.RTVHeap, 9, uintptr(unsafe.Pointer(&rtvStart)))
+	h.RTVStart = rtvStart
+
+	for i := uintptr(0); i < 2; i++ {
+		var bb uintptr
+		if int32(comCall(h.SwapChain, 9, i, uintptr(unsafe.Pointer(&guidID3D12Resource[0])), uintptr(unsafe.Pointer(&bb)))) < 0 || bb == 0 {
+			return
+		}
+		h.BackBuffers[i] = bb
+		// ID3D12Device::CreateRenderTargetView (slot 20)
+		_ = comCall(h.Device, 20, bb, 0, h.RTVStart+i*h.RTVStride)
+	}
+
+	// 2. CommandAllocator + CommandList (fermée au repos)
+	if int32(comCall(h.Device, 9, 0 /* DIRECT */, uintptr(unsafe.Pointer(&guidID3D12CommandAllocator[0])), uintptr(unsafe.Pointer(&h.CmdAlloc)))) < 0 || h.CmdAlloc == 0 {
+		return
+	}
+	if int32(comCall(h.Device, 12, 0, 0 /* DIRECT */, h.CmdAlloc, 0, uintptr(unsafe.Pointer(&guidID3D12GraphicsCommandList[0])), uintptr(unsafe.Pointer(&h.CmdList)))) < 0 || h.CmdList == 0 {
+		return
+	}
+	_ = comCall(h.CmdList, 9) // Close
+
+	// 3. Fence + Event CPU/GPU
+	if int32(comCall(h.Device, 36, 0, 0, uintptr(unsafe.Pointer(&guidID3D12Fence[0])), uintptr(unsafe.Pointer(&h.Fence)))) < 0 || h.Fence == 0 {
+		return
+	}
+	h.FenceEvent, _, _ = procCreateEventW.Call(0, 0, 0, 0)
+
+	// 4. Buffer d'upload persistant pour copier un framebuffer RGBA8 vers la SwapChain
+	pitch := ((h.Width * 4) + 255) &^ 255
+	uploadSize := uint64(pitch) * uint64(h.Height)
+	heapProps := d3d12HeapProperties{Type: 2 /* UPLOAD */, CreationNodeMask: 1, VisibleNodeMask: 1}
+	bufDesc := d3d12ResourceDesc{
+		Dimension:        1, // BUFFER
+		Width:            uploadSize,
+		Height:           1,
+		DepthOrArraySize: 1,
+		MipLevels:        1,
+		SampleCount:      1,
+		Layout:           1, // ROW_MAJOR
+	}
+	var upBuf uintptr
+	if int32(comCall(h.Device, 27,
+		uintptr(unsafe.Pointer(&heapProps)), 0,
+		uintptr(unsafe.Pointer(&bufDesc)),
+		0x00000A83, // D3D12_RESOURCE_STATE_GENERIC_READ
+		0,
+		uintptr(unsafe.Pointer(&guidID3D12Resource[0])),
+		uintptr(unsafe.Pointer(&upBuf)),
+	)) >= 0 && upBuf != 0 {
+		var mapped uintptr
+		// ID3D12Resource::Map (slot 8)
+		if int32(comCall(upBuf, 8, 0, 0, uintptr(unsafe.Pointer(&mapped)))) >= 0 && mapped != 0 {
+			h.UploadBuf = upBuf
+			h.UploadPtr = mapped
+			h.UploadPitch = pitch
+		}
+	}
+
+	h.Ready = true
+}
+
+func (h *HostD3D12) waitGPU() {
+	if h.Queue == 0 || h.Fence == 0 {
+		return
+	}
+	h.FenceValue++
+	val := h.FenceValue
+	_ = comCall(h.Queue, 14, h.Fence, uintptr(val)) // Signal
+	if uint64(comCall(h.Fence, 8)) < val {           // GetCompletedValue
+		_ = comCall(h.Fence, 9, uintptr(val), h.FenceEvent) // SetEventOnCompletion
+		_, _, _ = procWaitForSingleObj.Call(h.FenceEvent, 2000)
+	}
+}
+
+// PresentClear présente la trame courante en effaçant le backbuffer avec clearColor (RGBA)
+// ou en y copiant srcRGBA (s'il est non vide), puis en appelant IDXGISwapChain::Present.
+func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32) {
 	if h == nil || h.SwapChain == 0 {
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.Ready {
+		idx := comCall(h.SwapChain3, 36) & 1 // GetCurrentBackBufferIndex
+		bb := h.BackBuffers[idx]
+		rtv := h.RTVStart + idx*h.RTVStride
+
+		_ = comCall(h.CmdAlloc, 8)            // Allocator::Reset
+		_ = comCall(h.CmdList, 10, h.CmdAlloc, 0) // CommandList::Reset
+
+		if len(srcRGBA) > 0 && h.UploadBuf != 0 && h.UploadPtr != 0 && srcW > 0 && srcH > 0 {
+			// Copie ligne à ligne (clippée à Width x Height) vers le buffer d'upload
+			copyW := srcW
+			if copyW > h.Width {
+				copyW = h.Width
+			}
+			copyH := srcH
+			if copyH > h.Height {
+				copyH = h.Height
+			}
+			rowBytes := copyW * 4
+			if srcPitch < rowBytes {
+				srcPitch = rowBytes
+			}
+			dstSlice := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadPtr))), uintptr(h.UploadPitch)*uintptr(h.Height))
+			for y := uint32(0); y < copyH; y++ {
+				sOff := uintptr(y) * uintptr(srcPitch)
+				dOff := uintptr(y) * uintptr(h.UploadPitch)
+				if sOff+uintptr(rowBytes) <= uintptr(len(srcRGBA)) && dOff+uintptr(rowBytes) <= uintptr(len(dstSlice)) {
+					copy(dstSlice[dOff:dOff+uintptr(rowBytes)], srcRGBA[sOff:sOff+uintptr(rowBytes)])
+				}
+			}
+
+			b1 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0 /* PRESENT */, StateAfter: 0x400 /* COPY_DEST */}
+			_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b1)))
+
+			dstLoc := d3d12TextureCopyLocation{Resource: bb, Type: 0 /* SUBRESOURCE_INDEX */}
+			srcLoc := d3d12TextureCopyLocation{
+				Resource: h.UploadBuf,
+				Type:     1, // PLACED_FOOTPRINT
+				Format:   28,
+				Width:    h.Width,
+				Height:   h.Height,
+				Depth:    1,
+				RowPitch: h.UploadPitch,
+			}
+			_ = comCall(h.CmdList, 16, uintptr(unsafe.Pointer(&dstLoc)), 0, 0, 0, uintptr(unsafe.Pointer(&srcLoc)), 0)
+
+			b2 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x400 /* COPY_DEST */, StateAfter: 0 /* PRESENT */}
+			_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b2)))
+		} else {
+			b1 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0 /* PRESENT */, StateAfter: 0x4 /* RENDER_TARGET */}
+			_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b1)))
+
+			// ID3D12GraphicsCommandList::ClearRenderTargetView (slot 48)
+			_ = comCall(h.CmdList, 48, rtv, uintptr(unsafe.Pointer(&clearColor[0])), 0, 0)
+
+			b2 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x4 /* RENDER_TARGET */, StateAfter: 0 /* PRESENT */}
+			_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b2)))
+		}
+
+		_ = comCall(h.CmdList, 9) // Close
+		lists := [1]uintptr{h.CmdList}
+		_ = comCall(h.Queue, 10, 1, uintptr(unsafe.Pointer(&lists[0]))) // ExecuteCommandLists
+		_ = comCall(h.SwapChain, 8, uintptr(syncInterval), 0)           // Present
+		h.waitGPU()
+		return
+	}
+
 	_ = comCall(h.SwapChain, 8, uintptr(syncInterval), 0)
+}
+
+// Present présente la trame courante sur la SwapChain DXGI hôte.
+func (h *HostD3D12) Present(syncInterval uint32) {
+	h.PresentClear(syncInterval, [4]float32{0.04, 0.05, 0.09, 1.0}, nil, 0, 0, 0)
 }
 
 // PresentHost présente la trame courante sur l'instance globale HostD3D12 si active.
@@ -175,5 +448,15 @@ func PresentHost(syncInterval uint32) {
 	hostMu.Unlock()
 	if h != nil {
 		h.Present(syncInterval)
+	}
+}
+
+// PresentHostFrame présente une trame avec couleur de clear et/ou framebuffer RGBA8 optionnel.
+func PresentHostFrame(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32) {
+	hostMu.Lock()
+	h := hostInstance
+	hostMu.Unlock()
+	if h != nil {
+		h.PresentClear(syncInterval, clearColor, srcRGBA, srcW, srcH, srcPitch)
 	}
 }

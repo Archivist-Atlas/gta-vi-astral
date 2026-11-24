@@ -23,26 +23,37 @@ var k32SetEvent = k32.NewProc("SetEvent")
 
 // d3d12xState centralise les objets COM Xbox Series D3D12.X créés pendant le boot.
 type d3d12xState struct {
-	mu            sync.Mutex
-	deviceObj     uintptr
-	nextHeapBase  atomic.Uint64
-	nextGPUAddr   atomic.Uint64
-	fenceWaiters  map[uintptr][]fenceWaiter
-	heapBases     map[uintptr]uint64
-	resGPUAddrs   map[uintptr]uint64
-	queuesCreated atomic.Int64
-	listsCreated  atomic.Int64
-	fencesCreated atomic.Int64
-	heapsCreated  atomic.Int64
-	resCreated    atomic.Int64
-	psoCreated    atomic.Int64
+	mu              sync.Mutex
+	deviceObj       uintptr
+	nextHeapBase    atomic.Uint64
+	nextGPUAddr     atomic.Uint64
+	fenceWaiters    map[uintptr][]fenceWaiter
+	heapBases       map[uintptr]uint64
+	resGPUAddrs     map[uintptr]uint64
+	resDescs        map[uintptr]xgResourceDesc
+	rtvResources    map[uintptr]uintptr
+	lastClearColor  [4]float32
+	hasClearColor   bool
+	queuesCreated   atomic.Int64
+	listsCreated    atomic.Int64
+	fencesCreated   atomic.Int64
+	heapsCreated    atomic.Int64
+	resCreated      atomic.Int64
+	psoCreated      atomic.Int64
+	execListsCount  atomic.Uint64
+	drawCalls       atomic.Uint64
+	dispatchCalls   atomic.Uint64
+	clearRTVCalls   atomic.Uint64
 }
 
 func newD3D12XDevice() uintptr {
 	st := &d3d12xState{
-		fenceWaiters: make(map[uintptr][]fenceWaiter),
-		heapBases:    make(map[uintptr]uint64),
-		resGPUAddrs:  make(map[uintptr]uint64),
+		fenceWaiters:   make(map[uintptr][]fenceWaiter),
+		heapBases:      make(map[uintptr]uint64),
+		resGPUAddrs:    make(map[uintptr]uint64),
+		resDescs:       make(map[uintptr]xgResourceDesc),
+		rtvResources:   make(map[uintptr]uintptr),
+		lastClearColor: [4]float32{0.04, 0.05, 0.09, 1.0},
 	}
 	st.nextHeapBase.Store(0x0000100000000000)
 	st.nextGPUAddr.Store(0x0000200000000000)
@@ -207,12 +218,42 @@ func newD3D12XDevice() uintptr {
 		return hresultOK
 	})
 	var presents atomic.Uint64
+	cbQueueExecuteLists := syscall.NewCallback(func(this, numLists, listsPtr uintptr) uintptr {
+		st.execListsCount.Add(uint64(uint32(numLists)))
+		return hresultOK
+	})
 	cbQueuePresentX := syscall.NewCallback(func(this, numPlanes, planes, params uintptr) uintptr {
 		n := presents.Add(1)
-		if n == 1 || n%60 == 0 {
-			slog.Info("ID3D12CommandQueueX!PresentX", "frame", n, "planes", uint32(numPlanes))
+		var resObj uintptr
+		var resW, resH, resFmt uint32
+		if uint32(numPlanes) > 0 && planes >= 0x10000 {
+			resCount := *(*uint32)(osPtr(planes + 8))
+			ppRes := *(*uintptr)(osPtr(planes + 0x10))
+			if resCount > 0 && ppRes >= 0x10000 {
+				resObj = *(*uintptr)(osPtr(ppRes))
+			}
 		}
-		gpu.PresentHost(0)
+		st.mu.Lock()
+		clr := st.lastClearColor
+		if resObj != 0 {
+			if d, ok := st.resDescs[resObj]; ok {
+				resW, resH, resFmt = uint32(d.Width), d.Height, d.Format
+			}
+		}
+		st.mu.Unlock()
+		if n == 1 || n%60 == 0 {
+			slog.Info("ID3D12CommandQueueX!PresentX",
+				"frame", n,
+				"planes", uint32(numPlanes),
+				"res", fmt.Sprintf("0x%X", resObj),
+				"w", resW, "h", resH, "fmt", resFmt,
+				"execLists", st.execListsCount.Load(),
+				"draws", st.drawCalls.Load(),
+				"dispatches", st.dispatchCalls.Load(),
+				"clears", st.clearRTVCalls.Load(),
+			)
+		}
+		gpu.PresentHostFrame(0, clr, nil, 0, 0, 0)
 		return hresultOK
 	})
 	newQueue := func() uintptr {
@@ -224,7 +265,7 @@ func newD3D12XDevice() uintptr {
 			5:  cbOK, // SetPrivateDataInterface
 			6:  cbOK, // SetName
 			7:  cbGetDevice,
-			10: cbOK,                 // ExecuteCommandLists
+			10: cbQueueExecuteLists,  // ExecuteCommandLists
 			14: cbQueueSignal,        // Signal (2020)
 			15: cbOK,                 // Wait (2020)
 			16: cbQueueSignal,        // Signal (2026, 0x80)
@@ -236,9 +277,9 @@ func newD3D12XDevice() uintptr {
 			30: cbQueuePresentX,      // PresentX (2020, 0xF0)
 			31: cbOK,                 // CopyPageMappingsBatchX (2026, 0xF8)
 			32: cbQueuePresentX,      // PresentX (2026, 0x100)
-			33: cbOK,                 // ExecuteCommandListsX (2020)
+			33: cbQueueExecuteLists,  // ExecuteCommandListsX (2020)
 			34: cbQueueSignal,        // Signal2X (2026, 0x110)
-			35: cbOK,                 // ExecuteCommandListsX (2026, 0x118)
+			35: cbQueueExecuteLists,  // ExecuteCommandListsX (2026, 0x118)
 		})
 	}
 
@@ -285,7 +326,32 @@ func newD3D12XDevice() uintptr {
 			return hresultOK
 		})
 	}
+	cbListDraw := syscall.NewCallback(func() uintptr {
+		st.drawCalls.Add(1)
+		return 0
+	})
+	cbListDispatch := syscall.NewCallback(func() uintptr {
+		st.dispatchCalls.Add(1)
+		return 0
+	})
+	cbListClearRTV := syscall.NewCallback(func(this, rtvHandle, colorPtr, numRects, rects uintptr) uintptr {
+		st.clearRTVCalls.Add(1)
+		if colorPtr >= 0x10000 {
+			c := *(*[4]float32)(osPtr(colorPtr))
+			st.mu.Lock()
+			st.lastClearColor = c
+			st.hasClearColor = true
+			st.mu.Unlock()
+		}
+		return 0
+	})
+	cmdListSlots[12] = cbListDraw         // DrawInstanced
+	cmdListSlots[13] = cbListDraw         // DrawIndexedInstanced
+	cmdListSlots[14] = cbListDispatch     // Dispatch
+	cmdListSlots[48] = cbListClearRTV     // ClearRenderTargetView
 	cmdListSlots[60] = cbListCopyMem      // CopyMemoryToMemoryX (0x1E0)
+	cmdListSlots[78] = cbListDispatch     // DispatchX (0x270)
+	cmdListSlots[81] = cbListDraw         // DrawIndexedX (0x288)
 	cmdListSlots[148] = cbListAllocUpload // AllocateUploadMemory (0x4A0)
 	cmdListProto := NewCOMObjectWithHeader("ID3D12GraphicsCommandListX", 160, 0x1000, cmdListSlots)
 	cmdListVtable := *(*uintptr)(osPtr(cmdListProto))
@@ -491,6 +557,9 @@ func newD3D12XDevice() uintptr {
 		})
 		st.mu.Lock()
 		st.resGPUAddrs[obj] = gpuVA
+		if descPtr != 0 {
+			st.resDescs[obj] = *(*xgResourceDesc)(osPtr(descPtr))
+		}
 		st.mu.Unlock()
 		return obj
 	}
@@ -926,6 +995,9 @@ func newD3D12XDevice() uintptr {
 			if descPtr >= 0x10000 {
 				copy(unsafe.Slice((*byte)(osPtr(handle+16)), 24), unsafe.Slice((*byte)(osPtr(descPtr)), 24))
 			}
+			st.mu.Lock()
+			st.rtvResources[handle] = res
+			st.mu.Unlock()
 		}
 		return 0
 	})
