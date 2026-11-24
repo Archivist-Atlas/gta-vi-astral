@@ -702,8 +702,8 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		slog.Debug("d3d12_xs!D3D12ConfigureVirtualMemoryX -> S_OK")
 		return 0 // S_OK
 	})
-	// ID3D12DeviceX (160 slots pour couvrir jusqu'à CreatePlacedResourceX slot 133+)
-	d3d12DeviceObj := NewCOMObject("ID3D12DeviceX", 160, nil)
+	// ID3D12DeviceX complet (pkg/hle/d3d12x_windows.go : 160 slots, en-tête 0x58, out_of_line=1)
+	d3d12DeviceObj := newD3D12XDevice()
 	cbCreateDeviceX := syscall.NewCallback(func(adapter, params, iidPtr, outPtr uintptr) uintptr {
 		slog.Info("d3d12_xs!D3D12XboxCreateDevice -> ID3D12DeviceX COM actif", "iid", FormatGUID(iidPtr))
 		if outPtr != 0 {

@@ -116,17 +116,26 @@ func emitCOMSlotStub(area string, slot int) uintptr {
 // NewCOMObject alloue un objet COM et sa vtable en mémoire native OS (hors tas Go, GC-safe).
 // Les slots 0..2 sont automatiquement initialisés à QueryInterface / AddRef / Release.
 func NewCOMObject(area string, numSlots int, overrides map[int]uintptr) uintptr {
+	return NewCOMObjectWithHeader(area, numSlots, 8, overrides)
+}
+
+// NewCOMObjectWithHeader alloue un objet COM dont l'en-tête objet fait headerBytes (>= 8, multiple de 8),
+// suivi immédiatement de sa vtable de numSlots entrées.
+func NewCOMObjectWithHeader(area string, numSlots, headerBytes int, overrides map[int]uintptr) uintptr {
 	initCOMCallbacks()
 	if numSlots < 3 {
 		numSlots = 3
 	}
-	// Layout : [8 octets: ptr vers vtable][numSlots * 8 octets: vtable]
-	totalBytes := uintptr((1 + numSlots) * 8)
+	if headerBytes < 8 {
+		headerBytes = 8
+	}
+	headerBytes = (headerBytes + 7) &^ 7
+	totalBytes := uintptr(headerBytes + numSlots*8)
 	mem, _, _ := k32VirtualAlloc.Call(0, totalBytes, 0x3000, 0x04 /* PAGE_READWRITE */)
 	if mem == 0 {
 		return 0
 	}
-	vtableAddr := mem + 8
+	vtableAddr := mem + uintptr(headerBytes)
 	*(*uintptr)(osPtr(mem)) = vtableAddr
 
 	vtable := unsafe.Slice((*uintptr)(osPtr(vtableAddr)), numSlots)
