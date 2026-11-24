@@ -1,0 +1,3 @@
+# Marqueur de racine du dépôt gta-vi-astral.
+# Ce fichier permet au garde-fou (pkg/core/policy.go) d'empêcher toute écriture
+# de données dérivées du jeu (caches, sauvegardes, shaders, assets, dumps) à l'intérieur du dépôt.

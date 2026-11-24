@@ -1,0 +1,39 @@
+# Configuration locale utilisateur (contient des chemins locaux)
+astral.toml
+
+# Binaires compilés
+/astral.exe
+/astral
+/bin/
+/build/
+/dist/
+*.exe
+*.dll
+*.pdb
+
+# Données dérivées du jeu (ne doivent JAMAIS entrer dans le dépôt)
+/cache/
+/data/
+/work/
+/out/
+/reports/
+/saves/
+/overlay/
+*.rpf
+*.ttpf
+*.dxbc
+*.spv
+*.dxil
+*.awc
+*.bk2
+*.dds
+*.obj
+*.glb
+crashes.log
+
+# Éditeurs / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

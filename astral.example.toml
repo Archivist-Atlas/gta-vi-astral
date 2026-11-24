@@ -1,0 +1,39 @@
+# Copiez ce fichier vers `astral.toml` (ignoré par git) et adaptez les chemins.
+# RÈGLE #1 : Tous les chemins ci-dessous doivent se trouver EN DEHORS du dépôt gta-vi-astral.
+# Les variables d'environnement (ASTRAL_*) ont priorité sur ce fichier.
+
+[paths]
+# Dossier contenant votre copie locale de GTA VI Xbox Series (avec MicrosoftGame.Config et les .rpf)
+# Variable d'environnement : ASTRAL_GAME_DIR
+game_dir = 'C:\GTA_VI'
+
+# Dossier de cache (shaders traduits, pipelines, données converties)
+# Par défaut : %LOCALAPPDATA%\gta-vi-astral\cache
+# Variable d'environnement : ASTRAL_CACHE_DIR
+# cache_dir = 'D:\astral-data\cache'
+
+# Dossier de données persistantes (sauvegardes, paramètres, crashes.log)
+# Par défaut : %LOCALAPPDATA%\gta-vi-astral\data
+# Variable d'environnement : ASTRAL_DATA_DIR
+# data_dir = 'D:\astral-data\data'
+
+# Dossier overlay copy-on-write pour garder le dossier du jeu en lecture seule
+# Par défaut : %LOCALAPPDATA%\gta-vi-astral\overlay
+# Variable d'environnement : ASTRAL_OVERLAY_DIR
+# overlay_dir = 'D:\astral-data\overlay'
+
+[runtime]
+# Modèle de console émulé : "series-x" ou "series-s"
+console_profile = 'series-x'
+
+# Backend GPU : "auto", "d3d12" (natif Windows façon VIctory) ou "vulkan" (façon Leonida)
+gpu_backend = 'auto'
+
+# Politique face aux imports non implémentés : "log", "zero", "fail" ou "trap"
+unimplemented = 'log'
+
+# Mode d'émulation wave64 pour les GPU 32-wide (NVIDIA/Intel) : "auto", "on", "off"
+wave64_emulate = 'auto'
+
+# Nombre de workers parallèles (0 = automatique selon les cœurs CPU)
+jobs = 0
