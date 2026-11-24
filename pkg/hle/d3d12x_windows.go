@@ -439,9 +439,66 @@ func newD3D12XDevice() uintptr {
 		return hresultOK
 	})
 
+	cbCheckFeatureSupport := syscall.NewCallback(func(this, feature, dataPtr, dataSize uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CheckFeatureSupport", "feature", feature, "size", dataSize)
+		if dataPtr == 0 {
+			return hresultInvalidArg
+		}
+		switch feature {
+		case 0: // D3D12_FEATURE_D3D12_OPTIONS (64 bytes = 16 u32)
+			if dataSize == 64 {
+				opts := [16]uint32{
+					1, 1, 0, 3, 3, 1, 1, 1,
+					3, 40, 0, 0, 0, 0, 1, 2,
+				}
+				dst := unsafe.Slice((*uint32)(osPtr(dataPtr)), 16)
+				copy(dst, opts[:])
+				return hresultOK
+			}
+		case 1: // D3D12_FEATURE_ARCHITECTURE (16 bytes)
+			if dataSize == 16 {
+				a := unsafe.Slice((*uint32)(osPtr(dataPtr)), 4)
+				a[1], a[2], a[3] = 0, 1, 1 // UMA, CacheCoherentUMA
+				return hresultOK
+			}
+		case 2: // D3D12_FEATURE_FEATURE_LEVELS (24 bytes)
+			if dataSize == 24 {
+				// { NumFeatureLevels u32, _pad u32, pFeatureLevelsRequested ptr, MaxSupportedFeatureLevel u32 }
+				*(*uint32)(osPtr(dataPtr + 16)) = 0xC200 // D3D_FEATURE_LEVEL_12_2
+				return hresultOK
+			}
+		case 3: // D3D12_FEATURE_FORMAT_SUPPORT (12 bytes)
+			if dataSize == 12 {
+				q := unsafe.Slice((*uint32)(osPtr(dataPtr)), 3)
+				q[1] = 0x7FFFFFFF
+				q[2] = 0xFFFF
+				return hresultOK
+			}
+		case 4: // D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS (16 bytes)
+			if dataSize == 16 {
+				q := unsafe.Slice((*uint32)(osPtr(dataPtr)), 4)
+				if q[1] == 1 || q[1] == 2 || q[1] == 4 || q[1] == 8 {
+					q[3] = 1
+				} else {
+					q[3] = 0
+				}
+				return hresultOK
+			}
+		}
+		return hresultOK
+	})
+
+	cbCreateShaderCacheSession := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateShaderCacheSession")
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = newGenericChild("ID3D12ShaderCacheSession")
+		}
+		return hresultOK
+	})
+
 	// Allocation de ID3D12DeviceX avec en-tête 0x58 octets (VIctory device.rs)
 	// et octet +0x18 = 1 (out_of_line[0] = 1 pour forcer le passage par la vtable).
-	st.deviceObj = NewCOMObjectWithHeader("ID3D12DeviceX", 160, 0x58, map[int]uintptr{
+	st.deviceObj = NewCOMObjectWithHeader("ID3D12DeviceX", 200, 0x58, map[int]uintptr{
 		0:   cbDeviceQI,
 		3:   cbOK, // GetPrivateData
 		4:   cbOK, // SetPrivateData
@@ -453,7 +510,7 @@ func newD3D12XDevice() uintptr {
 		10:  cbCreatePSO,
 		11:  cbCreatePSO,
 		12:  cbCreateList,
-		13:  cbOK, // CheckFeatureSupport
+		13:  cbCheckFeatureSupport,
 		14:  cbCreateDescHeap,
 		15:  cbDescIncrSize,
 		16:  cbCreateRootSig,
@@ -490,6 +547,7 @@ func newD3D12XDevice() uintptr {
 		81:  cbOK, // GetFrameStatisticsX
 		86:  cbCreatePSO,
 		108: cbAllocInfo,
+		118: cbCreateShaderCacheSession,
 		127: cbCreateCommitted,
 		133: cbCreatePlacedAtAddr,
 	})
