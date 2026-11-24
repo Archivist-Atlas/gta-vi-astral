@@ -307,22 +307,110 @@ func NewLiveTable(profile core.ConsoleProfile) *LiveTable {
 	cbGetApiVerImpl := syscall.NewCallback(func() uintptr {
 		return 1
 	})
+	// --- 3a. Objets COM GDK (QueryApiImpl) & IGameInput ---
+	// IGameInput (22 slots) : renvoie READING_NOT_FOUND sur GetCurrentReading et S_OK sur les callbacks
+	cbGIReadingNotFound := syscall.NewCallback(func() uintptr { return giReadingNotFound })
+	cbGISuccess := syscall.NewCallback(func() uintptr { return hresultOK })
+	cbGITimestamp := syscall.NewCallback(func() uintptr { return 1000 })
+	gameInputObj := NewCOMObject("IGameInput", 22, map[int]uintptr{
+		3:  cbGITimestamp,       // GetCurrentTimestamp
+		4:  cbGIReadingNotFound, // GetCurrentReading
+		5:  cbGIReadingNotFound, // GetNextReading
+		6:  cbGIReadingNotFound, // GetPreviousReading
+		7:  cbGIReadingNotFound, // GetTemporalReading
+		8:  cbGISuccess,         // RegisterReadingCallback
+		9:  cbGISuccess,         // RegisterDeviceCallback
+		10: cbGISuccess,         // RegisterSystemButtonCallback
+		11: cbGISuccess,         // RegisterGuideButtonCallback
+		12: cbGISuccess,         // RegisterKeyboardLayoutCallback
+		13: cbGISuccess,         // StopCallback
+		14: cbReturnTrue,        // UnregisterCallback
+		16: cbGISuccess,         // FindDeviceFromId
+		17: cbGISuccess,         // FindDeviceFromObject
+		18: cbGISuccess,         // FindDeviceFromPlatformHandle
+		19: cbGISuccess,         // FindDeviceFromPlatformString
+		20: cbGISuccess,         // EnableOemDeviceSupport
+		21: cbGISuccess,         // SetFocusPolicy
+	})
+
+	gdkProviders := map[string]uintptr{
+		"{073B7DCB-1FCF-4030-94BE-E3C9EB623428}": NewCOMObject("xasync", 64, nil),
+		"{37E56907-2F10-41E8-B72F-36EDB185331A}": NewCOMObject("xnetworking", 64, nil),
+		"{01ACD177-91F9-4763-A38E-CCBB55CE32E0}": NewCOMObject("xuser", 64, nil),
+		"{973A344E-24BF-4D0F-8457-56C534892B29}": NewCOMObject("xgame", 64, nil),
+		"{E349BD1A-FC20-4E40-B99C-4178CC6B409F}": NewCOMObject("xsystem", 64, nil),
+	}
+
 	cbQueryApiImpl := syscall.NewCallback(func(provider, iid, outPtr uintptr) uintptr {
-		slog.Info("xgameruntime!QueryApiImpl", "provider", FormatGUID(provider), "iid", FormatGUID(iid))
+		provGUID := FormatGUID(provider)
+		iidGUID := FormatGUID(iid)
+		if obj, ok := gdkProviders[provGUID]; ok && obj != 0 {
+			slog.Debug("xgameruntime!QueryApiImpl résolu", "provider", provGUID, "iid", iidGUID)
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = obj
+			}
+			return hresultOK
+		}
+		slog.Info("xgameruntime!QueryApiImpl inconnu", "provider", provGUID, "iid", iidGUID)
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = 0
 		}
-		return 0x80004002 // E_NOINTERFACE
+		return hresultNoIface
 	})
 	cbGameInputCreate := syscall.NewCallback(func(outPtr uintptr) uintptr {
-		slog.Info("GameInput!GameInputCreate appelé (stub E_NOTIMPL)")
+		slog.Info("GameInput!GameInputCreate -> IGameInput COM actif")
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = 0
+			*(*uintptr)(osPtr(outPtr)) = gameInputObj
 		}
-		return 0x80004001 // E_NOTIMPL
+		return hresultOK
 	})
 	t.bind("gameinput.dll", "#1", cbGameInputCreate)
 	t.bind("gameinput.dll", "GameInputCreate", cbGameInputCreate)
+
+	// --- 3c. XCRDAPI.dll!DStorageGetFactory (DirectStorage Xbox Series) ---
+	dstorageQueueObj := NewCOMObject("IDStorageQueueX", 32, map[int]uintptr{
+		10: cbGISuccess, // Submit
+	})
+	dstorageStatusObj := NewCOMObject("IDStorageStatusArrayX", 16, map[int]uintptr{
+		3: cbReturnTrue, // IsComplete
+		4: cbGISuccess,  // GetHResult
+	})
+	dstorageFileObj := NewCOMObject("IDStorageFileX", 16, nil)
+	dstorageFactoryObj := NewCOMObject("IDStorageFactoryX", 32, map[int]uintptr{
+		3: syscall.NewCallback(func(this, descPtr, iidPtr, outPtr uintptr) uintptr { // CreateQueue
+			slog.Info("IDStorageFactoryX!CreateQueue -> IDStorageQueueX")
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = dstorageQueueObj
+			}
+			return hresultOK
+		}),
+		4: syscall.NewCallback(func(this, pathPtr, iidPtr, outPtr uintptr) uintptr { // OpenFile
+			slog.Info("IDStorageFactoryX!OpenFile", "path", readUTF16Str(pathPtr))
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = dstorageFileObj
+			}
+			return hresultOK
+		}),
+		5: syscall.NewCallback(func(this, capacity, namePtr, iidPtr, outPtr uintptr) uintptr { // CreateStatusArray
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = dstorageStatusObj
+			}
+			return hresultOK
+		}),
+		6: cbGISuccess, // SetDebugFlags
+		7: cbGISuccess, // SetStagingBufferSize
+		8: cbGISuccess, // SetStagingBufferSize / SetCpuAffinity (IDStorageFactoryX2)
+		9: cbGISuccess, // GetCompressionCodec / config
+	})
+	cbDStorageGetFactory := syscall.NewCallback(func(iidPtr, outPtr uintptr) uintptr {
+		slog.Info("XCRDAPI!DStorageGetFactory -> IDStorageFactoryX COM actif", "iid", FormatGUID(iidPtr))
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = dstorageFactoryObj
+		}
+		return hresultOK
+	})
+	t.bind("xcrdapi.dll", "DStorageGetFactory", cbDStorageGetFactory)
+	t.bind("dstorage_xs.dll", "DStorageGetFactory", cbDStorageGetFactory)
 	t.bind("xgameruntime.dll", "XSystemGetDeviceType", cbGetDeviceType)
 	t.bind("xgameruntime.dll", "XSystemIsRemoteConnectEnabled", cbReturnFalse)
 	t.bind("xgameruntime.dll", "XErrorReport", cbReturnTrue)
@@ -455,7 +543,17 @@ func NewLiveTable(profile core.ConsoleProfile) *LiveTable {
 		slog.Debug("d3d12_xs!D3D12ConfigureVirtualMemoryX -> S_OK")
 		return 0 // S_OK
 	})
+	// ID3D12DeviceX (160 slots pour couvrir jusqu'à CreatePlacedResourceX slot 133+)
+	d3d12DeviceObj := NewCOMObject("ID3D12DeviceX", 160, nil)
+	cbCreateDeviceX := syscall.NewCallback(func(adapter, params, iidPtr, outPtr uintptr) uintptr {
+		slog.Info("d3d12_xs!D3D12XboxCreateDevice -> ID3D12DeviceX COM actif", "iid", FormatGUID(iidPtr))
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = d3d12DeviceObj
+		}
+		return hresultOK
+	})
 	t.bind("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", cbConfigVirtMem)
+	t.bind("d3d12_xs.dll", "D3D12XboxCreateDevice", cbCreateDeviceX)
 	t.bind("d3d12_xs.dll", "IID_ID3D12Device", uintptr(unsafe.Pointer(&iidID3D12Device[0])))
 	t.bind("d3d12_xs.dll", "D3D12SerializeRootSignature", cbSerRootSig)
 	t.bind("d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", cbSerVerRootSig)
