@@ -102,6 +102,11 @@ func LoadConfig(explicitPath string) (Config, error) {
 	if configPath == "" {
 		if _, err := os.Stat("astral.toml"); err == nil {
 			configPath = "astral.toml"
+		} else if exe, exeErr := os.Executable(); exeErr == nil {
+			beside := filepath.Join(filepath.Dir(exe), "astral.toml")
+			if _, err := os.Stat(beside); err == nil {
+				configPath = beside
+			}
 		}
 	}
 
@@ -148,6 +153,22 @@ func LoadConfig(explicitPath string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// SaveGameDir mémorise gameDir dans le fichier local astral.toml (ignoré par Git).
+func SaveGameDir(gameDir string) (string, error) {
+	if err := EnsureOutsideRepo(gameDir); err != nil {
+		return "", err
+	}
+	target := "astral.toml"
+	if exe, err := os.Executable(); err == nil {
+		target = filepath.Join(filepath.Dir(exe), "astral.toml")
+	}
+	content := fmt.Sprintf("# Configuration locale générée par gta-vi-astral (ignorée par Git)\n\n[paths]\ngame_dir = '%s'\n", gameDir)
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return target, nil
 }
 
 // ValidatePolicy vérifie qu'aucun chemin de données dérivées ne pointe dans le dépôt.

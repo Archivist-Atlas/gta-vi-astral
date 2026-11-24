@@ -579,8 +579,15 @@ func runInteractiveMenu() {
 		case "1":
 			fmt.Print("Chemin complet du dossier GTA VI : ")
 			p, _ := reader.ReadString('\n')
-			gameDir = strings.Trim(strings.TrimSpace(p), `"'`)
-			continue
+			entered := strings.Trim(strings.TrimSpace(p), `"'`)
+			if entered != "" {
+				if savedPath, saveErr := core.SaveGameDir(entered); saveErr != nil {
+					runErr = saveErr
+				} else {
+					gameDir = entered
+					fmt.Printf("Dossier mémorisé dans %s (ignoré par Git).\n", savedPath)
+				}
+			}
 		case "2":
 			if gameDir == "" {
 				runErr = fmt.Errorf("définissez d'abord le dossier du jeu (option 1) ou astral.toml")
