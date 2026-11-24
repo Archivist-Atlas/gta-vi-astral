@@ -45,6 +45,96 @@ func newD3D12XDevice() uintptr {
 		return hresultOK
 	})
 
+	// --- Objets DXGI (IDXGIDevice -> IDXGIAdapter -> IDXGIFactory / IDXGIOutput) ---
+	dxgiOutputObj := NewCOMObject("IDXGIOutput", 24, map[int]uintptr{
+		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK,
+		7: syscall.NewCallback(func(this, outDesc uintptr) uintptr { // GetDesc (DXGI_OUTPUT_DESC)
+			if outDesc != 0 {
+				// DesktopCoordinates = {0, 0, 1920, 1080}, AttachedToDesktop = 1
+				b := unsafe.Slice((*byte)(osPtr(outDesc)), 96)
+				for i := range b {
+					b[i] = 0
+				}
+				*(*int32)(osPtr(outDesc + 64 + 8)) = 1920
+				*(*int32)(osPtr(outDesc + 64 + 12)) = 1080
+				*(*int32)(osPtr(outDesc + 80)) = 1
+			}
+			return hresultOK
+		}),
+	})
+	dxgiFactoryObj := NewCOMObject("IDXGIFactory", 32, map[int]uintptr{
+		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK,
+	})
+	dxgiAdapterObj := NewCOMObject("IDXGIAdapter", 24, map[int]uintptr{
+		3: cbOK, 4: cbOK, 5: cbOK,
+		6: syscall.NewCallback(func(this, iid, outPtr uintptr) uintptr { // GetParent -> IDXGIFactory
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = dxgiFactoryObj
+			}
+			return hresultOK
+		}),
+		7: syscall.NewCallback(func(this, index, outPtr uintptr) uintptr { // EnumOutputs
+			if index != 0 {
+				return 0x887A0002 // DXGI_ERROR_NOT_FOUND
+			}
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = dxgiOutputObj
+			}
+			return hresultOK
+		}),
+		8: syscall.NewCallback(func(this, outDesc uintptr) uintptr { // GetDesc (DXGI_ADAPTER_DESC)
+			if outDesc != 0 {
+				b := unsafe.Slice((*byte)(osPtr(outDesc)), 312)
+				for i := range b {
+					b[i] = 0
+				}
+				name, _ := syscall.UTF16FromString("ASTRAL Xbox Series GPU")
+				dst := unsafe.Slice((*uint16)(osPtr(outDesc)), len(name))
+				copy(dst, name)
+				// VendorId=AMD (0x1002), DedicatedVideoMemory=10 GiB
+				*(*uint32)(osPtr(outDesc + 256)) = 0x1002
+				*(*uint64)(osPtr(outDesc + 272)) = uint64(10) << 30
+			}
+			return hresultOK
+		}),
+	})
+	dxgiDeviceObj := NewCOMObject("IDXGIDevice", 16, map[int]uintptr{
+		0: syscall.NewCallback(func(this, iid, outPtr uintptr) uintptr {
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = st.deviceObj
+			}
+			return hresultOK
+		}),
+		3: cbOK, 4: cbOK, 5: cbOK,
+		6: syscall.NewCallback(func(this, iid, outPtr uintptr) uintptr { // GetParent -> IDXGIAdapter
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = dxgiAdapterObj
+			}
+			return hresultOK
+		}),
+		7: syscall.NewCallback(func(this, outPtr uintptr) uintptr { // GetAdapter
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = dxgiAdapterObj
+			}
+			return hresultOK
+		}),
+	})
+
+	cbDeviceQI := syscall.NewCallback(func(this, iid, outPtr uintptr) uintptr {
+		if outPtr == 0 {
+			return hresultInvalidArg
+		}
+		g := FormatGUID(iid)
+		if g == "{54EC77FA-1377-44E6-8C32-88FD5F44C84C}" ||
+			g == "{77DB970F-6276-48BA-BA28-070143B4392C}" ||
+			g == "{05008617-FBFD-4051-A790-144884B4F6A9}" {
+			*(*uintptr)(osPtr(outPtr)) = dxgiDeviceObj
+			return hresultOK
+		}
+		*(*uintptr)(osPtr(outPtr)) = st.deviceObj
+		return hresultOK
+	})
+
 	// Helpers de création d'objets enfants D3D12.X
 	newQueue := func() uintptr {
 		st.queuesCreated.Add(1)
@@ -82,10 +172,13 @@ func newD3D12XDevice() uintptr {
 		// En-tête de 0x100 octets mis à zéro => PutPointer == LimitPointer == 0 (interception vtable)
 		return NewCOMObjectWithHeader("ID3D12GraphicsCommandListX", 160, 0x100, map[int]uintptr{
 			3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
-			8:  cbOK, // GetType
-			9:  cbOK, // Close
-			10: cbOK, // Reset
-			11: cbOK, // ClearState
+			8:   cbOK, // GetType
+			9:   cbOK, // Close
+			10:  cbOK, // Reset
+			11:  cbOK, // ClearState
+			131: cbOK, // 0x418 GPU sync (VIctory list.rs)
+			132: cbOK, // 0x420 GPU sync
+			139: cbOK, // 0x458 ResetX
 		})
 	}
 
@@ -122,9 +215,34 @@ func newD3D12XDevice() uintptr {
 		return obj
 	}
 
-	newDescriptorHeap := func() uintptr {
+	newDescriptorHeap := func(descPtr uintptr) uintptr {
 		st.heapsCreated.Add(1)
-		base := st.nextHeapBase.Add(0x1000000) // 16 MiB par heap
+		// D3D12_DESCRIPTOR_HEAP_DESC : { Type u32, NumDescriptors u32, Flags u32, NodeMask u32 }
+		numDescs := uintptr(4096)
+		stride := uintptr(128)
+		if descPtr != 0 {
+			heapType := *(*uint32)(osPtr(descPtr))
+			n := *(*uint32)(osPtr(descPtr + 4))
+			if n > 0 && n <= 1_048_576 {
+				numDescs = uintptr(n)
+			}
+			switch heapType {
+			case 0:
+				stride = 32
+			case 1:
+				stride = 16
+			default:
+				stride = 128
+			}
+		}
+		bytes := numDescs * stride
+		if bytes < 65536 {
+			bytes = 65536
+		}
+		baseAddr, _, _ := k32VirtualAlloc.Call(0, bytes, 0x3000 /* COMMIT|RESERVE */, 0x04 /* PAGE_READWRITE */)
+		if baseAddr == 0 {
+			baseAddr = uintptr(st.nextHeapBase.Add(0x1000000))
+		}
 		var obj uintptr
 		obj = NewCOMObject("ID3D12DescriptorHeapX", 16, map[int]uintptr{
 			3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
@@ -143,7 +261,7 @@ func newD3D12XDevice() uintptr {
 			}),
 		})
 		st.mu.Lock()
-		st.heapBases[obj] = base
+		st.heapBases[obj] = uint64(baseAddr)
 		st.mu.Unlock()
 		return obj
 	}
@@ -210,7 +328,7 @@ func newD3D12XDevice() uintptr {
 	})
 	cbCreateDescHeap := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newDescriptorHeap()
+			*(*uintptr)(osPtr(outPtr)) = newDescriptorHeap(desc)
 		}
 		return hresultOK
 	})
@@ -305,6 +423,7 @@ func newD3D12XDevice() uintptr {
 	// Allocation de ID3D12DeviceX avec en-tête 0x58 octets (VIctory device.rs)
 	// et octet +0x18 = 1 (out_of_line[0] = 1 pour forcer le passage par la vtable).
 	st.deviceObj = NewCOMObjectWithHeader("ID3D12DeviceX", 160, 0x58, map[int]uintptr{
+		0:   cbDeviceQI,
 		3:   cbOK, // GetPrivateData
 		4:   cbOK, // SetPrivateData
 		5:   cbOK, // SetPrivateDataInterface

@@ -706,6 +706,7 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	d3d12DeviceObj := newD3D12XDevice()
 	cbCreateDeviceX := syscall.NewCallback(func(adapter, params, iidPtr, outPtr uintptr) uintptr {
 		slog.Info("d3d12_xs!D3D12XboxCreateDevice -> ID3D12DeviceX COM actif", "iid", FormatGUID(iidPtr))
+		gpu.EnsureWindow("gta-vi-astral — GTA VI (Xbox Series)", 1280, 720)
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = d3d12DeviceObj
 		}
