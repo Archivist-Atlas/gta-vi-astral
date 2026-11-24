@@ -28,23 +28,23 @@ type MappedModule struct {
 
 // LiveSession regroupe l'ensemble des modules mappés et la table de résolution active.
 type LiveSession struct {
-	Main           *MappedModule
-	Modules        []*MappedModule
-	modulesByName  map[string]*MappedModule
-	hostModules    map[string]uintptr
-	BoundHLE       int
-	BoundHost      int
-	BoundTitleDLL  int
-	BoundStubs     int
-	TLSSlot        uint32
-	TLSPatched     int
-	DataDir        string
+	Main          *MappedModule
+	Modules       []*MappedModule
+	modulesByName map[string]*MappedModule
+	hostModules   map[string]uintptr
+	BoundHLE      int
+	BoundHost     int
+	BoundTitleDLL int
+	BoundStubs    int
+	TLSSlot       uint32
+	TLSPatched    int
+	DataDir       string
 }
 
 var (
-	vehOnce     sync.Once
-	vehMu       sync.RWMutex
-	vehSession  *LiveSession
+	vehOnce    sync.Once
+	vehMu      sync.RWMutex
+	vehSession *LiveSession
 )
 
 // MapOptions configure le mappage natif Windows d'un exécutable console.
@@ -295,6 +295,16 @@ func (s *LiveSession) RunEntryPoint() (uint32, error) {
 		return 0, fmt.Errorf("point d'entrée invalide")
 	}
 
+	// 0. Exécute DllMain(DLL_PROCESS_ATTACH) des DLL du titre chargées en mode passif
+	for _, mod := range s.Modules {
+		if mod == s.Main || mod.Info == nil || mod.Info.EntryRVA == 0 {
+			continue
+		}
+		dllMain := mod.Base + uintptr(mod.Info.EntryRVA)
+		slog.Info("exécution DllMain titre", "module", mod.Name, "rva", fmt.Sprintf("0x%X", mod.Info.EntryRVA))
+		_, _, _ = syscall.SyscallN(dllMain, mod.Base, 1 /* DLL_PROCESS_ATTACH */, 0)
+	}
+
 	// 1. Exécute les callbacks TLS de l'image principale
 	if s.Main.Info.TLS != nil {
 		for idx, cbRVA := range s.Main.Info.TLS.CallbackRVAs {
@@ -369,9 +379,16 @@ func installVEH(sess *LiveSession) {
 				return 0
 			}
 			addr := ep.ExceptionRecord.ExceptionAddress
-			// Émulation AMD Zen 2 CLZERO (0F 01 FC) sur CPU Intel (0xC000001D = STATUS_ILLEGAL_INSTRUCTION)
+			// Émulation AMD Zen 2 sur CPU Intel (0xC000001D = STATUS_ILLEGAL_INSTRUCTION) :
+			// - CLZERO   (0F 01 FC) : met à zéro la ligne de cache 64 octets pointée par RAX
+			// - MONITORX (0F 01 FA) / MWAITX (0F 01 FB) : attente basse consommation (no-op sûr)
 			if code == 0xC000001D && ep.ContextRecord != 0 && addr > 0x10000 {
 				b := unsafe.Slice((*byte)(ptrFromAddr(addr)), 12)
+				if b[0] == 0x0F && b[1] == 0x01 && (b[2] == 0xFA || b[2] == 0xFB) {
+					ripPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0xF8))
+					*ripPtr += 3
+					return ^uintptr(0) // EXCEPTION_CONTINUE_EXECUTION (-1)
+				}
 				if b[0] == 0x0F && b[1] == 0x01 && b[2] == 0xFC {
 					raxPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0x78))
 					ripPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0xF8))
@@ -404,7 +421,7 @@ func installVEH(sess *LiveSession) {
 				dataDir = s.DataDir
 			}
 			msg := fmt.Sprintf("ASTRAL VEH: exception 0x%08X à %s", code, where)
-			if (code == 0xC0000005 || code == 0x80000003) && ep.ContextRecord != 0 {
+			if (code == 0xC0000005 || code == 0x80000003 || code == 0xC0000374) && ep.ContextRecord != 0 {
 				if code == 0xC0000005 && ep.ExceptionRecord.NumberParameters >= 2 {
 					op := "read"
 					if ep.ExceptionRecord.ExceptionInformation[0] == 1 {

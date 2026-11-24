@@ -336,38 +336,125 @@ func bindXG(t *LiveTable) {
 		if st == nil {
 			return hresultInvalidArg
 		}
-		totalTiles := uint32((st.totalSize + 65535) / 65536)
+		// Dimensions standard d'une tuile 64 KiB D3D12 / RDNA2 selon (bpe, blockSize).
+		var tileW, tileH, tileD uint32 = 128, 128, 1
+		if st.blockSize == 4 {
+			if st.bpe <= 8 { // BC1 / BC4 (8 B / bloc 4x4) -> 128x64 blocs = 512x256 texels
+				tileW, tileH = 512, 256
+			} else { // BC2 / BC3 / BC5 / BC6H / BC7 (16 B / bloc 4x4) -> 64x64 blocs = 256x256 texels
+				tileW, tileH = 256, 256
+			}
+		} else {
+			switch st.bpe {
+			case 1:
+				tileW, tileH = 256, 256
+			case 2:
+				tileW, tileH = 256, 128
+			case 4:
+				tileW, tileH = 128, 128
+			case 8:
+				tileW, tileH = 128, 64
+			default: // 12 / 16 B
+				tileW, tileH = 64, 64
+			}
+		}
+		if st.desc.Dimension == 4 { // Texture3D : tuile 3D 64 KiB
+			tileW, tileH, tileD = 32, 32, 16
+		}
+
+		// Séparation mips standards (>= 1 tuile) vs mips packés (< 1 tuile).
+		numMips := len(st.mips)
+		numStandard := 0
+		for i := 0; i < numMips; i++ {
+			m := st.mips[i]
+			if m.Width < tileW || m.Height < tileH || m.Depth < tileD {
+				break
+			}
+			numStandard++
+		}
+		numPacked := numMips - numStandard
+
+		type subTiling struct {
+			w, h, d, start uint32
+		}
+		subTilings := make([]subTiling, numMips)
+		var tileIdx uint32
+		for i := 0; i < numStandard; i++ {
+			m := st.mips[i]
+			wt := (m.Width + tileW - 1) / tileW
+			ht := (m.Height + tileH - 1) / tileH
+			dt := (m.Depth + tileD - 1) / tileD
+			if wt == 0 {
+				wt = 1
+			}
+			if ht == 0 {
+				ht = 1
+			}
+			if dt == 0 {
+				dt = 1
+			}
+			subTilings[i] = subTiling{w: wt, h: ht, d: dt, start: tileIdx}
+			tileIdx += wt * ht * dt
+		}
+		var tilesForPacked, startPacked uint32
+		if numPacked > 0 {
+			tilesForPacked = 1
+			startPacked = tileIdx
+			tileIdx += tilesForPacked
+			for i := numStandard; i < numMips; i++ {
+				subTilings[i] = subTiling{w: 0, h: 0, d: 0, start: 0xFFFFFFFF} // D3D12_PACKED_TILE
+			}
+		}
+		arraySlices := uint32(st.desc.DepthOrArray)
+		if st.desc.Dimension == 4 || arraySlices == 0 {
+			arraySlices = 1
+		}
+		totalTiles := tileIdx * arraySlices
 		if totalTiles == 0 {
 			totalTiles = 1
 		}
+
 		if tilesPtr != 0 {
 			*(*uint32)(osPtr(tilesPtr)) = totalTiles
 		}
 		if packedPtr != 0 {
-			*(*uint8)(osPtr(packedPtr + 0)) = uint8(len(st.mips))
-			*(*uint8)(osPtr(packedPtr + 1)) = 0
-			*(*uint32)(osPtr(packedPtr + 4)) = 0
-			*(*uint32)(osPtr(packedPtr + 8)) = totalTiles
+			*(*uint8)(osPtr(packedPtr + 0)) = uint8(numStandard)
+			*(*uint8)(osPtr(packedPtr + 1)) = uint8(numPacked)
+			*(*uint32)(osPtr(packedPtr + 4)) = tilesForPacked
+			*(*uint32)(osPtr(packedPtr + 8)) = startPacked
 		}
 		if shapePtr != 0 {
-			*(*uint32)(osPtr(shapePtr + 0)) = 128
-			*(*uint32)(osPtr(shapePtr + 4)) = 128
-			*(*uint32)(osPtr(shapePtr + 8)) = 1
+			*(*uint32)(osPtr(shapePtr + 0)) = tileW
+			*(*uint32)(osPtr(shapePtr + 4)) = tileH
+			*(*uint32)(osPtr(shapePtr + 8)) = tileD
 		}
 		if countPtr != 0 {
 			avail := *(*uint32)(osPtr(countPtr))
-			n := uint32(len(st.mips))
-			if avail < n {
-				n = avail
+			firstIdx := uint32(first)
+			totalSubs := uint32(numMips) * arraySlices
+			var n uint32
+			if firstIdx < totalSubs {
+				n = totalSubs - firstIdx
+				if avail < n {
+					n = avail
+				}
 			}
 			*(*uint32)(osPtr(countPtr)) = n
-			if outTilings != 0 {
+			if outTilings != 0 && numMips > 0 {
 				for i := uint32(0); i < n; i++ {
+					subIdx := firstIdx + i
+					sliceIdx := subIdx / uint32(numMips)
+					mipIdx := subIdx % uint32(numMips)
+					stSub := subTilings[mipIdx]
+					start := stSub.start
+					if start != 0xFFFFFFFF {
+						start += sliceIdx * tileIdx
+					}
 					p := outTilings + uintptr(i)*12
-					*(*uint32)(osPtr(p + 0)) = 1
-					*(*uint16)(osPtr(p + 4)) = 1
-					*(*uint16)(osPtr(p + 6)) = 1
-					*(*uint32)(osPtr(p + 8)) = i
+					*(*uint32)(osPtr(p + 0)) = stSub.w
+					*(*uint16)(osPtr(p + 4)) = uint16(stSub.h)
+					*(*uint16)(osPtr(p + 6)) = uint16(stSub.d)
+					*(*uint32)(osPtr(p + 8)) = start
 				}
 			}
 		}

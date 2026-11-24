@@ -5,6 +5,7 @@ package hle
 import (
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -20,19 +21,19 @@ type LiveTable struct {
 }
 
 var (
-	k32              = syscall.NewLazyDLL("kernel32.dll")
-	kbase            = syscall.NewLazyDLL("kernelbase.dll")
-	k32VirtualAlloc  = k32.NewProc("VirtualAlloc")
-	k32VirtualFree   = k32.NewProc("VirtualFree")
-	k32VirtualQuery  = k32.NewProc("VirtualQuery")
-	k32HeapAlloc     = k32.NewProc("HeapAlloc")
-	k32HeapFree      = k32.NewProc("HeapFree")
-	k32GetProcHeap   = k32.NewProc("GetProcessHeap")
-	k32GetCurrProc   = k32.NewProc("GetCurrentProcess")
-	k32LoadLibA      = k32.NewProc("LoadLibraryA")
-	k32LoadLibW      = k32.NewProc("LoadLibraryW")
-	k32LoadLibExA    = k32.NewProc("LoadLibraryExA")
-	k32LoadLibExW    = k32.NewProc("LoadLibraryExW")
+	k32                     = syscall.NewLazyDLL("kernel32.dll")
+	kbase                   = syscall.NewLazyDLL("kernelbase.dll")
+	k32VirtualAlloc         = k32.NewProc("VirtualAlloc")
+	k32VirtualFree          = k32.NewProc("VirtualFree")
+	k32VirtualQuery         = k32.NewProc("VirtualQuery")
+	k32HeapAlloc            = k32.NewProc("HeapAlloc")
+	k32HeapFree             = k32.NewProc("HeapFree")
+	k32GetProcHeap          = k32.NewProc("GetProcessHeap")
+	k32GetCurrProc          = k32.NewProc("GetCurrentProcess")
+	k32LoadLibA             = k32.NewProc("LoadLibraryA")
+	k32LoadLibW             = k32.NewProc("LoadLibraryW")
+	k32LoadLibExA           = k32.NewProc("LoadLibraryExA")
+	k32LoadLibExW           = k32.NewProc("LoadLibraryExW")
 	k32GetModHandleA        = k32.NewProc("GetModuleHandleA")
 	k32GetModHandleW        = k32.NewProc("GetModuleHandleW")
 	k32GetModFileNameA      = k32.NewProc("GetModuleFileNameA")
@@ -50,13 +51,13 @@ var (
 	k32DeleteFileW          = k32.NewProc("DeleteFileW")
 	k32GetProcessMemoryInfo = k32.NewProc("K32GetProcessMemoryInfo")
 	kbaseVirtAlloc2         = kbase.NewProc("VirtualAlloc2")
-	ucrtbase         = syscall.NewLazyDLL("ucrtbase.dll")
-	ucrtFopen        = ucrtbase.NewProc("fopen")
-	ucrtWFopen       = ucrtbase.NewProc("_wfopen")
-	ucrtWStat64      = ucrtbase.NewProc("_wstat64")
-	d3d12Host        = syscall.NewLazyDLL("d3d12.dll")
-	d3d12SerRoot     = d3d12Host.NewProc("D3D12SerializeRootSignature")
-	d3d12SerVerRoot  = d3d12Host.NewProc("D3D12SerializeVersionedRootSignature")
+	ucrtbase                = syscall.NewLazyDLL("ucrtbase.dll")
+	ucrtFopen               = ucrtbase.NewProc("fopen")
+	ucrtWFopen              = ucrtbase.NewProc("_wfopen")
+	ucrtWStat64             = ucrtbase.NewProc("_wstat64")
+	d3d12Host               = syscall.NewLazyDLL("d3d12.dll")
+	d3d12SerRoot            = d3d12Host.NewProc("D3D12SerializeRootSignature")
+	d3d12SerVerRoot         = d3d12Host.NewProc("D3D12SerializeVersionedRootSignature")
 
 	// IID_ID3D12Device : {189819f1-1db6-4b57-be54-1821339b85f7} (import de données)
 	iidID3D12Device = [16]byte{
@@ -70,6 +71,7 @@ var (
 	xmemHooksAddr  atomic.Uintptr
 	xmemHooksInit  atomic.Bool
 	xmemHooksCell  uintptr // cellule OS fixe (non déplacée par le GC) contenant __XMemAllocationHooks__
+	xmemVirtAllocs sync.Map
 )
 
 func ensureXMemHooksCell() uintptr {
@@ -168,6 +170,9 @@ func xmemAllocDefault(size, attrs uintptr) uintptr {
 	alignShift := (uint64(attrs) >> 24) & 0x1F
 	if alignShift >= 12 || size >= 65536 {
 		r, _, _ := k32VirtualAlloc.Call(0, size, 0x3000 /* COMMIT|RESERVE */, 0x04 /* PAGE_READWRITE */)
+		if r != 0 {
+			xmemVirtAllocs.Store(r, struct{}{})
+		}
 		return r
 	}
 	heap, _, _ := k32GetProcHeap.Call()
@@ -177,6 +182,10 @@ func xmemAllocDefault(size, attrs uintptr) uintptr {
 
 func xmemFreeDefault(ptr, attrs uintptr) {
 	if ptr == 0 {
+		return
+	}
+	if _, ok := xmemVirtAllocs.LoadAndDelete(ptr); ok {
+		_, _, _ = k32VirtualFree.Call(ptr, 0, 0x8000 /* MEM_RELEASE */)
 		return
 	}
 	alignShift := (uint64(attrs) >> 24) & 0x1F
@@ -407,15 +416,15 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 
 	cbXMemVirtualAlloc := syscall.NewCallback(func(base, size, kindArg, flagsArg, protectArg uintptr) uintptr {
 		const (
-			pages2M             uint32 = 0x20000000
-			pages64KBit         uint32 = 0x00400000
-			pages64K            uint32 = pages2M | pages64KBit
-			memCommit           uint32 = 0x00001000
-			memReserve          uint32 = 0x00002000
-			memReplacePH        uint32 = 0x00004000
-			memReservePH        uint32 = 0x00040000
-			hostProtMask        uint32 = 0x000001FF
-			pageNoAccess        uint32 = 0x00000001
+			pages2M      uint32 = 0x20000000
+			pages64KBit  uint32 = 0x00400000
+			pages64K     uint32 = pages2M | pages64KBit
+			memCommit    uint32 = 0x00001000
+			memReserve   uint32 = 0x00002000
+			memReplacePH uint32 = 0x00004000
+			memReservePH uint32 = 0x00040000
+			hostProtMask uint32 = 0x000001FF
+			pageNoAccess uint32 = 0x00000001
 		)
 		kind := uint32(kindArg)
 		prot := uint32(protectArg) & hostProtMask
@@ -584,7 +593,15 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		"{073B7DCB-1FCF-4030-94BE-E3C9EB623428}": NewCOMObject("xasync", 64, map[int]uintptr{
 			12: cbTaskQueueCreate, // 0x60 XTaskQueueCreate
 			13: cbTaskQueueCreate, // 0x68 XTaskQueueCreateComposite
-			29: cbGISuccess,       // 0xE8 CheckThread
+			14: syscall.NewCallback(func(this, q, outPtr uintptr) uintptr { // 0x70 XTaskQueueDuplicateHandle
+				if outPtr != 0 {
+					*(*uintptr)(osPtr(outPtr)) = q
+				}
+				return hresultOK
+			}),
+			15: cbGISuccess, // 0x78 XTaskQueueCloseHandle
+			25: cbGISuccess, // 0xC8 XTaskQueueTerminate
+			29: cbGISuccess, // 0xE8 CheckThread
 		}),
 		"{37E56907-2F10-41E8-B72F-36EDB185331A}": NewCOMObject("xnetworking", 64, map[int]uintptr{
 			15: cbNetConnectivityHint, // 0x78 GetConnectivityHint

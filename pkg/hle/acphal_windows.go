@@ -5,8 +5,13 @@ package hle
 import (
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
+)
+
+var (
+	k32CreateEventW = k32.NewProc("CreateEventW")
 )
 
 type apuRegion struct {
@@ -186,4 +191,70 @@ func bindAcpHal(t *LiveTable) {
 		t.bind(dll, "AcpHalReleaseShapeContexts", cbOK)
 		t.bind(dll, "AcpHalCreate", cbAcpHalCreate)
 	}
+
+	// --- xapu.dll (décodeur audio matériel Xbox Series) ---
+	var nextXApuHandle atomic.Uint64
+	nextXApuHandle.Store(0x880000)
+
+	cbXApuConnect := syscall.NewCallback(func(inPtr, outPtr, handleOut uintptr) uintptr {
+		if inPtr == 0 || outPtr == 0 || handleOut == 0 {
+			return hresultInvalidArg
+		}
+		// XApuConnectInput : { process u32 (+0), streams u32 (+4), cmds u32 (+8), data_bytes u32 (+12), frames u32 (+16), options u32 (+20) }
+		streams := *(*uint32)(osPtr(inPtr + 4))
+		dataBytes := *(*uint32)(osPtr(inPtr + 12))
+		options := *(*uint32)(osPtr(inPtr + 20))
+		var dataMem uintptr
+		if dataBytes > 0 {
+			allocSz := (uintptr(dataBytes) + 65535) &^ 65535
+			dataMem, _, _ = k32VirtualAlloc.Call(0, allocSz, 0x3000, 0x04)
+		}
+		var readyEv uintptr
+		if options&8 != 0 {
+			readyEv, _, _ = k32CreateEventW.Call(0, 0, 0, 0)
+		}
+		*(*uintptr)(osPtr(outPtr + 0)) = dataMem
+		*(*uintptr)(osPtr(outPtr + 8)) = readyEv
+		h := uintptr(nextXApuHandle.Add(1))
+		*(*uintptr)(osPtr(handleOut)) = h
+		slog.Info("xapu!XApuConnect", "streams", streams, "dataBytes", dataBytes, "handle", h)
+		return hresultOK
+	})
+	cbXApuGetResultCount := syscall.NewCallback(func(handle, totalPtr uintptr) uintptr {
+		if totalPtr != 0 {
+			*(*uint32)(osPtr(totalPtr)) = 0
+		}
+		return 0
+	})
+	cbXApuDequeueResult := syscall.NewCallback(func(handle, resPtr uintptr) uintptr {
+		return 0x8000000A // E_PENDING (aucun résultat en attente)
+	})
+	cbXApuGetUtilization := syscall.NewCallback(func(a, b, outPtr uintptr) uintptr {
+		if outPtr != 0 {
+			*(*uint32)(osPtr(outPtr)) = 256
+		}
+		return hresultOK
+	})
+	t.bind("xapu.dll", "XApuConnect", cbXApuConnect)
+	t.bind("xapu.dll", "XApuDisconnect", cbOK)
+	t.bind("xapu.dll", "XApuEnqueueCommand", cbOK)
+	t.bind("xapu.dll", "XApuDequeueResult", cbXApuDequeueResult)
+	t.bind("xapu.dll", "XApuGetResultCount", cbXApuGetResultCount)
+	t.bind("xapu.dll", "XApuGetUtilization", cbXApuGetUtilization)
+
+	// --- chad.dll (XDsp processeur audio DSP console) ---
+	cbXDspConnect := syscall.NewCallback(func(a, b, c, streams, flags, handleOut uintptr) uintptr {
+		if handleOut == 0 {
+			return hresultInvalidArg
+		}
+		h := uintptr(nextXApuHandle.Add(1))
+		*(*uintptr)(osPtr(handleOut)) = h
+		slog.Info("chad!XDspConnectWithMaximumStreamLimit", "streams", uint32(streams), "handle", h)
+		return hresultOK
+	})
+	t.bind("chad.dll", "XDspConnectWithMaximumStreamLimit", cbXDspConnect)
+	t.bind("chad.dll", "XDspDisconnect", cbOK)
+	t.bind("chad.dll", "XDspActivate", cbOK)
+	t.bind("chad.dll", "XDspDeactivate", cbOK)
+	t.bind("chad.dll", "XDspSubmitCommand", cbOK)
 }
