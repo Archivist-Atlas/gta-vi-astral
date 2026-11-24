@@ -621,8 +621,18 @@ func runInteractiveMenu() {
 		case "7":
 			if gameDir == "" {
 				runErr = fmt.Errorf("définissez d'abord le dossier du jeu (option 1)")
+			} else if self, exeErr := os.Executable(); exeErr != nil {
+				runErr = exeErr
 			} else {
-				runErr = cmdRun([]string{"-execute", "-unimplemented", "log", filepath.Join(gameDir, game.ExpectedExecutable)})
+				// Lance l'exécution native dans un processus enfant pour que le menu
+				// reste ouvert et lisible même si le binaire console déclenche une exception.
+				child := exec.Command(self, "run", "-execute", "-unimplemented", "log", filepath.Join(gameDir, game.ExpectedExecutable))
+				child.Stdout = os.Stdout
+				child.Stderr = os.Stderr
+				child.Stdin = os.Stdin
+				if err := child.Run(); err != nil {
+					fmt.Printf("\nProcessus jeu terminé : %v\n", err)
+				}
 			}
 		case "8":
 			runErr = cmdConfig(nil)
