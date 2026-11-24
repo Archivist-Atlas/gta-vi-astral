@@ -12,21 +12,24 @@
 
 ## Phase 2 — Traducteur Shaders complet (IR SSA -> DXIL & SPIR-V)
 - [x] Levée 1:1 en IR SSA avec filtrage des ops de planification et suivi des gardes `EXEC` (`pkg/shader/ssa.go`).
-- [ ] Structuration complète du flux de contrôle (élimination des masques `EXEC`).
+- [x] Base d'émetteur binaire **SPIR-V 1.2** en Go pur (`pkg/shader/emit_spirv.go` : en-tête, capabilities, `OpEntryPoint`, `OpExecutionMode`, squelette fonctionnel).
+- [ ] Structuration complète du flux de contrôle (élimination des masques `EXEC`) et abaissement ALU/mémoire/images.
 - [ ] Analyse de flux de données pour les descripteurs et boucles waterfall (`v_readfirstlane_b32`).
 - [ ] Émetteur binaire **DXIL SM 6.6** (LLVM 3.7 bitcode + conteneur DXBC signé).
-- [ ] Émetteur **SPIR-V 1.2** + mode `--wave64-emulate` validé par `spirv-val`.
-- [ ] Suite de tests sémantiques et différentiels sur GPU / WARP.
+- [ ] Validation `spirv-val` + mode `--wave64-emulate` + tests différentiels GPU / WARP.
 
 ## Phase 3 — Chargeur natif Windows & Shims HLE live
 - [x] Mappage mémoire natif Windows (`LoadLibraryExW` sur image passive-DLL + redirection des 53 246 accès TLS slot 0 + binding IAT réel + chargement récursif des DLL du titre).
 - [x] Génération dynamique de thunks x86-64 pour les imports non implémentés (`log`/`zero`/`fail`/`trap`).
-- [x] Gestionnaire d'exceptions VEH (`module+RVA` -> `crashes.log`).
-- [x] Premiers shims exécutables live : `XMemVirtualAlloc` (`VirtualAlloc2` avec plages 40-bit/32-bit), `XMemAlloc/Free`, `D3D12ConfigureVirtualMemoryX`, `LoadLibrary*/GetProcAddress` console, `xgameruntime` (`InitializeApiImpl*`, `QueryApiImpl` avec décodage GUID), `GameInputCreate`, isolation réseau hors-ligne.
-- [ ] Implémentation complète des interfaces COM `QueryApiImpl` (`XUser`, `XGameSave`, `XStore`, `XPackage`, `XAsync`), `xcrdapi` (DirectStorage + BCPack BC1–BC7), `AcpHal` (XMA2) et `xapu` (Opus).
+- [x] Gestionnaire d'exceptions VEH (`module+RVA`, adresse fautive, registres x64 et octets `RIP` -> `crashes.log`).
+- [x] Mémoire physique console complète (`pkg/hle/xmem_windows.go` : `XMemAllocatePhysicalPages` / `XMemMapPhysicalPages` sur sections `SEC_RESERVE` + `MapViewOfFile3`).
+- [x] Moteur DirectStorage réel (`pkg/hle/dstorage_windows.go` : ouverture des 12 `.rpf` via `VirtualFS`, lectures `ReadAt` et décompression `zlib`).
+- [x] Shims exécutables live : `VirtualFS` (`G:\`/`T:\`), `xgameruntime` (`xasync`, `xnetworking`, `xuser`, `xgame`, `xsystem`, `xpackage`, `storage`, `display`), `GameInputCreate`, isolation réseau hors-ligne.
+- [ ] Implémentation complète des codecs audio/texture temps réel (`BCPack` BC1–BC7, `AcpHal` XMA2, `xapu` Opus) et sauvegardes `XGameSave`.
 
 ## Phase 4 — Exécution GPU (Boot -> Menus -> Monde)
-- [ ] Proxy COM Xbox `d3d12_xs.dll` connecté au backend D3D12 hôte (et/ou Vulkan bindless).
-- [ ] Synchronisation mémoire unifiée (WriteWatch / shadow buffers) et détuilage textures RDNA2.
+- [x] Proxy COM Xbox `d3d12_xs.dll` (`pkg/hle/d3d12x_windows.go` : `ID3D12DeviceX` 200 slots, `IDXGIDevice`/`Adapter`/`Factory`/`Output`, 581 command lists, descriptor heaps placés, `CreateCommittedResource3`, `GetResourceAllocationInfo2`, tokens de trame).
+- [x] Fenêtre Win32 native (`pkg/gpu/window_windows.go`) + initialisation réelle du **`ID3D12Device` matériel Windows** et de la **SwapChain DXGI** (`pkg/gpu/d3d12_host_windows.go`).
+- [ ] Enregistrement/rejeu des command lists sur le `ID3D12Device` hôte + synchronisation mémoire unifiée (WriteWatch / shadow buffers) et détuilage textures RDNA2.
 - [ ] Compilation asynchrone des PSO + persistance sur disque + garde-fou `ExecuteIndirect`.
 - [ ] Support Mesh Shaders, 64-bit image atomics et constructeur XDXR BVH4 pour le rendu du monde.

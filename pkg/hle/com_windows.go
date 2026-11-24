@@ -142,6 +142,11 @@ func NewCOMObjectWithHeader(area string, numSlots, headerBytes int, overrides ma
 	vtable[0] = comQICb
 	vtable[1] = comAddRefCb
 	vtable[2] = comAddRefCb
+	for i := 0; i < 3; i++ {
+		if fn, ok := overrides[i]; ok && fn != 0 {
+			vtable[i] = fn
+		}
+	}
 	for i := 3; i < numSlots; i++ {
 		if fn, ok := overrides[i]; ok && fn != 0 {
 			vtable[i] = fn

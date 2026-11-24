@@ -526,50 +526,8 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	t.bind("gameinput.dll", "#1", cbGameInputCreate)
 	t.bind("gameinput.dll", "GameInputCreate", cbGameInputCreate)
 
-	// --- 3c. XCRDAPI.dll!DStorageGetFactory (DirectStorage Xbox Series) ---
-	dstorageQueueObj := NewCOMObject("IDStorageQueueX", 32, map[int]uintptr{
-		10: cbGISuccess, // Submit
-	})
-	dstorageStatusObj := NewCOMObject("IDStorageStatusArrayX", 16, map[int]uintptr{
-		3: cbReturnTrue, // IsComplete
-		4: cbGISuccess,  // GetHResult
-	})
-	dstorageFileObj := NewCOMObject("IDStorageFileX", 16, nil)
-	dstorageFactoryObj := NewCOMObject("IDStorageFactoryX", 32, map[int]uintptr{
-		3: syscall.NewCallback(func(this, descPtr, iidPtr, outPtr uintptr) uintptr { // CreateQueue
-			slog.Info("IDStorageFactoryX!CreateQueue -> IDStorageQueueX")
-			if outPtr != 0 {
-				*(*uintptr)(osPtr(outPtr)) = dstorageQueueObj
-			}
-			return hresultOK
-		}),
-		4: syscall.NewCallback(func(this, pathPtr, iidPtr, outPtr uintptr) uintptr { // OpenFile
-			slog.Info("IDStorageFactoryX!OpenFile", "path", readUTF16Str(pathPtr))
-			if outPtr != 0 {
-				*(*uintptr)(osPtr(outPtr)) = dstorageFileObj
-			}
-			return hresultOK
-		}),
-		5: syscall.NewCallback(func(this, capacity, namePtr, iidPtr, outPtr uintptr) uintptr { // CreateStatusArray
-			if outPtr != 0 {
-				*(*uintptr)(osPtr(outPtr)) = dstorageStatusObj
-			}
-			return hresultOK
-		}),
-		6: cbGISuccess, // SetDebugFlags
-		7: cbGISuccess, // SetStagingBufferSize
-		8: cbGISuccess, // SetStagingBufferSize / SetCpuAffinity (IDStorageFactoryX2)
-		9: cbGISuccess, // GetCompressionCodec / config
-	})
-	cbDStorageGetFactory := syscall.NewCallback(func(iidPtr, outPtr uintptr) uintptr {
-		slog.Info("XCRDAPI!DStorageGetFactory -> IDStorageFactoryX COM actif", "iid", FormatGUID(iidPtr))
-		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = dstorageFactoryObj
-		}
-		return hresultOK
-	})
-	t.bind("xcrdapi.dll", "DStorageGetFactory", cbDStorageGetFactory)
-	t.bind("dstorage_xs.dll", "DStorageGetFactory", cbDStorageGetFactory)
+	// --- 3c. XCRDAPI.dll!DStorageGetFactory (DirectStorage réel via pkg/hle/dstorage_windows.go) ---
+	bindDirectStorage(t, vfs)
 	t.bind("xgameruntime.dll", "XSystemGetDeviceType", cbGetDeviceType)
 	t.bind("xgameruntime.dll", "XSystemIsRemoteConnectEnabled", cbReturnFalse)
 	t.bind("xgameruntime.dll", "XErrorReport", cbReturnTrue)
@@ -706,7 +664,10 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	d3d12DeviceObj := newD3D12XDevice()
 	cbCreateDeviceX := syscall.NewCallback(func(adapter, params, iidPtr, outPtr uintptr) uintptr {
 		slog.Info("d3d12_xs!D3D12XboxCreateDevice -> ID3D12DeviceX COM actif", "iid", FormatGUID(iidPtr))
-		gpu.EnsureWindow("gta-vi-astral — GTA VI (Xbox Series)", 1280, 720)
+		hwnd := gpu.EnsureWindow("gta-vi-astral — GTA VI (Xbox Series)", 1280, 720)
+		if _, err := gpu.InitHostD3D12(hwnd, 1280, 720); err != nil {
+			slog.Warn("Host D3D12 non initialisé (mode logiciel/stub)", "err", err)
+		}
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = d3d12DeviceObj
 		}

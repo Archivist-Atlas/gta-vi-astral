@@ -379,12 +379,26 @@ func installVEH(sess *LiveSession) {
 				dataDir = s.DataDir
 			}
 			msg := fmt.Sprintf("ASTRAL VEH: exception 0x%08X à %s", code, where)
-			if code == 0xC0000005 && ep.ExceptionRecord.NumberParameters >= 2 {
-				op := "read"
-				if ep.ExceptionRecord.ExceptionInformation[0] == 1 {
-					op = "write"
+			if (code == 0xC0000005 || code == 0x80000003) && ep.ContextRecord != 0 {
+				if code == 0xC0000005 && ep.ExceptionRecord.NumberParameters >= 2 {
+					op := "read"
+					if ep.ExceptionRecord.ExceptionInformation[0] == 1 {
+						op = "write"
+					}
+					msg = fmt.Sprintf("%s (%s @ 0x%016X)", msg, op, ep.ExceptionRecord.ExceptionInformation[1])
 				}
-				msg = fmt.Sprintf("%s (%s @ 0x%016X)", msg, op, ep.ExceptionRecord.ExceptionInformation[1])
+				if addr > 0x10000 {
+					codeBytes := unsafe.Slice((*byte)(ptrFromAddr(addr)), 16)
+					msg = fmt.Sprintf("%s bytes=% X", msg, codeBytes)
+				}
+				// Offsets Windows x64 CONTEXT : Rax=+0x78, Rcx=+0x80, Rdx=+0x88, Rbx=+0x90, Rsp=+0x98, R8=+0xB8, R9=+0xC0
+				rax := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0x78))
+				rcx := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0x80))
+				rdx := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0x88))
+				rbx := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0x90))
+				r8 := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0xB8))
+				r9 := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0xC0))
+				msg = fmt.Sprintf("%s rax=0x%X rcx=0x%X rdx=0x%X rbx=0x%X r8=0x%X r9=0x%X", msg, rax, rcx, rdx, rbx, r8, r9)
 			}
 			slog.Error(msg)
 			if dataDir != "" {
