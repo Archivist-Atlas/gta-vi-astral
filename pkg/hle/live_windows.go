@@ -36,10 +36,16 @@ var (
 	k32GetModHandleA = k32.NewProc("GetModuleHandleA")
 	k32GetModHandleW  = k32.NewProc("GetModuleHandleW")
 	k32GetProcAddr    = k32.NewProc("GetProcAddress")
-	k32CreateFileW    = k32.NewProc("CreateFileW")
-	k32GetFileAttrW   = k32.NewProc("GetFileAttributesW")
-	k32GetFileAttrExW = k32.NewProc("GetFileAttributesExW")
+	k32CreateFileW          = k32.NewProc("CreateFileW")
+	k32CreateFileA          = k32.NewProc("CreateFileA")
+	k32CreateFile2          = kbase.NewProc("CreateFile2")
+	k32GetFileAttrW         = k32.NewProc("GetFileAttributesW")
+	k32GetFileAttrA         = k32.NewProc("GetFileAttributesA")
+	k32GetFileAttrExW       = k32.NewProc("GetFileAttributesExW")
 	k32FindFirstFileW       = k32.NewProc("FindFirstFileW")
+	k32FindFirstFileExW     = k32.NewProc("FindFirstFileExW")
+	k32CreateDirW           = k32.NewProc("CreateDirectoryW")
+	k32DeleteFileW          = k32.NewProc("DeleteFileW")
 	k32GetProcessMemoryInfo = k32.NewProc("K32GetProcessMemoryInfo")
 	kbaseVirtAlloc2         = kbase.NewProc("VirtualAlloc2")
 	d3d12Host        = syscall.NewLazyDLL("d3d12.dll")
@@ -680,13 +686,64 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			return p, true
 		}
 
+		rewriteA := func(pathPtr uintptr, isWrite bool) ([]byte, bool) {
+			if pathPtr == 0 {
+				return nil, false
+			}
+			orig := readANSIStr(pathPtr)
+			var mapped string
+			var changed bool
+			if isWrite {
+				if m, err := vfs.ResolveWrite(orig); err == nil && m != orig {
+					mapped, changed = m, true
+				}
+			} else {
+				mapped, changed = vfs.ResolveRead(orig)
+			}
+			if !changed {
+				return nil, false
+			}
+			slog.Debug("VirtualFS rewriteA", "from", orig, "to", mapped)
+			return append([]byte(mapped), 0), true
+		}
+
 		cbCreateFileW := syscall.NewCallback(func(namePtr, access, share, sec, disp, flags, tmpl uintptr) uintptr {
 			isWrite := (access & 0x40000000) != 0 // GENERIC_WRITE
+			var r uintptr
 			if mapped, ok := rewriteW(namePtr, isWrite); ok {
-				r, _, _ := k32CreateFileW.Call(uintptr(unsafe.Pointer(mapped)), access, share, sec, disp, flags, tmpl)
-				return r
+				r, _, _ = k32CreateFileW.Call(uintptr(unsafe.Pointer(mapped)), access, share, sec, disp, flags, tmpl)
+			} else {
+				r, _, _ = k32CreateFileW.Call(namePtr, access, share, sec, disp, flags, tmpl)
 			}
-			r, _, _ := k32CreateFileW.Call(namePtr, access, share, sec, disp, flags, tmpl)
+			if r == ^uintptr(0) && namePtr != 0 {
+				slog.Debug("CreateFileW échoué", "path", readUTF16Str(namePtr))
+			}
+			return r
+		})
+		cbCreateFileA := syscall.NewCallback(func(namePtr, access, share, sec, disp, flags, tmpl uintptr) uintptr {
+			isWrite := (access & 0x40000000) != 0
+			var r uintptr
+			if mapped, ok := rewriteA(namePtr, isWrite); ok {
+				r, _, _ = k32CreateFileA.Call(uintptr(unsafe.Pointer(&mapped[0])), access, share, sec, disp, flags, tmpl)
+			} else {
+				r, _, _ = k32CreateFileA.Call(namePtr, access, share, sec, disp, flags, tmpl)
+			}
+			if r == ^uintptr(0) && namePtr != 0 {
+				slog.Debug("CreateFileA échoué", "path", readANSIStr(namePtr))
+			}
+			return r
+		})
+		cbCreateFile2 := syscall.NewCallback(func(namePtr, access, share, disp, extParams uintptr) uintptr {
+			isWrite := (access & 0x40000000) != 0
+			var r uintptr
+			if mapped, ok := rewriteW(namePtr, isWrite); ok {
+				r, _, _ = k32CreateFile2.Call(uintptr(unsafe.Pointer(mapped)), access, share, disp, extParams)
+			} else {
+				r, _, _ = k32CreateFile2.Call(namePtr, access, share, disp, extParams)
+			}
+			if r == ^uintptr(0) && namePtr != 0 {
+				slog.Debug("CreateFile2 échoué", "path", readUTF16Str(namePtr))
+			}
 			return r
 		})
 		cbGetFileAttrW := syscall.NewCallback(func(namePtr uintptr) uintptr {
@@ -695,6 +752,14 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				return r
 			}
 			r, _, _ := k32GetFileAttrW.Call(namePtr)
+			return r
+		})
+		cbGetFileAttrA := syscall.NewCallback(func(namePtr uintptr) uintptr {
+			if mapped, ok := rewriteA(namePtr, false); ok {
+				r, _, _ := k32GetFileAttrA.Call(uintptr(unsafe.Pointer(&mapped[0])))
+				return r
+			}
+			r, _, _ := k32GetFileAttrA.Call(namePtr)
 			return r
 		})
 		cbGetFileAttrExW := syscall.NewCallback(func(namePtr, level, infoPtr uintptr) uintptr {
@@ -713,6 +778,30 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			r, _, _ := k32FindFirstFileW.Call(namePtr, dataPtr)
 			return r
 		})
+		cbFindFirstFileExW := syscall.NewCallback(func(namePtr, infoLevel, dataPtr, searchOp, filter, flags uintptr) uintptr {
+			if mapped, ok := rewriteW(namePtr, false); ok {
+				r, _, _ := k32FindFirstFileExW.Call(uintptr(unsafe.Pointer(mapped)), infoLevel, dataPtr, searchOp, filter, flags)
+				return r
+			}
+			r, _, _ := k32FindFirstFileExW.Call(namePtr, infoLevel, dataPtr, searchOp, filter, flags)
+			return r
+		})
+		cbCreateDirW := syscall.NewCallback(func(namePtr, sec uintptr) uintptr {
+			if mapped, ok := rewriteW(namePtr, true); ok {
+				r, _, _ := k32CreateDirW.Call(uintptr(unsafe.Pointer(mapped)), sec)
+				return r
+			}
+			r, _, _ := k32CreateDirW.Call(namePtr, sec)
+			return r
+		})
+		cbDeleteFileW := syscall.NewCallback(func(namePtr uintptr) uintptr {
+			if mapped, ok := rewriteW(namePtr, true); ok {
+				r, _, _ := k32DeleteFileW.Call(uintptr(unsafe.Pointer(mapped)))
+				return r
+			}
+			r, _, _ := k32DeleteFileW.Call(namePtr)
+			return r
+		})
 
 		for _, dll := range []string{
 			"kernel32.dll",
@@ -723,9 +812,15 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			"api-ms-win-core-file-l1-2-2.dll",
 		} {
 			t.bind(dll, "CreateFileW", cbCreateFileW)
+			t.bind(dll, "CreateFileA", cbCreateFileA)
+			t.bind(dll, "CreateFile2", cbCreateFile2)
 			t.bind(dll, "GetFileAttributesW", cbGetFileAttrW)
+			t.bind(dll, "GetFileAttributesA", cbGetFileAttrA)
 			t.bind(dll, "GetFileAttributesExW", cbGetFileAttrExW)
 			t.bind(dll, "FindFirstFileW", cbFindFirstFileW)
+			t.bind(dll, "FindFirstFileExW", cbFindFirstFileExW)
+			t.bind(dll, "CreateDirectoryW", cbCreateDirW)
+			t.bind(dll, "DeleteFileW", cbDeleteFileW)
 		}
 	}
 
@@ -936,7 +1031,12 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		r, _, _ := d3d12SerVerRoot.Call(descPtr, blobOut, errOut)
 		return r
 	})
-	cbConfigVirtMem := syscall.NewCallback(func() uintptr {
+	cbConfigVirtMem := syscall.NewCallback(func(cfgPtr uintptr) uintptr {
+		if cfgPtr != 0 {
+			// VirtualMemory (0x20 octets) : +0x10 lowest, +0x18 highest
+			*(*uint64)(osPtr(cfgPtr + 0x10)) = 0x0000000000010000
+			*(*uint64)(osPtr(cfgPtr + 0x18)) = 0x00007FFFFFFEFFFF
+		}
 		slog.Debug("d3d12_xs!D3D12ConfigureVirtualMemoryX -> S_OK")
 		return 0 // S_OK
 	})

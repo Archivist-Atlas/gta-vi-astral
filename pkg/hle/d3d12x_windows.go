@@ -101,7 +101,7 @@ func newD3D12XDevice() uintptr {
 			return hresultOK
 		}),
 		7: syscall.NewCallback(func(this, index, outPtr uintptr) uintptr { // EnumOutputs
-			if index != 0 {
+			if uint32(index) != 0 {
 				return 0x887A0002 // DXGI_ERROR_NOT_FOUND
 			}
 			if outPtr != 0 {
@@ -251,12 +251,34 @@ func newD3D12XDevice() uintptr {
 
 	// Vtable partagée pour toutes les ID3D12GraphicsCommandListX (GTA VI en crée 581+ au boot).
 	// En-tête de 0x1000 octets mis à zéro : PutPointer==LimitPointer==0 ET protège jusqu'au-delà de +0x564.
+	cbListCopyMem := syscall.NewCallback(func(this, dst, src, length, flags uintptr) uintptr {
+		if dst >= 0x10000 && src >= 0x10000 && length > 0 && length <= (256<<20) {
+			copy(unsafe.Slice((*byte)(osPtr(dst)), length), unsafe.Slice((*byte)(osPtr(src)), length))
+		}
+		return 0
+	})
+	cbListWrite32 := syscall.NewCallback(func(this, addr, val, flush, flags uintptr) uintptr {
+		if addr >= 0x10000 {
+			*(*uint32)(osPtr(addr)) = uint32(val)
+		}
+		return 0
+	})
+	cbListWrite64 := syscall.NewCallback(func(this, addr, val, flush, flags uintptr) uintptr {
+		if addr >= 0x10000 {
+			*(*uint64)(osPtr(addr)) = uint64(val)
+		}
+		return 0
+	})
 	cmdListSlots := map[int]uintptr{
 		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
 	}
 	for s := 8; s < 160; s++ {
 		cmdListSlots[s] = cbOK
 	}
+	cmdListSlots[60] = cbListCopyMem // CopyMemoryX (2020)
+	cmdListSlots[62] = cbListCopyMem // CopyMemoryX (2026)
+	cmdListSlots[71] = cbListWrite32 // WriteValueBottomOfPipe32 (2026, 0x238)
+	cmdListSlots[72] = cbListWrite64 // WriteValueBottomOfPipe64 (2026, 0x240)
 	cmdListProto := NewCOMObjectWithHeader("ID3D12GraphicsCommandListX", 160, 0x1000, cmdListSlots)
 	cmdListVtable := *(*uintptr)(osPtr(cmdListProto))
 
@@ -494,6 +516,30 @@ func newD3D12XDevice() uintptr {
 		}
 		return hresultOK
 	})
+	cbDeserializePSOX := syscall.NewCallback(func(this, state, iid, outPtr uintptr) uintptr {
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = 0
+		}
+		return hresultNotImpl
+	})
+	cbSerializePSOX := syscall.NewCallback(func(this, pso uintptr) uintptr {
+		return 0x80070005 // E_ACCESSDENIED
+	})
+	cbCreateDerivedPSOX := syscall.NewCallback(func(this, base, count, patches, iid, outPtr uintptr) uintptr {
+		st.psoCreated.Add(1)
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = newGenericChild("ID3D12PipelineStateX")
+		}
+		return hresultOK
+	})
+	cbCreateGraphicsPSOX := syscall.NewCallback(func(this, desc, extensions, extended, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateGraphicsPipelineStateX", "ext", extensions)
+		st.psoCreated.Add(1)
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = newGenericChild("ID3D12PipelineStateX")
+		}
+		return hresultOK
+	})
 	cbCreateComputePSOX := syscall.NewCallback(func(this, desc, extensions, extended, iid, outPtr uintptr) uintptr {
 		slog.Debug("D3D12DeviceX!CreateComputePipelineStateX", "ext", extensions)
 		st.psoCreated.Add(1)
@@ -524,7 +570,7 @@ func newD3D12XDevice() uintptr {
 		return hresultOK
 	})
 	cbDescIncrSize := syscall.NewCallback(func(this, heapType uintptr) uintptr {
-		switch heapType {
+		switch uint32(heapType) {
 		case 0: // CBV_SRV_UAV
 			return 32
 		case 1: // SAMPLER
@@ -586,7 +632,8 @@ func newD3D12XDevice() uintptr {
 		}
 		return outPtr
 	})
-	cbAllocInfo2 := syscall.NewCallback(func(outPtr, this, visible, count, descsPtr, eachPtr uintptr) uintptr {
+	cbAllocInfo2 := syscall.NewCallback(func(outPtr, this, visible, countArg, descsPtr, eachPtr uintptr) uintptr {
+		count := uintptr(uint32(countArg))
 		var total uint64
 		for i := uintptr(0); i < count; i++ {
 			// D3D12_RESOURCE_DESC1 fait 72 octets (56 + SamplerFeedbackMipRegion)
@@ -756,7 +803,9 @@ func newD3D12XDevice() uintptr {
 		return hresultOK
 	})
 
-	cbCheckFeatureSupport := syscall.NewCallback(func(this, feature, dataPtr, dataSize uintptr) uintptr {
+	cbCheckFeatureSupport := syscall.NewCallback(func(this, featureArg, dataPtr, dataSizeArg uintptr) uintptr {
+		feature := uint32(featureArg)
+		dataSize := uint32(dataSizeArg)
 		slog.Debug("D3D12DeviceX!CheckFeatureSupport", "feature", feature, "size", dataSize)
 		if dataPtr == 0 {
 			return hresultInvalidArg
@@ -765,7 +814,7 @@ func newD3D12XDevice() uintptr {
 		case 0: // D3D12_FEATURE_D3D12_OPTIONS (64 bytes = 16 u32)
 			if dataSize == 64 {
 				opts := [16]uint32{
-					1, 1, 0, 3, 3, 1, 1, 1,
+					1, 1, 2, 3, 3, 1, 1, 1,
 					3, 40, 0, 0, 0, 0, 1, 2,
 				}
 				dst := unsafe.Slice((*uint32)(osPtr(dataPtr)), 16)
@@ -801,6 +850,8 @@ func newD3D12XDevice() uintptr {
 				}
 				return hresultOK
 			}
+		default:
+			slog.Warn("D3D12DeviceX!CheckFeatureSupport non implémenté", "feature", feature, "size", dataSize)
 		}
 		return hresultOK
 	})
@@ -955,9 +1006,16 @@ func newD3D12XDevice() uintptr {
 		38:  cbCopyableFootprints,
 		39:  cbCreateQueryHeap,
 		41:  cbCreateCmdSig,
-		48:  cbCreateQueue, // CreateCommandQueueX
+		48:  cbCreateQueue,       // CreateCommandQueueX
+		52:  cbOK,                // SetDebugFlagsX
+		55:  cbCreateDerivedPSOX, // CreateDerivedPipelineStateX (6 args)
+		56:  cbSerializePSOX,     // SerializeGraphicsPipelineStateX
+		57:  cbDeserializePSOX,   // DeserializeGraphicsPipelineStateX
+		60:  cbCreateGraphicsPSOX, // CreateGraphicsPipelineStateX (6 args)
 		61:  logOK("CreateSampler2"),
 		62:  cbCreateComputePSOX, // CreateComputePipelineStateX (6 args)
+		66:  cbSerializePSOX,     // SerializeComputePipelineStateX
+		67:  cbDeserializePSOX,   // DeserializeComputePipelineStateX
 		69:  cbOK,          // Debug filter
 		70:  logOK("CreatePlacedSRV"),
 		71:  logOK("CreatePlacedUAV"),

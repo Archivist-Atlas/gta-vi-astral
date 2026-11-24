@@ -423,7 +423,26 @@ func installVEH(sess *LiveSession) {
 				rbx := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0x90))
 				r8 := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0xB8))
 				r9 := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0xC0))
+				rsp := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0x98))
 				msg = fmt.Sprintf("%s rax=0x%X rcx=0x%X rdx=0x%X rbx=0x%X r8=0x%X r9=0x%X", msg, rax, rcx, rdx, rbx, r8, r9)
+				if s != nil && rsp > 0x10000 {
+					var callers []string
+					stackWords := unsafe.Slice((*uintptr)(ptrFromAddr(uintptr(rsp))), 512)
+					for _, w := range stackWords {
+						for _, m := range s.Modules {
+							if w >= m.Base && w < m.Base+uintptr(m.Size) {
+								callers = append(callers, fmt.Sprintf("%s+0x%X", m.Name, w-m.Base))
+								break
+							}
+						}
+						if len(callers) >= 12 {
+							break
+						}
+					}
+					if len(callers) > 0 {
+						msg = fmt.Sprintf("%s stack=[%s]", msg, strings.Join(callers, ", "))
+					}
+				}
 			}
 			slog.Error(msg)
 			if dataDir != "" {

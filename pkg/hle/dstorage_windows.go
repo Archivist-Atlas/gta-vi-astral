@@ -90,11 +90,12 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		obj = NewCOMObject("IDStorageStatusArrayX", 16, map[int]uintptr{
 			3: syscall.NewCallback(func(this, index uintptr) uintptr { return 1 }), // IsComplete -> TRUE
 			4: syscall.NewCallback(func(this, index uintptr) uintptr { // GetHResult
+				idx := int(uint32(index))
 				ds.mu.Lock()
 				s := ds.statuses[this]
 				ds.mu.Unlock()
-				if s != nil && int(index) < len(s.results) {
-					return uintptr(s.results[index])
+				if s != nil && idx >= 0 && idx < len(s.results) {
+					return uintptr(s.results[idx])
 				}
 				return hresultOK
 			}),
@@ -128,11 +129,15 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				srcSize := *(*uint32)(osPtr(reqPtr + 0x30))
 
 				if dstPtr == 0 || dstSize == 0 || srcPtr == 0 {
+					slog.Warn("IDStorageQueueX!EnqueueRequest ignoré (null/zero)", "opts", opts, "dst", dstPtr, "dstSize", dstSize, "src", srcPtr, "srcSize", srcSize)
 					return 0
+				}
+				if opts > 1 {
+					slog.Warn("IDStorageQueueX!EnqueueRequest opts!=0/1", "opts", opts, "srcSize", srcSize, "dstSize", dstSize)
 				}
 				// PAGE_DESTINATION (bit 21) : destination est un tableau de numéros de pages 64 KiB
 				if opts&(1<<21) != 0 {
-					slog.Debug("IDStorageQueueX!EnqueueRequest (PAGE_DESTINATION)", "dstSize", dstSize, "srcSize", srcSize)
+					slog.Warn("IDStorageQueueX!EnqueueRequest (PAGE_DESTINATION non supporté)", "dstSize", dstSize, "srcSize", srcSize)
 					return 0
 				}
 
@@ -149,21 +154,32 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 					copy(raw, unsafe.Slice((*byte)(osPtr(srcPtr)), srcSize))
 				}
 				if len(raw) == 0 {
+					slog.Warn("IDStorageQueueX!EnqueueRequest raw vide", "opts", opts, "srcSize", srcSize, "dstSize", dstSize, "hasFile", fh != nil)
 					return 0
 				}
 
 				dst := unsafe.Slice((*byte)(osPtr(dstPtr)), dstSize)
+				var written int
 				if opts&1 != 0 { // ZLIB (RFC 1950)
 					if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
-						n, _ := io.ReadFull(zr, dst)
+						var rerr error
+						written, rerr = io.ReadFull(zr, dst)
 						_ = zr.Close()
-						ds.bytesRead.Add(uint64(n))
+						ds.bytesRead.Add(uint64(written))
+						if rerr != nil && rerr != io.EOF {
+							slog.Warn("IDStorageQueueX!EnqueueRequest zlib read err", "err", rerr, "written", written, "dstSize", dstSize)
+						}
+					} else {
+						slog.Warn("IDStorageQueueX!EnqueueRequest zlib err", "err", err, "srcSize", srcSize, "dstSize", dstSize)
 					}
 				} else {
-					n := copy(dst, raw)
-					ds.bytesRead.Add(uint64(n))
+					written = copy(dst, raw)
+					ds.bytesRead.Add(uint64(written))
 				}
-				ds.readCount.Add(1)
+				rc := ds.readCount.Add(1)
+				if rc <= 5 || rc%200 == 0 {
+					slog.Info("IDStorageQueueX!EnqueueRequest", "count", rc, "opts", opts, "srcSize", srcSize, "dstSize", dstSize, "written", written)
+				}
 				return 0
 			}),
 			4:  cbOK, // EnqueueStatus (0x20)
@@ -205,7 +221,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		}),
 		5: syscall.NewCallback(func(this, capacity, namePtr, iidPtr, outPtr uintptr) uintptr { // CreateStatusArray
 			if outPtr != 0 {
-				*(*uintptr)(osPtr(outPtr)) = newDSStatus(int(capacity))
+				*(*uintptr)(osPtr(outPtr)) = newDSStatus(int(uint32(capacity)))
 			}
 			return hresultOK
 		}),
