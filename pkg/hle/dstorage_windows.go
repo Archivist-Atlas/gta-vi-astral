@@ -105,55 +105,55 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		return obj
 	}
 
-	// IDStorageQueueX (32 slots) : slot 3 = EnqueueRequest, slot 4 = EnqueueStatus, slot 5 = EnqueueSignal, slot 10 = Submit
+	// IDStorageQueueX : slot 3 = EnqueueRequest, slot 4 = EnqueueStatus, slot 6 = Submit, slot 8 = Close
 	newDSQueue := func() uintptr {
 		return NewCOMObject("IDStorageQueueX", 32, map[int]uintptr{
 			3: syscall.NewCallback(func(this, reqPtr uintptr) uintptr { // EnqueueRequest
 				if reqPtr == 0 {
 					return 0
 				}
-				// DSTORAGE_REQUEST_X (layout simplifié) :
-				// +0x00 Options (u64) : bits 0..7 = CompressionFormat (0=None, 1=Zlib), bit 8 = SourceType (0=File, 1=Memory)
-				// +0x08 Source.File.File (ptr) / Source.Memory.Source (ptr)
-				// +0x10 Source.File.Offset (u64) / Source.Memory.Size (u32)
-				// +0x18 Source.File.Size (u32)
-				// +0x20 Destination.Memory.Buffer (ptr)
-				// +0x28 Destination.Memory.Size (u32) / UncompressedSize (u32)
-				opts := *(*uint64)(osPtr(reqPtr))
-				compFmt := opts & 0xFF
-				srcType := (opts >> 8) & 1
-				srcPtr := *(*uintptr)(osPtr(reqPtr + 0x08))
-				srcOff := *(*uint64)(osPtr(reqPtr + 0x10))
-				srcSize := *(*uint32)(osPtr(reqPtr + 0x18))
-				dstPtr := *(*uintptr)(osPtr(reqPtr + 0x20))
-				dstSize := *(*uint32)(osPtr(reqPtr + 0x28))
+				// DSTORAGE_REQUEST_X (0x48 octets, layout Xbox Series 2026 vérifié) :
+				// +0x00 options (u64) : bit 0 = ZLIB, bits 1..4 = BCPACK, bit 21 = PAGE_DESTINATION
+				// +0x08 destination (ptr)
+				// +0x10 page_offset (u64)
+				// +0x18 destination_size (u32)
+				// +0x20 source (ptr : IDStorageFileX ou buffer mémoire)
+				// +0x28 offset (u64)
+				// +0x30 source_size (u32)
+				opts := *(*uint64)(osPtr(reqPtr + 0x00))
+				dstPtr := *(*uintptr)(osPtr(reqPtr + 0x08))
+				dstSize := *(*uint32)(osPtr(reqPtr + 0x18))
+				srcPtr := *(*uintptr)(osPtr(reqPtr + 0x20))
+				srcOff := *(*uint64)(osPtr(reqPtr + 0x28))
+				srcSize := *(*uint32)(osPtr(reqPtr + 0x30))
 
-				if dstPtr == 0 || dstSize == 0 {
+				if dstPtr == 0 || dstSize == 0 || srcPtr == 0 {
 					return 0
 				}
+				// PAGE_DESTINATION (bit 21) : destination est un tableau de numéros de pages 64 KiB
+				if opts&(1<<21) != 0 {
+					slog.Debug("IDStorageQueueX!EnqueueRequest (PAGE_DESTINATION)", "dstSize", dstSize, "srcSize", srcSize)
+					return 0
+				}
+
 				var raw []byte
-				if srcType == 0 && srcPtr != 0 && srcSize > 0 {
-					ds.mu.Lock()
-					fh := ds.files[srcPtr]
-					ds.mu.Unlock()
-					if fh != nil {
-						raw = make([]byte, srcSize)
-						n, _ := fh.ReadAt(raw, int64(srcOff))
-						raw = raw[:n]
-					}
-				} else if srcType == 1 && srcPtr != 0 {
-					sz := uint32(srcOff)
-					if sz > 0 && sz <= (64<<20) {
-						raw = make([]byte, sz)
-						copy(raw, unsafe.Slice((*byte)(osPtr(srcPtr)), sz))
-					}
+				ds.mu.Lock()
+				fh := ds.files[srcPtr]
+				ds.mu.Unlock()
+				if fh != nil && srcSize > 0 {
+					raw = make([]byte, srcSize)
+					n, _ := fh.ReadAt(raw, int64(srcOff))
+					raw = raw[:n]
+				} else if srcSize > 0 && srcSize <= (64<<20) {
+					raw = make([]byte, srcSize)
+					copy(raw, unsafe.Slice((*byte)(osPtr(srcPtr)), srcSize))
 				}
 				if len(raw) == 0 {
 					return 0
 				}
 
 				dst := unsafe.Slice((*byte)(osPtr(dstPtr)), dstSize)
-				if compFmt == 1 { // ZLIB
+				if opts&1 != 0 { // ZLIB (RFC 1950)
 					if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
 						n, _ := io.ReadFull(zr, dst)
 						_ = zr.Close()
@@ -166,22 +166,25 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				ds.readCount.Add(1)
 				return 0
 			}),
-			4:  cbOK, // EnqueueStatus
-			5:  cbOK, // EnqueueSignal
-			6:  cbOK, // EnqueueSetEvent
-			10: cbOK, // Submit
+			4:  cbOK, // EnqueueStatus (0x20)
+			5:  cbOK, // EnqueueSignal (0x28)
+			6:  cbOK, // Submit (0x30)
+			8:  cbOK, // Close (0x40)
+			10: cbOK, // Submit / ErrorRecord fallback
 		})
 	}
 
+	cbCreateQueue := syscall.NewCallback(func(this, descPtr, iidPtr, outPtr uintptr) uintptr {
+		slog.Info("IDStorageFactoryX!CreateQueue -> IDStorageQueueX")
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = newDSQueue()
+		}
+		return hresultOK
+	})
+
 	dstorageFactoryObj := NewCOMObject("IDStorageFactoryX", 32, map[int]uintptr{
-		3: syscall.NewCallback(func(this, descPtr, iidPtr, outPtr uintptr) uintptr { // CreateQueue
-			slog.Info("IDStorageFactoryX!CreateQueue -> IDStorageQueueX")
-			if outPtr != 0 {
-				*(*uintptr)(osPtr(outPtr)) = newDSQueue()
-			}
-			return hresultOK
-		}),
-		4: syscall.NewCallback(func(this, pathPtr, iidPtr, outPtr uintptr) uintptr { // OpenFile
+		3:  cbCreateQueue, // CreateQueue (2020)
+		4:  syscall.NewCallback(func(this, pathPtr, iidPtr, outPtr uintptr) uintptr { // OpenFile
 			orig := readUTF16Str(pathPtr)
 			hostPath := orig
 			if ds.vfs != nil {
@@ -206,10 +209,11 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			}
 			return hresultOK
 		}),
-		6: cbOK, // SetDebugFlags
-		7: cbOK, // SetStagingBufferSize
-		8: cbOK, // SetCpuAffinity / config
-		9: cbOK, // GetCompressionCodec
+		6:  cbOK,          // SetCpuAffinity
+		7:  cbOK,          // SetDebugFlags
+		8:  cbOK,          // SetStagingBufferSize (0x40)
+		9:  cbOK,          // GetCompressionCodec
+		10: cbCreateQueue, // CreateQueue (2026 Xbox Series, 0x50)
 	})
 
 	cbGetFactory := syscall.NewCallback(func(iidPtr, outPtr uintptr) uintptr {

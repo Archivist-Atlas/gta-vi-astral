@@ -39,8 +39,9 @@ var (
 	k32CreateFileW    = k32.NewProc("CreateFileW")
 	k32GetFileAttrW   = k32.NewProc("GetFileAttributesW")
 	k32GetFileAttrExW = k32.NewProc("GetFileAttributesExW")
-	k32FindFirstFileW = k32.NewProc("FindFirstFileW")
-	kbaseVirtAlloc2   = kbase.NewProc("VirtualAlloc2")
+	k32FindFirstFileW       = k32.NewProc("FindFirstFileW")
+	k32GetProcessMemoryInfo = k32.NewProc("K32GetProcessMemoryInfo")
+	kbaseVirtAlloc2         = kbase.NewProc("VirtualAlloc2")
 	d3d12Host        = syscall.NewLazyDLL("d3d12.dll")
 	d3d12SerRoot     = d3d12Host.NewProc("D3D12SerializeRootSignature")
 	d3d12SerVerRoot  = d3d12Host.NewProc("D3D12SerializeVersionedRootSignature")
@@ -51,6 +52,170 @@ var (
 		0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7,
 	}
 )
+
+var (
+	mainImageBase  atomic.Uintptr
+	xmemHooksAddr  atomic.Uintptr
+	xmemHooksInit  atomic.Bool
+	xmemHooksCell  uintptr // cellule OS fixe (non déplacée par le GC) contenant __XMemAllocationHooks__
+)
+
+func ensureXMemHooksCell() uintptr {
+	if xmemHooksCell == 0 {
+		mem, _, _ := k32VirtualAlloc.Call(0, 4096, 0x3000, 0x04)
+		xmemHooksCell = mem
+	}
+	return xmemHooksCell
+}
+
+// SetMainImageBase enregistre l'adresse de base de l'image principale mappée
+// afin de résoudre les exports de hooks du titre (ex. __XMemAllocationHooks__).
+func SetMainImageBase(base uintptr) {
+	mainImageBase.Store(base)
+	var addr uintptr
+	if base != 0 {
+		name := append([]byte("__XMemAllocationHooks__"), 0)
+		addr, _, _ = k32GetProcAddr.Call(base, uintptr(unsafe.Pointer(&name[0])))
+		slog.Info("xmem: __XMemAllocationHooks__", "found", addr != 0)
+	}
+	xmemHooksAddr.Store(addr)
+	xmemHooksInit.Store(true)
+	if cell := ensureXMemHooksCell(); cell != 0 {
+		*(*uintptr)(osPtr(cell)) = addr
+	}
+}
+
+// makeXMemTrampoline génère un trampoline x86-64 natif (tail-call pur) pour XMemAlloc / XMemFree.
+// Évite toute ré-entrance Go->C->Go sur un thread étranger (qui déclenche exitsyscall).
+func makeXMemTrampoline(slotOffset byte, defaultCb uintptr) uintptr {
+	cell := ensureXMemHooksCell()
+	if cell == 0 {
+		return defaultCb
+	}
+	code, _, _ := k32VirtualAlloc.Call(0, 4096, 0x3000, 0x40 /* PAGE_EXECUTE_READWRITE */)
+	if code == 0 {
+		return defaultCb
+	}
+	b := unsafe.Slice((*byte)(osPtr(code)), 64)
+	i := 0
+	// mov rax, imm64(cell)
+	b[i], b[i+1] = 0x48, 0xB8
+	*(*uint64)(unsafe.Pointer(&b[i+2])) = uint64(cell)
+	i += 10
+	// mov rax, [rax]
+	b[i], b[i+1], b[i+2] = 0x48, 0x8B, 0x00
+	i += 3
+	// test rax, rax
+	b[i], b[i+1], b[i+2] = 0x48, 0x85, 0xC0
+	i += 3
+	// jz +9 (saute mov rax,[rax+off] (4) + test (3) + jz (2) + jmp rax (2) = +11)
+	b[i], b[i+1] = 0x74, 11
+	i += 2
+	// mov rax, [rax + slotOffset]
+	b[i], b[i+1], b[i+2], b[i+3] = 0x48, 0x8B, 0x40, slotOffset
+	i += 4
+	// test rax, rax
+	b[i], b[i+1], b[i+2] = 0x48, 0x85, 0xC0
+	i += 3
+	// jz +2 (saute jmp rax)
+	b[i], b[i+1] = 0x74, 2
+	i += 2
+	// jmp rax
+	b[i], b[i+1] = 0xFF, 0xE0
+	i += 2
+	// fallback: mov rax, imm64(defaultCb); jmp rax
+	b[i], b[i+1] = 0x48, 0xB8
+	*(*uint64)(unsafe.Pointer(&b[i+2])) = uint64(defaultCb)
+	i += 10
+	b[i], b[i+1] = 0xFF, 0xE0
+	return code
+}
+
+func resolveXMemHooks() [2]uintptr {
+	if !xmemHooksInit.Load() {
+		base := mainImageBase.Load()
+		if base != 0 {
+			name := append([]byte("__XMemAllocationHooks__"), 0)
+			addr, _, _ := k32GetProcAddr.Call(base, uintptr(unsafe.Pointer(&name[0])))
+			xmemHooksAddr.Store(addr)
+			xmemHooksInit.Store(true)
+			slog.Info("xmem: __XMemAllocationHooks__", "found", addr != 0)
+		}
+	}
+	addr := xmemHooksAddr.Load()
+	if addr == 0 {
+		return [2]uintptr{}
+	}
+	return *(*[2]uintptr)(osPtr(addr))
+}
+
+func xmemAllocDefault(size, attrs uintptr) uintptr {
+	if size == 0 {
+		size = 16
+	}
+	alignShift := (uint64(attrs) >> 24) & 0x1F
+	if alignShift >= 12 || size >= 65536 {
+		r, _, _ := k32VirtualAlloc.Call(0, size, 0x3000 /* COMMIT|RESERVE */, 0x04 /* PAGE_READWRITE */)
+		return r
+	}
+	heap, _, _ := k32GetProcHeap.Call()
+	r, _, _ := k32HeapAlloc.Call(heap, 0x00000008 /* HEAP_ZERO_MEMORY */, size)
+	return r
+}
+
+func xmemFreeDefault(ptr, attrs uintptr) {
+	if ptr == 0 {
+		return
+	}
+	alignShift := (uint64(attrs) >> 24) & 0x1F
+	if alignShift >= 12 {
+		_, _, _ = k32VirtualFree.Call(ptr, 0, 0x8000 /* MEM_RELEASE */)
+		return
+	}
+	heap, _, _ := k32GetProcHeap.Call()
+	_, _, _ = k32HeapFree.Call(heap, 0, ptr)
+}
+
+func xmemAlloc(size, attrs uintptr) uintptr {
+	if h := resolveXMemHooks()[0]; h != 0 {
+		r, _, _ := syscall.SyscallN(h, size, attrs)
+		return r
+	}
+	return xmemAllocDefault(size, attrs)
+}
+
+func xmemFree(ptr, attrs uintptr) {
+	if ptr == 0 {
+		return
+	}
+	if h := resolveXMemHooks()[1]; h != 0 {
+		_, _, _ = syscall.SyscallN(h, ptr, attrs)
+		return
+	}
+	xmemFreeDefault(ptr, attrs)
+}
+
+// xmemAllocCommitted alloue la mémoire d'une ressource D3D12.X "committed" via l'allocateur
+// du titre (__XMemAllocationHooks__) avec les attributs graphiques Xbox Series.
+func xmemAllocCommitted(size uint64, heapKind uint32) uint64 {
+	const graphicsAllocator uint64 = 128 << 16
+	pages := uint64(1)
+	if size >= 2<<20 {
+		pages = 2 // pages 2 MiB (bits 14..15 = 2 -> 0x8000)
+	}
+	memType := uint64(3) // cacheable (upload/readback)
+	if heapKind == 1 {
+		memType = 1 // write-combined (default GPU heap)
+	}
+	const alignLog2 uint64 = 16 // 64 KiB
+	attrs := graphicsAllocator | (pages << 14) | (alignLog2 << 24) | (memType << 29)
+	ptr := xmemAlloc(uintptr(size), uintptr(attrs))
+	if ptr != 0 {
+		dst := unsafe.Slice((*byte)(osPtr(ptr)), size)
+		clear(dst)
+	}
+	return uint64(ptr)
+}
 
 type memAddressRequirements struct {
 	LowestStartingAddress uintptr
@@ -179,24 +344,16 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		t.bind(dll, "VirtualAlloc", cbVirtualAlloc)
 	}
 
-	// --- 2. xmem.dll (allocation unifiée Xbox Series) ---
-	cbXMemAlloc := syscall.NewCallback(func(size, attrs uintptr) uintptr {
-		heap, _, _ := k32GetProcHeap.Call()
-		if size == 0 {
-			size = 16
-		}
-		// Allocation alignée 64 octets (exigence XMemAlloc / AVX2)
-		r, _, _ := k32HeapAlloc.Call(heap, 0x00000008 /* HEAP_ZERO_MEMORY */, size)
-		return r
+	// --- 2. xmem.dll (allocation unifiée Xbox Series + trampolines natifs __XMemAllocationHooks__) ---
+	cbXMemAllocDefault := syscall.NewCallback(func(size, attrs uintptr) uintptr {
+		return xmemAllocDefault(size, attrs)
 	})
-	cbXMemFree := syscall.NewCallback(func(ptr, attrs uintptr) uintptr {
-		if ptr == 0 {
-			return 0
-		}
-		heap, _, _ := k32GetProcHeap.Call()
-		_, _, _ = k32HeapFree.Call(heap, 0, ptr)
+	cbXMemFreeDefault := syscall.NewCallback(func(ptr, attrs uintptr) uintptr {
+		xmemFreeDefault(ptr, attrs)
 		return 0
 	})
+	cbXMemAlloc := makeXMemTrampoline(0, cbXMemAllocDefault)
+	cbXMemFree := makeXMemTrampoline(8, cbXMemFreeDefault)
 	cbXMemVirtualFree := syscall.NewCallback(func(addr, size, freeType uintptr) uintptr {
 		r, _, _ := k32VirtualFree.Call(addr, size, freeType)
 		return r
@@ -206,16 +363,31 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		return r
 	})
 	cbXMemWorkingSet := syscall.NewCallback(func(kind, outPtr uintptr) uintptr {
-		if outPtr != 0 {
-			// Rapporte 12 GiB (Series X) ou 8 GiB (Series S) disponibles
-			total := uint64(12) << 30
-			if profile == core.ConsoleSeriesS {
-				total = uint64(8) << 30
-			}
-			words := unsafe.Slice((*uint64)(osPtr(outPtr)), 4)
-			words[0] = total
-			words[1] = total
+		if outPtr == 0 {
+			return 0
 		}
+		// PROCESS_MEMORY_COUNTERS (x64 = 72 octets) : PagefileUsage à l'offset 56 (u64 #7)
+		var counters [9]uint64
+		counters[0] = 72 // cb (u32) + PageFaultCount (u32)
+		hProc, _, _ := k32GetCurrProc.Call()
+		_, _, _ = k32GetProcessMemoryInfo.Call(hProc, uintptr(unsafe.Pointer(&counters[0])), 72)
+		pagefileUsage := counters[7]
+
+		// WorkingSet Xbox Series (0x50 = 80 octets = 10 u64) :
+		// +0x00 title_limit, +0x08 title_used, +0x28 gpu_optimal_limit
+		gpuOpt := uint64(10) << 30
+		standard := (uint64(3) << 30) + (uint64(512) << 20)
+		if profile == core.ConsoleSeriesS {
+			gpuOpt = uint64(6) << 30
+			standard = uint64(2) << 30
+		}
+		words := unsafe.Slice((*uint64)(osPtr(outPtr)), 10)
+		for i := range words {
+			words[i] = 0
+		}
+		words[0] = gpuOpt + standard
+		words[1] = pagefileUsage
+		words[5] = gpuOpt
 		return 1 // TRUE
 	})
 	cbReturnFalse := syscall.NewCallback(func() uintptr { return 0 })
@@ -290,9 +462,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	})
 
 	t.bind("xmem.dll", "XMemAlloc", cbXMemAlloc)
-	t.bind("xmem.dll", "XMemAllocDefault", cbXMemAlloc)
+	t.bind("xmem.dll", "XMemAllocDefault", cbXMemAllocDefault)
 	t.bind("xmem.dll", "XMemFree", cbXMemFree)
-	t.bind("xmem.dll", "XMemFreeDefault", cbXMemFree)
+	t.bind("xmem.dll", "XMemFreeDefault", cbXMemFreeDefault)
 	t.bind("xmem.dll", "XMemVirtualAlloc", cbXMemVirtualAlloc)
 	t.bind("xmem.dll", "XMemVirtualFree", cbXMemVirtualFree)
 	t.bind("xmem.dll", "XMemVirtualQuery", cbXMemVirtualQuery)
@@ -419,9 +591,66 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			4: cbSysSandboxID, // 0x20 SandboxId ("RETAIL")
 			5: cbSysDeviceID,  // 0x28 DeviceId
 		}),
-		"{AF406016-E850-4AA8-A88D-2F3DCB9DAC7E}": NewCOMObject("xpackage", 64, nil),
-		"{F4FAF4D4-2D04-4FCE-B3E0-474A713A3E84}": NewCOMObject("storage", 64, nil),
-		"{03F0FE74-FDD9-4E5C-B630-F9339C47ACC5}": NewCOMObject("display", 64, nil),
+		"{AF406016-E850-4AA8-A88D-2F3DCB9DAC7E}": NewCOMObject("xpackage", 64, map[int]uintptr{
+			3: syscall.NewCallback(func(this, size, bufPtr uintptr) uintptr { // XPackageGetCurrentProcessPackageIdentifier
+				return putStr("7952987A", size, bufPtr, 0)
+			}),
+			4: cbReturnTrue, // XPackageIsPackaged
+			5: syscall.NewCallback(func(this, id, selCount, sels, interval, queue, outPtr uintptr) uintptr { // CreateInstallationMonitor
+				if outPtr != 0 {
+					*(*uintptr)(osPtr(outPtr)) = uintptr(nextHandle.Add(1))
+				}
+				return hresultOK
+			}),
+			6: cbGISuccess, // CloseInstallationMonitorHandle
+			7: syscall.NewCallback(func(this, mon, outPtr uintptr) uintptr { // GetInstallationProgress
+				if outPtr != 0 {
+					// { total_bytes, installed_bytes, launch_bytes, launchable=true, completed=true }
+					const pkgBytes = uint64(100) << 30
+					*(*uint64)(osPtr(outPtr + 0)) = pkgBytes
+					*(*uint64)(osPtr(outPtr + 8)) = pkgBytes
+					*(*uint64)(osPtr(outPtr + 16)) = pkgBytes
+					*(*uint8)(osPtr(outPtr + 24)) = 1
+					*(*uint8)(osPtr(outPtr + 25)) = 1
+				}
+				return 0
+			}),
+			9: syscall.NewCallback(func(this, id, selCount, sels, outAvail uintptr) uintptr { // XPackageFindChunkAvailability
+				if outAvail != 0 {
+					*(*uint32)(osPtr(outAvail)) = 0 // XPackageChunkAvailability::Ready
+				}
+				return hresultOK
+			}),
+			39: cbGISuccess, // XPackageEnumeratePackages (aucun DLC externe)
+		}),
+		"{F4FAF4D4-2D04-4FCE-B3E0-474A713A3E84}": NewCOMObject("storage", 64, map[int]uintptr{
+			3: syscall.NewCallback(func(this, outSize uintptr) uintptr { // XPersistentLocalStorageGetPathSize
+				if outSize != 0 {
+					*(*uintptr)(osPtr(outSize)) = 4 // "T:\\\0"
+				}
+				return hresultOK
+			}),
+			4: syscall.NewCallback(func(this, size, bufPtr, usedPtr uintptr) uintptr { // XPersistentLocalStorageGetPath
+				if size <= 3 {
+					return 0x80004005 // E_FAIL (ABI Xbox)
+				}
+				return putStr(`T:\`, size, bufPtr, usedPtr)
+			}),
+			5: syscall.NewCallback(func(this, outSpace uintptr) uintptr { // XPersistentLocalStorageGetSpaceInfo
+				if outSpace != 0 {
+					// { available_free, total_free, used, total } = 4 GiB libre
+					w := unsafe.Slice((*uint64)(osPtr(outSpace)), 4)
+					quota := uint64(4) << 30
+					w[0], w[1], w[2], w[3] = quota, quota, 0, quota
+				}
+				return hresultOK
+			}),
+		}),
+		"{03F0FE74-FDD9-4E5C-B630-F9339C47ACC5}": NewCOMObject("display", 64, map[int]uintptr{
+			4: syscall.NewCallback(func(this, pref, info uintptr) uintptr { // XDisplayTryEnableHdrMode -> 2 (Disabled / SDR)
+				return 2
+			}),
+		}),
 	}
 
 	// --- 3d. Réécriture des chemins console (VirtualFS : G:\ / GAME:\ / T:\) ---
@@ -627,6 +856,35 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		t.bind(dll, "GetProcAddress", cbGetProcAddr)
 	}
 
+	// --- 3e. OutputDebugStringA/W (capture les diagnostics / assertions du titre) ---
+	cbOutDbgA := syscall.NewCallback(func(ptr uintptr) uintptr {
+		if ptr != 0 {
+			s := strings.TrimSpace(readANSIStr(ptr))
+			if s != "" {
+				slog.Info("TITLE OutputDebugStringA", "msg", s)
+			}
+		}
+		return 0
+	})
+	cbOutDbgW := syscall.NewCallback(func(ptr uintptr) uintptr {
+		if ptr != 0 {
+			s := strings.TrimSpace(readUTF16Str(ptr))
+			if s != "" {
+				slog.Info("TITLE OutputDebugStringW", "msg", s)
+			}
+		}
+		return 0
+	})
+	for _, dll := range []string{
+		"kernel32.dll",
+		"kernelbase.dll",
+		"api-ms-win-core-debug-l1-1-0.dll",
+		"api-ms-win-core-debug-l1-1-1.dll",
+	} {
+		t.bind(dll, "OutputDebugStringA", cbOutDbgA)
+		t.bind(dll, "OutputDebugStringW", cbOutDbgW)
+	}
+
 	// --- 4. Isolation réseau hors-ligne (ws2_32 & winhttp) ---
 	cbNetBlocked := syscall.NewCallback(func() uintptr {
 		slog.Debug("appel réseau sortant bloqué (mode hors-ligne)")
@@ -637,24 +895,46 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	t.bind("ws2_32.dll", "GetAddrInfoW", cbNetBlocked)
 
 	// --- 5. d3d12_xs.dll (Root Signature PC + log CreateDevice) ---
+	type rootSigDesc struct {
+		NumParameters     uint32
+		_pad0             uint32
+		Parameters        uintptr
+		NumStaticSamplers uint32
+		_pad1             uint32
+		StaticSamplers    uintptr
+		Flags             uint32
+		_pad2             uint32
+	}
+	type versionedRootSigDesc struct {
+		Version uint32
+		_pad    uint32
+		Desc    rootSigDesc
+	}
 	cbSerRootSig := syscall.NewCallback(func(descPtr, version, blobOut, errOut uintptr) uintptr {
-		if descPtr != 0 {
-			// Offset 32 dans D3D12_ROOT_SIGNATURE_DESC (64-bit) = Flags
-			flagsPtr := (*uint32)(osPtr(descPtr + 32))
-			*flagsPtr = gpu.SanitizeRootSignatureFlags(*flagsPtr)
+		if d3d12SerRoot.Find() != nil {
+			return 0x80004001 // E_NOTIMPL
 		}
-		if d3d12SerRoot.Find() == nil {
-			r, _, _ := d3d12SerRoot.Call(descPtr, version, blobOut, errOut)
+		if descPtr != 0 {
+			cp := *(*rootSigDesc)(osPtr(descPtr))
+			cp.Flags = gpu.SanitizeRootSignatureFlags(cp.Flags) &^ 0xFF000000
+			r, _, _ := d3d12SerRoot.Call(uintptr(unsafe.Pointer(&cp)), version, blobOut, errOut)
 			return r
 		}
-		return 0x80004001 // E_NOTIMPL
+		r, _, _ := d3d12SerRoot.Call(descPtr, version, blobOut, errOut)
+		return r
 	})
 	cbSerVerRootSig := syscall.NewCallback(func(descPtr, blobOut, errOut uintptr) uintptr {
-		if d3d12SerVerRoot.Find() == nil {
-			r, _, _ := d3d12SerVerRoot.Call(descPtr, blobOut, errOut)
+		if d3d12SerVerRoot.Find() != nil {
+			return 0x80004001
+		}
+		if descPtr != 0 {
+			cp := *(*versionedRootSigDesc)(osPtr(descPtr))
+			cp.Desc.Flags = gpu.SanitizeRootSignatureFlags(cp.Desc.Flags) &^ 0xFF000000
+			r, _, _ := d3d12SerVerRoot.Call(uintptr(unsafe.Pointer(&cp)), blobOut, errOut)
 			return r
 		}
-		return 0x80004001
+		r, _, _ := d3d12SerVerRoot.Call(descPtr, blobOut, errOut)
+		return r
 	})
 	cbConfigVirtMem := syscall.NewCallback(func() uintptr {
 		slog.Debug("d3d12_xs!D3D12ConfigureVirtualMemoryX -> S_OK")
@@ -676,6 +956,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	t.bind("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", cbConfigVirtMem)
 	t.bind("d3d12_xs.dll", "D3D12XboxCreateDevice", cbCreateDeviceX)
 	t.bind("d3d12_xs.dll", "IID_ID3D12Device", uintptr(unsafe.Pointer(&iidID3D12Device[0])))
+
+	// --- 6. xg_xs.dll (layout & swizzle textures Xbox Series) ---
+	bindXG(t)
 	t.bind("d3d12_xs.dll", "D3D12SerializeRootSignature", cbSerRootSig)
 	t.bind("d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", cbSerVerRootSig)
 

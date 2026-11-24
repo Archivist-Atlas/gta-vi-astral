@@ -167,3 +167,13 @@ func (h *HostD3D12) Present(syncInterval uint32) {
 	}
 	_ = comCall(h.SwapChain, 8, uintptr(syncInterval), 0)
 }
+
+// PresentHost présente la trame courante sur l'instance globale HostD3D12 si active.
+func PresentHost(syncInterval uint32) {
+	hostMu.Lock()
+	h := hostInstance
+	hostMu.Unlock()
+	if h != nil {
+		h.Present(syncInterval)
+	}
+}

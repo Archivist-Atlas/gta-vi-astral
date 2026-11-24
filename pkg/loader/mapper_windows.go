@@ -107,6 +107,7 @@ func MapAndBind(opts MapOptions) (*LiveSession, error) {
 		Size: prepared.Info.SizeOfImage,
 		Info: prepared.Info,
 	}
+	hle.SetMainImageBase(base)
 	sess := &LiveSession{
 		Main:          mainMod,
 		Modules:       []*MappedModule{mainMod},
@@ -368,6 +369,30 @@ func installVEH(sess *LiveSession) {
 				return 0
 			}
 			addr := ep.ExceptionRecord.ExceptionAddress
+			// Émulation AMD Zen 2 CLZERO (0F 01 FC) sur CPU Intel (0xC000001D = STATUS_ILLEGAL_INSTRUCTION)
+			if code == 0xC000001D && ep.ContextRecord != 0 && addr > 0x10000 {
+				b := unsafe.Slice((*byte)(ptrFromAddr(addr)), 12)
+				if b[0] == 0x0F && b[1] == 0x01 && b[2] == 0xFC {
+					raxPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0x78))
+					ripPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0xF8))
+					start := *raxPtr &^ 63
+					// Fast-path : boucle "clzero; add rax, 0x40; cmp rax, r10; jb -12"
+					if b[3] == 0x48 && b[4] == 0x83 && b[5] == 0xC0 && b[6] == 0x40 &&
+						b[7] == 0x4C && b[8] == 0x39 && b[9] == 0xD0 && b[10] == 0x72 && b[11] == 0xF4 {
+						r10 := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0xC8))
+						if r10 > start && (r10-start) <= (256<<20) {
+							n := ((r10 - start + 63) &^ 63)
+							clear(unsafe.Slice((*byte)(ptrFromAddr(uintptr(start))), n))
+							*raxPtr = start + n
+							*ripPtr += 12
+							return ^uintptr(0) // EXCEPTION_CONTINUE_EXECUTION (-1)
+						}
+					}
+					clear(unsafe.Slice((*byte)(ptrFromAddr(uintptr(start))), 64))
+					*ripPtr += 3
+					return ^uintptr(0) // EXCEPTION_CONTINUE_EXECUTION (-1)
+				}
+			}
 			vehMu.RLock()
 			s := vehSession
 			vehMu.RUnlock()
@@ -406,6 +431,6 @@ func installVEH(sess *LiveSession) {
 			}
 			return 0 // EXCEPTION_CONTINUE_SEARCH
 		})
-		_, _, _ = procAddVectoredExHandler.Call(1, cb)
+		_, _, _ = procAddVectoredExHandler.Call(0, cb)
 	})
 }
