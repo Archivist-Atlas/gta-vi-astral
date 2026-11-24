@@ -125,6 +125,7 @@ func newD3D12XDevice() uintptr {
 			return hresultInvalidArg
 		}
 		g := FormatGUID(iid)
+		slog.Debug("ID3D12DeviceX!QueryInterface", "iid", g)
 		if g == "{54EC77FA-1377-44E6-8C32-88FD5F44C84C}" ||
 			g == "{77DB970F-6276-48BA-BA28-070143B4392C}" ||
 			g == "{05008617-FBFD-4051-A790-144884B4F6A9}" {
@@ -167,19 +168,27 @@ func newD3D12XDevice() uintptr {
 		})
 	}
 
+	// Vtable partagée pour toutes les ID3D12GraphicsCommandListX (GTA VI en crée 581+ au boot).
+	// En-tête de 0x1000 octets mis à zéro : PutPointer==LimitPointer==0 ET protège jusqu'au-delà de +0x564.
+	cmdListProto := NewCOMObjectWithHeader("ID3D12GraphicsCommandListX", 160, 0x1000, map[int]uintptr{
+		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
+		8:   cbOK, // GetType
+		9:   cbOK, // Close
+		10:  cbOK, // Reset
+		11:  cbOK, // ClearState
+		131: cbOK, // 0x418 GPU sync (VIctory list.rs)
+		132: cbOK, // 0x420 GPU sync
+		139: cbOK, // 0x458 ResetX
+	})
+	cmdListVtable := *(*uintptr)(osPtr(cmdListProto))
+
 	newCommandList := func() uintptr {
 		st.listsCreated.Add(1)
-		// En-tête de 0x100 octets mis à zéro => PutPointer == LimitPointer == 0 (interception vtable)
-		return NewCOMObjectWithHeader("ID3D12GraphicsCommandListX", 160, 0x100, map[int]uintptr{
-			3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
-			8:   cbOK, // GetType
-			9:   cbOK, // Close
-			10:  cbOK, // Reset
-			11:  cbOK, // ClearState
-			131: cbOK, // 0x418 GPU sync (VIctory list.rs)
-			132: cbOK, // 0x420 GPU sync
-			139: cbOK, // 0x458 ResetX
-		})
+		mem, _, _ := k32VirtualAlloc.Call(0, 0x1000, 0x3000, 0x04 /* PAGE_READWRITE */)
+		if mem != 0 {
+			*(*uintptr)(osPtr(mem)) = cmdListVtable
+		}
+		return mem
 	}
 
 	newFence := func(initVal uint64) uintptr {
@@ -296,18 +305,21 @@ func newD3D12XDevice() uintptr {
 
 	// --- Callbacks des slots ID3D12DeviceX ---
 	cbCreateQueue := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateCommandQueue", "iid", FormatGUID(iid))
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newQueue()
 		}
 		return hresultOK
 	})
 	cbCreateAllocator := syscall.NewCallback(func(this, listType, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateCommandAllocator", "type", listType)
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newAllocator()
 		}
 		return hresultOK
 	})
 	cbCreatePSO := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreatePSO")
 		st.psoCreated.Add(1)
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newGenericChild("ID3D12PipelineStateX")
@@ -315,18 +327,21 @@ func newD3D12XDevice() uintptr {
 		return hresultOK
 	})
 	cbCreateList := syscall.NewCallback(func(this, nodeMask, listType, alloc, pso, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateCommandList", "type", listType)
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newCommandList()
 		}
 		return hresultOK
 	})
 	cbCreateListX := syscall.NewCallback(func(this, nodeMask, listType, flags, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateCommandListX", "type", listType, "flags", flags)
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newCommandList()
 		}
 		return hresultOK
 	})
 	cbCreateDescHeap := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateDescriptorHeap")
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newDescriptorHeap(desc)
 		}
@@ -378,24 +393,28 @@ func newD3D12XDevice() uintptr {
 		return outPtr
 	})
 	cbCreateCommitted := syscall.NewCallback(func(this, heapProps, heapFlags, desc, state, clearVal, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateCommittedResource")
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newResource(0)
 		}
 		return hresultOK
 	})
 	cbCreatePlaced := syscall.NewCallback(func(this, heap, offset, desc, state, clearVal, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreatePlacedResource")
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newResource(0)
 		}
 		return hresultOK
 	})
 	cbCreatePlacedAtAddr := syscall.NewCallback(func(this, gpuAddr, desc, state, clearVal, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreatePlacedResourceX", "gpuAddr", gpuAddr)
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newResource(uint64(gpuAddr))
 		}
 		return hresultOK
 	})
 	cbCreateFence := syscall.NewCallback(func(this, initVal, flags, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateFence", "init", initVal)
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newFence(uint64(initVal))
 		}

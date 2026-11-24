@@ -338,11 +338,13 @@ func (s *LiveSession) Symbolize(addr uintptr) string {
 }
 
 type exceptionRecord struct {
-	ExceptionCode    uint32
-	ExceptionFlags   uint32
-	ExceptionRecord  uintptr
-	ExceptionAddress uintptr
-	NumberParameters uint32
+	ExceptionCode        uint32
+	ExceptionFlags       uint32
+	ExceptionRecord      uintptr
+	ExceptionAddress     uintptr
+	NumberParameters     uint32
+	_pad                 uint32
+	ExceptionInformation [15]uintptr
 }
 
 type exceptionPointers struct {
@@ -377,6 +379,13 @@ func installVEH(sess *LiveSession) {
 				dataDir = s.DataDir
 			}
 			msg := fmt.Sprintf("ASTRAL VEH: exception 0x%08X à %s", code, where)
+			if code == 0xC0000005 && ep.ExceptionRecord.NumberParameters >= 2 {
+				op := "read"
+				if ep.ExceptionRecord.ExceptionInformation[0] == 1 {
+					op = "write"
+				}
+				msg = fmt.Sprintf("%s (%s @ 0x%016X)", msg, op, ep.ExceptionRecord.ExceptionInformation[1])
+			}
 			slog.Error(msg)
 			if dataDir != "" {
 				_ = AppendCrashLog(dataDir, msg)
