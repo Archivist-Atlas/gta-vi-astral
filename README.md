@@ -53,6 +53,12 @@ copy astral.example.toml astral.toml
 
 # 6. Analyser les shaders RDNA2 de shaders.rpf
 .\astral.exe shader-info -limit 500 "C:\GTA_VI\shaders.rpf"
+
+# 7. Mapper l'exécutable dans Windows (TLS statique + binding IAT réel) sans exécuter
+.\astral.exe run -map "C:\GTA_VI\game_scarlett_master.exe"
+
+# 8. Lancer le point d'entrée natif (expérimental, journalisé avec VEH)
+.\astral.exe run -execute -unimplemented log "C:\GTA_VI\game_scarlett_master.exe"
 ```
 
 ## Documentation

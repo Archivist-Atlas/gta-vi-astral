@@ -11,17 +11,19 @@
 - [x] Documentation technique complète en français (`docs/`).
 
 ## Phase 2 — Traducteur Shaders complet (IR SSA -> DXIL & SPIR-V)
-- [ ] Passe SSA complète et structuration du flux de contrôle (élimination des masques `EXEC`).
+- [x] Levée 1:1 en IR SSA avec filtrage des ops de planification et suivi des gardes `EXEC` (`pkg/shader/ssa.go`).
+- [ ] Structuration complète du flux de contrôle (élimination des masques `EXEC`).
 - [ ] Analyse de flux de données pour les descripteurs et boucles waterfall (`v_readfirstlane_b32`).
 - [ ] Émetteur binaire **DXIL SM 6.6** (LLVM 3.7 bitcode + conteneur DXBC signé).
 - [ ] Émetteur **SPIR-V 1.2** + mode `--wave64-emulate` validé par `spirv-val`.
 - [ ] Suite de tests sémantiques et différentiels sur GPU / WARP.
 
 ## Phase 3 — Chargeur natif Windows & Shims HLE live
-- [ ] Mappage mémoire natif Windows (`LoadLibraryExW` sur image préparée + redirection TLS slot 0 + `RtlAddFunctionTable`).
-- [ ] Génération dynamique de thunks x86-64 pour les imports non implémentés (`log`/`zero`/`fail`/`trap`).
-- [ ] Implémentation live des shims `xgameruntime`, `xmem`, `xcrdapi` (DirectStorage + décodeur BCPack BC1–BC7), `gameinput`, `AcpHal` (XMA2) et `xapu` (Opus).
-- [ ] Journalisation automatique des crashs (`module+RVA` + stack unwind) dans `crashes.log`.
+- [x] Mappage mémoire natif Windows (`LoadLibraryExW` sur image passive-DLL + redirection des 53 246 accès TLS slot 0 + binding IAT réel + chargement récursif des DLL du titre).
+- [x] Génération dynamique de thunks x86-64 pour les imports non implémentés (`log`/`zero`/`fail`/`trap`).
+- [x] Gestionnaire d'exceptions VEH (`module+RVA` -> `crashes.log`).
+- [x] Premiers shims exécutables live : `XMemVirtualAlloc` (`VirtualAlloc2` avec plages 40-bit/32-bit), `XMemAlloc/Free`, `D3D12ConfigureVirtualMemoryX`, `LoadLibrary*/GetProcAddress` console, `xgameruntime` (`InitializeApiImpl*`, `QueryApiImpl` avec décodage GUID), `GameInputCreate`, isolation réseau hors-ligne.
+- [ ] Implémentation complète des interfaces COM `QueryApiImpl` (`XUser`, `XGameSave`, `XStore`, `XPackage`, `XAsync`), `xcrdapi` (DirectStorage + BCPack BC1–BC7), `AcpHal` (XMA2) et `xapu` (Opus).
 
 ## Phase 4 — Exécution GPU (Boot -> Menus -> Monde)
 - [ ] Proxy COM Xbox `d3d12_xs.dll` connecté au backend D3D12 hôte (et/ou Vulkan bindless).

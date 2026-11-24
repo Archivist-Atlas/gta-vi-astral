@@ -1,0 +1,388 @@
+//go:build windows
+
+package loader
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"unsafe"
+
+	"github.com/Archivist-Atlas/gta-vi-astral/pkg/core"
+	"github.com/Archivist-Atlas/gta-vi-astral/pkg/hle"
+	"github.com/Archivist-Atlas/gta-vi-astral/pkg/pe"
+)
+
+// MappedModule représente une image PE32+ mappée dans l'espace d'adressage du processus.
+type MappedModule struct {
+	Name string
+	Path string
+	Base uintptr
+	Size uint32
+	Info *pe.ImageInfo
+}
+
+// LiveSession regroupe l'ensemble des modules mappés et la table de résolution active.
+type LiveSession struct {
+	Main           *MappedModule
+	Modules        []*MappedModule
+	modulesByName  map[string]*MappedModule
+	hostModules    map[string]uintptr
+	BoundHLE       int
+	BoundHost      int
+	BoundTitleDLL  int
+	BoundStubs     int
+	TLSSlot        uint32
+	TLSPatched     int
+	DataDir        string
+}
+
+var (
+	vehOnce     sync.Once
+	vehMu       sync.RWMutex
+	vehSession  *LiveSession
+)
+
+// MapOptions configure le mappage natif Windows d'un exécutable console.
+type MapOptions struct {
+	ExePath       string
+	CacheDir      string
+	DataDir       string
+	Unimplemented core.UnimplementedPolicy
+	LiveHLE       *hle.LiveTable
+	HostPolicy    hle.HostPolicy
+}
+
+// MapAndBind prépare l'exécutable en DLL passive, le mappe via Windows, mappe les DLL
+// du titre importées, redirige le TLS statique et lie tous les slots IAT.
+func MapAndBind(opts MapOptions) (*LiveSession, error) {
+	if err := core.EnsureOutsideRepo(opts.CacheDir); err != nil {
+		return nil, err
+	}
+	if opts.DataDir != "" {
+		if err := core.EnsureOutsideRepo(opts.DataDir); err != nil {
+			return nil, err
+		}
+		SetCrashDataDir(opts.DataDir)
+	}
+
+	raw, err := os.ReadFile(opts.ExePath)
+	if err != nil {
+		return nil, err
+	}
+	prepared, err := PreparePassiveDLL(raw)
+	if err != nil {
+		return nil, fmt.Errorf("préparation passive-DLL : %w", err)
+	}
+
+	imgDir := filepath.Join(opts.CacheDir, "images")
+	if err := os.MkdirAll(imgDir, 0o755); err != nil {
+		return nil, err
+	}
+	dllPath := filepath.Join(imgDir, prepared.FileName())
+	if _, statErr := os.Stat(dllPath); statErr != nil {
+		tmp := dllPath + ".tmp"
+		if err := os.WriteFile(tmp, prepared.Bytes, 0o644); err != nil {
+			return nil, err
+		}
+		if err := os.Rename(tmp, dllPath); err != nil {
+			_ = os.Remove(tmp)
+			return nil, err
+		}
+	}
+
+	base, err := loadLibraryExW(dllPath, loadWithAlteredSearchPath)
+	if err != nil {
+		return nil, fmt.Errorf("mappage Windows de %s : %w", filepath.Base(opts.ExePath), err)
+	}
+
+	mainMod := &MappedModule{
+		Name: filepath.Base(opts.ExePath),
+		Path: opts.ExePath,
+		Base: base,
+		Size: prepared.Info.SizeOfImage,
+		Info: prepared.Info,
+	}
+	sess := &LiveSession{
+		Main:          mainMod,
+		Modules:       []*MappedModule{mainMod},
+		modulesByName: map[string]*MappedModule{strings.ToLower(mainMod.Name): mainMod},
+		hostModules:   make(map[string]uintptr),
+		DataDir:       opts.DataDir,
+	}
+
+	// Redirection TLS statique pour l'exécutable principal (slot != 0 -> slot 0 logique)
+	patched, slot, err := RedirectStaticTLS(base, prepared.Info)
+	if err != nil {
+		return nil, fmt.Errorf("redirection TLS statique : %w", err)
+	}
+	sess.TLSPatched = patched
+	sess.TLSSlot = slot
+
+	// Prépare le bloc de thunks pour les imports non encore implémentés en live
+	thunks, err := NewThunkBlock(prepared.Info.TotalImports() + 128)
+	if err != nil {
+		return nil, err
+	}
+
+	titleDir := filepath.Dir(opts.ExePath)
+	if err := sess.bindModule(mainMod, titleDir, imgDir, opts, thunks); err != nil {
+		return nil, err
+	}
+
+	if err := thunks.Seal(); err != nil {
+		return nil, err
+	}
+
+	installVEH(sess)
+	return sess, nil
+}
+
+func (s *LiveSession) bindModule(mod *MappedModule, titleDir, imgDir string, opts MapOptions, thunks *ThunkBlock) error {
+	for _, impMod := range mod.Info.Imports {
+		for _, entry := range impMod.Entries {
+			sym := entry.DisplayName()
+			addr, kind, err := s.resolveAddress(impMod.DLL, entry, titleDir, imgDir, opts, thunks)
+			if err != nil {
+				return fmt.Errorf("résolution %s!%s : %w", impMod.DLL, sym, err)
+			}
+			slotAddr := mod.Base + uintptr(entry.IATSlotRVA)
+			oldProt, err := virtualProtect(slotAddr, 8, pageReadWrite)
+			if err != nil {
+				return fmt.Errorf("VirtualProtect(IAT %s!%s) : %w", impMod.DLL, sym, err)
+			}
+			*(*uintptr)(ptrFromAddr(slotAddr)) = addr
+			_, _ = virtualProtect(slotAddr, 8, oldProt)
+
+			switch kind {
+			case ResolveHLE:
+				s.BoundHLE++
+			case ResolveHost:
+				s.BoundHost++
+			case ResolveTitleDLL:
+				s.BoundTitleDLL++
+			default:
+				s.BoundStubs++
+			}
+		}
+	}
+	return nil
+}
+
+func (s *LiveSession) resolveAddress(dll string, entry pe.ImportEntry, titleDir, imgDir string, opts MapOptions, thunks *ThunkBlock) (uintptr, ResolutionKind, error) {
+	sym := entry.DisplayName()
+
+	// 1. Live HLE override (toujours prioritaire)
+	if opts.LiveHLE != nil {
+		if fn, ok := opts.LiveHLE.Lookup(dll, sym); ok && fn != 0 {
+			return fn, ResolveHLE, nil
+		}
+	}
+
+	// 2. Host System32 (protégé contre le DLL planting via LOAD_LIBRARY_SEARCH_SYSTEM32)
+	if opts.HostPolicy.Allows(dll) {
+		hMod := s.loadHostDLL(dll)
+		if hMod != 0 {
+			var proc uintptr
+			if entry.ByOrdinal {
+				proc = getProcAddressOrdinal(hMod, entry.Ordinal)
+			} else {
+				proc = getProcAddressName(hMod, entry.Name)
+			}
+			if proc != 0 {
+				return proc, ResolveHost, nil
+			}
+		}
+	}
+
+	// 3. DLL fournie par le titre (ex: Bink2Scarlett.dll, XCurl.dll, msvcp140.dll)
+	titlePath := filepath.Join(titleDir, dll)
+	if _, err := os.Stat(titlePath); err == nil {
+		tMod, err := s.ensureTitleDLL(dll, titlePath, imgDir, titleDir, opts, thunks)
+		if err == nil && tMod != nil {
+			if addr := lookupExport(tMod, entry); addr != 0 {
+				return addr, ResolveTitleDLL, nil
+			}
+		}
+	}
+
+	// 4. Stub x86-64 généré
+	stub, err := thunks.Emit(dll, sym, opts.Unimplemented)
+	if err != nil {
+		return 0, ResolveUnimplemented, err
+	}
+	return stub, ResolveUnimplemented, nil
+}
+
+func (s *LiveSession) loadHostDLL(dll string) uintptr {
+	key := strings.ToLower(dll)
+	if h, ok := s.hostModules[key]; ok {
+		return h
+	}
+	h, err := loadLibraryExW(dll, loadLibrarySearchSystem32)
+	if err != nil {
+		s.hostModules[key] = 0
+		return 0
+	}
+	s.hostModules[key] = h
+	return h
+}
+
+func (s *LiveSession) ensureTitleDLL(dll, fullPath, imgDir, titleDir string, opts MapOptions, thunks *ThunkBlock) (*MappedModule, error) {
+	key := strings.ToLower(dll)
+	if m, ok := s.modulesByName[key]; ok {
+		return m, nil
+	}
+	raw, err := os.ReadFile(fullPath)
+	if err != nil {
+		return nil, err
+	}
+	prep, err := PreparePassiveDLL(raw)
+	if err != nil {
+		return nil, err
+	}
+	outPath := filepath.Join(imgDir, prep.FileName())
+	if _, err := os.Stat(outPath); err != nil {
+		tmp := outPath + ".tmp"
+		if err := os.WriteFile(tmp, prep.Bytes, 0o644); err != nil {
+			return nil, err
+		}
+		if err := os.Rename(tmp, outPath); err != nil {
+			_ = os.Remove(tmp)
+			return nil, err
+		}
+	}
+	base, err := loadLibraryExW(outPath, loadWithAlteredSearchPath)
+	if err != nil {
+		return nil, err
+	}
+	mod := &MappedModule{
+		Name: dll,
+		Path: fullPath,
+		Base: base,
+		Size: prep.Info.SizeOfImage,
+		Info: prep.Info,
+	}
+	s.modulesByName[key] = mod
+	s.Modules = append(s.Modules, mod)
+	// Lie récursivement les imports de la DLL du titre
+	_ = s.bindModule(mod, titleDir, imgDir, opts, thunks)
+	return mod, nil
+}
+
+func lookupExport(mod *MappedModule, entry pe.ImportEntry) uintptr {
+	for _, exp := range mod.Info.Exports {
+		if entry.ByOrdinal {
+			if exp.Ordinal == entry.Ordinal && exp.RVA != 0 {
+				return mod.Base + uintptr(exp.RVA)
+			}
+		} else if strings.EqualFold(exp.Name, entry.Name) && exp.RVA != 0 {
+			return mod.Base + uintptr(exp.RVA)
+		}
+	}
+	return 0
+}
+
+// RunEntryPoint exécute les callbacks TLS (DLL_PROCESS_ATTACH) puis le point d'entrée
+// du titre sur un thread OS dédié muni d'une pile de 8 Mio (approche Leonida).
+func (s *LiveSession) RunEntryPoint() (uint32, error) {
+	if s.Main == nil || s.Main.Info.EntryRVA == 0 {
+		return 0, fmt.Errorf("point d'entrée invalide")
+	}
+
+	// 1. Exécute les callbacks TLS de l'image principale
+	if s.Main.Info.TLS != nil {
+		for idx, cbRVA := range s.Main.Info.TLS.CallbackRVAs {
+			cbAddr := s.Main.Base + uintptr(cbRVA)
+			slog.Info("exécution callback TLS", "index", idx, "rva", fmt.Sprintf("0x%X", cbRVA))
+			_, _, _ = syscall.SyscallN(cbAddr, s.Main.Base, 1 /* DLL_PROCESS_ATTACH */, 0)
+		}
+	}
+
+	// 2. Lance le point d'entrée sur un thread OS avec pile 8 MiB
+	entryAddr := s.Main.Base + uintptr(s.Main.Info.EntryRVA)
+	slog.Info("lancement du point d'entrée natif", "module", s.Main.Name, "entry", fmt.Sprintf("0x%X", entryAddr))
+
+	var tid uint32
+	hThread, _, err := procCreateThread.Call(
+		0,
+		8*1024*1024, // 8 MiB stack
+		entryAddr,
+		0,
+		0,
+		uintptr(unsafe.Pointer(&tid)),
+	)
+	if hThread == 0 {
+		return 0, fmt.Errorf("CreateThread(entry) : %w", err)
+	}
+	defer procCloseHandle.Call(hThread)
+
+	_, _, _ = procWaitForSingleObject.Call(hThread, infiniteTimeout)
+	var exitCode uint32
+	_, _, _ = procGetExitCodeThread.Call(hThread, uintptr(unsafe.Pointer(&exitCode)))
+	return exitCode, nil
+}
+
+// Symbolize associe une adresse d'instruction à "module+0xRVA" si elle appartient au titre.
+func (s *LiveSession) Symbolize(addr uintptr) string {
+	for _, m := range s.Modules {
+		if addr >= m.Base && addr < m.Base+uintptr(m.Size) {
+			return fmt.Sprintf("%s+0x%X", m.Name, addr-m.Base)
+		}
+	}
+	return fmt.Sprintf("0x%016X", addr)
+}
+
+type exceptionRecord struct {
+	ExceptionCode    uint32
+	ExceptionFlags   uint32
+	ExceptionRecord  uintptr
+	ExceptionAddress uintptr
+	NumberParameters uint32
+}
+
+type exceptionPointers struct {
+	ExceptionRecord *exceptionRecord
+	ContextRecord   uintptr
+}
+
+func installVEH(sess *LiveSession) {
+	vehMu.Lock()
+	vehSession = sess
+	vehMu.Unlock()
+
+	vehOnce.Do(func() {
+		cb := syscall.NewCallback(func(ep *exceptionPointers) uintptr {
+			if ep == nil || ep.ExceptionRecord == nil {
+				return 0
+			}
+			code := ep.ExceptionRecord.ExceptionCode
+			// Ignore les exceptions bénignes (ex: SetThreadName 0x406D1388, C++ EH 0xE06D7363, DBG_PRINT)
+			if code == 0x406D1388 || code == 0xE06D7363 || code == 0x40010006 || code == 0x4001000A {
+				return 0
+			}
+			addr := ep.ExceptionRecord.ExceptionAddress
+			vehMu.RLock()
+			s := vehSession
+			vehMu.RUnlock()
+
+			where := fmt.Sprintf("0x%016X", addr)
+			dataDir := ""
+			if s != nil {
+				where = s.Symbolize(addr)
+				dataDir = s.DataDir
+			}
+			msg := fmt.Sprintf("ASTRAL VEH: exception 0x%08X à %s", code, where)
+			slog.Error(msg)
+			if dataDir != "" {
+				_ = AppendCrashLog(dataDir, msg)
+			}
+			return 0 // EXCEPTION_CONTINUE_SEARCH
+		})
+		_, _, _ = procAddVectoredExHandler.Call(1, cb)
+	})
+}

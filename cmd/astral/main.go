@@ -414,14 +414,20 @@ func cmdTranslate(args []string) error {
 
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
-	dryRun := fs.Bool("dry-run", true, "préparer l'image et vérifier les shims sans exécuter le point d'entrée")
+	dryRun := fs.Bool("dry-run", false, "vérification statique uniquement sans mappage mémoire")
+	mapOnly := fs.Bool("map", false, "mapper l'image + TLS + IAT dans Windows sans exécuter le point d'entrée")
+	execute := fs.Bool("execute", false, "mapper l'image et exécuter le point d'entrée natif du jeu")
 	backendFlag := fs.String("backend", "", "backend GPU : auto, d3d12, vulkan")
+	unimplFlag := fs.String("unimplemented", "", "politique imports non implémentés : log, zero, fail, trap")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	exePath := fs.Arg(0)
 	if exePath == "" {
-		return fmt.Errorf("usage : astral run <game_scarlett_master.exe> [--dry-run] [--backend auto|d3d12|vulkan]")
+		return fmt.Errorf("usage : astral run [--dry-run|--map|--execute] [--backend auto|d3d12|vulkan] [--unimplemented log|zero|fail|trap] <game_scarlett_master.exe>")
+	}
+	if !*dryRun && !*mapOnly && !*execute {
+		*mapOnly = true
 	}
 
 	cfg, err := core.LoadConfig("")
@@ -434,22 +440,9 @@ func cmdRun(args []string) error {
 	if *backendFlag != "" {
 		cfg.Runtime.GPUBackend = core.GPUBackend(strings.ToLower(*backendFlag))
 	}
-
-	raw, err := os.ReadFile(exePath)
-	if err != nil {
-		return err
+	if *unimplFlag != "" {
+		cfg.Runtime.Unimplemented = core.UnimplementedPolicy(strings.ToLower(*unimplFlag))
 	}
-	info, err := pe.Parse(raw)
-	if err != nil {
-		return err
-	}
-	prepared, err := loader.PreparePassiveDLL(raw)
-	if err != nil {
-		return err
-	}
-
-	res := loader.NewResolver(hle.NewDefaultRegistry(), hle.DefaultHostPolicy(), filepath.Dir(exePath))
-	census := res.Census(exePath, info)
 
 	backend := gpu.SelectBackend(cfg.Runtime.GPUBackend, cfg.Runtime.Wave64Emulate)
 	if err := backend.Init(); err != nil {
@@ -463,23 +456,64 @@ func cmdRun(args []string) error {
 		return err
 	}
 
-	fmt.Printf("Image préparée : %s (hash=%s, EntryRVA=0x%X)\n", filepath.Base(exePath), prepared.OriginalHash, prepared.EntryRVA)
-	fmt.Printf("Couverture IAT : %.1f%% (%d HLE, %d Host, %d TitleDLL, %d manquants)\n",
-		census.CoveragePercent(),
-		census.ByKind[loader.ResolveHLE],
-		census.ByKind[loader.ResolveHost],
-		census.ByKind[loader.ResolveTitleDLL],
-		census.ByKind[loader.ResolveUnimplemented],
-	)
 	fmt.Printf("Backend GPU    : %s (shaders=%s, wave64_natif=%v, mesh=%v, xdxr_bvh4=%v)\n",
 		caps.Name, caps.ShaderTarget, caps.NativeWave64, caps.MeshShaders, caps.XDXRBVH4Builder)
 	fmt.Printf("VirtualFS      : GAME:=%s | OVERLAY=%s | DATA=%s\n", vfs.GameDir, vfs.OverlayDir, vfs.DataDir)
 
 	if *dryRun {
-		fmt.Println("Mode --dry-run : préparation et vérifications réussies (point d'entrée non exécuté).")
+		raw, err := os.ReadFile(exePath)
+		if err != nil {
+			return err
+		}
+		info, err := pe.Parse(raw)
+		if err != nil {
+			return err
+		}
+		prepared, err := loader.PreparePassiveDLL(raw)
+		if err != nil {
+			return err
+		}
+		res := loader.NewResolver(hle.NewDefaultRegistry(), hle.DefaultHostPolicy(), filepath.Dir(exePath))
+		census := res.Census(exePath, info)
+		fmt.Printf("Image préparée : %s (hash=%s, EntryRVA=0x%X)\n", filepath.Base(exePath), prepared.OriginalHash, prepared.EntryRVA)
+		fmt.Printf("Couverture IAT : %.1f%% (%d HLE, %d Host, %d TitleDLL, %d manquants)\n",
+			census.CoveragePercent(),
+			census.ByKind[loader.ResolveHLE],
+			census.ByKind[loader.ResolveHost],
+			census.ByKind[loader.ResolveTitleDLL],
+			census.ByKind[loader.ResolveUnimplemented],
+		)
+		fmt.Println("Mode -dry-run  : vérifications statiques réussies.")
 		return nil
 	}
-	return fmt.Errorf("exécution live du point d'entrée non encore activée dans cette version (utilisez --dry-run)")
+
+	// Mappage natif Windows (LoadLibraryExW + redirection TLS statique + binding IAT réel)
+	sess, err := loader.MapAndBind(loader.MapOptions{
+		ExePath:       exePath,
+		CacheDir:      cfg.Paths.CacheDir,
+		DataDir:       cfg.Paths.DataDir,
+		Unimplemented: cfg.Runtime.Unimplemented,
+		LiveHLE:       hle.NewLiveTable(cfg.Runtime.ConsoleProfile),
+		HostPolicy:    hle.DefaultHostPolicy(),
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Image mappée   : %s (TLS slot=%d, %d accès TLS patchés)\n", filepath.Base(exePath), sess.TLSSlot, sess.TLSPatched)
+	fmt.Printf("Binding IAT    : %d HLE live | %d Host System32 | %d TitleDLL | %d stubs x86-64\n",
+		sess.BoundHLE, sess.BoundHost, sess.BoundTitleDLL, sess.BoundStubs)
+
+	if !*execute {
+		fmt.Println("Mode -map      : mappage mémoire, TLS et binding IAT réussis (ajoutez -execute pour lancer le point d'entrée).")
+		return nil
+	}
+
+	exitCode, err := sess.RunEntryPoint()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Point d'entrée terminé avec le code de sortie : %d (0x%X)\n", exitCode, exitCode)
+	return nil
 }
 
 func orNone(s string) string {
