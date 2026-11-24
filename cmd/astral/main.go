@@ -7,7 +7,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -531,12 +533,23 @@ func previewList(items []string, maxItems int) string {
 	return fmt.Sprintf("%s ... (+%d)", strings.Join(items[:maxItems], ", "), len(items)-maxItems)
 }
 
+func clearScreen() {
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("cmd", "/c", "cls")
+		cmd.Stdout = os.Stdout
+		_ = cmd.Run()
+		return
+	}
+	fmt.Print("\033[H\033[2J")
+}
+
 func runInteractiveMenu() {
 	reader := bufio.NewReader(os.Stdin)
 	cfg, _ := core.LoadConfig("")
 	gameDir := cfg.Paths.GameDir
 
 	for {
+		clearScreen()
 		fmt.Println("============================================================")
 		fmt.Printf("  gta-vi-astral %s — Menu interactif\n", version)
 		fmt.Println("============================================================")
