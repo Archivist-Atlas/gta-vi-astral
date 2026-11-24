@@ -5,6 +5,7 @@ package hle
 import (
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -12,7 +13,16 @@ import (
 	"unsafe"
 
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/gpu"
+	"github.com/Archivist-Atlas/gta-vi-astral/pkg/shader"
 )
+
+type guestPSO struct {
+	vsPtr  uintptr
+	vsLen  uint64
+	psPtr  uintptr
+	psLen  uint64
+	logged atomic.Bool
+}
 
 type fenceWaiter struct {
 	val   uint64
@@ -32,6 +42,8 @@ type d3d12xState struct {
 	resGPUAddrs     map[uintptr]uint64
 	resDescs        map[uintptr]xgResourceDesc
 	rtvResources    map[uintptr]uintptr
+	psos            map[uintptr]*guestPSO
+	frameDraws      []gpu.HostDrawPass
 	lastClearColor  [4]float32
 	hasClearColor   bool
 	queuesCreated   atomic.Int64
@@ -53,10 +65,14 @@ func newD3D12XDevice() uintptr {
 		resGPUAddrs:    make(map[uintptr]uint64),
 		resDescs:       make(map[uintptr]xgResourceDesc),
 		rtvResources:   make(map[uintptr]uintptr),
+		psos:           make(map[uintptr]*guestPSO),
 		lastClearColor: [4]float32{0.04, 0.05, 0.09, 1.0},
 	}
 	st.nextHeapBase.Store(0x0000100000000000)
 	st.nextGPUAddr.Store(0x0000200000000000)
+
+	gpuTrace := os.Getenv("ASTRAL_GPU_TRACE") == "1"
+	var listSlotHits [160]atomic.Uint64
 
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
 	cbOne := syscall.NewCallback(func() uintptr { return 1 })
@@ -235,12 +251,18 @@ func newD3D12XDevice() uintptr {
 		}
 		st.mu.Lock()
 		clr := st.lastClearColor
+		draws := st.frameDraws
+		st.frameDraws = nil
 		if resObj != 0 {
 			if d, ok := st.resDescs[resObj]; ok {
 				resW, resH, resFmt = uint32(d.Width), d.Height, d.Format
 			}
 		}
 		st.mu.Unlock()
+		for i := range draws {
+			draws[i].FrameNumber = uint32(n)
+			draws[i].PassIndex = uint32(i)
+		}
 		if n == 1 || n%60 == 0 {
 			slog.Info("ID3D12CommandQueueX!PresentX",
 				"frame", n,
@@ -252,8 +274,17 @@ func newD3D12XDevice() uintptr {
 				"dispatches", st.dispatchCalls.Load(),
 				"clears", st.clearRTVCalls.Load(),
 			)
+			if gpuTrace && n == 60 {
+				var summary string
+				for s := 8; s < 160; s++ {
+					if c := listSlotHits[s].Load(); c > 0 {
+						summary += fmt.Sprintf(" #%d=%d", s, c)
+					}
+				}
+				slog.Info("GPU_TRACE CommandListX slots @ frame 60", "slots", summary, "psos", st.psoCreated.Load(), "heaps", st.heapsCreated.Load(), "res", st.resCreated.Load())
+			}
 		}
-		gpu.PresentHostFrame(0, clr, nil, 0, 0, 0)
+		gpu.PresentHostFrame(0, clr, nil, 0, 0, 0, draws...)
 		return hresultOK
 	})
 	newQueue := func() uintptr {
@@ -320,38 +351,115 @@ func newD3D12XDevice() uintptr {
 	for s := 8; s < 160; s++ {
 		slotIdx := s
 		cmdListSlots[s] = syscall.NewCallback(func() uintptr {
+			listSlotHits[slotIdx].Add(1)
 			if listSlotLogged[slotIdx].CompareAndSwap(false, true) {
 				slog.Debug("ID3D12GraphicsCommandListX slot appelé", "slot", slotIdx, "offset", fmt.Sprintf("0x%X", slotIdx*8))
 			}
 			return hresultOK
 		})
 	}
-	cbListDraw := syscall.NewCallback(func() uintptr {
-		st.drawCalls.Add(1)
+	cbListDrawInst := syscall.NewCallback(func(this, vtxCount, instCount, startVtx, startInst uintptr) uintptr {
+		listSlotHits[12].Add(1)
+		n := st.drawCalls.Add(1)
+		st.mu.Lock()
+		if len(st.frameDraws) < 64 {
+			st.frameDraws = append(st.frameDraws, gpu.HostDrawPass{
+				VertexCount:   uint32(vtxCount),
+				InstanceCount: uint32(instCount),
+				StartVertex:   uint32(startVtx),
+				StartInstance: uint32(startInst),
+			})
+		}
+		st.mu.Unlock()
+		if gpuTrace && n <= 12 {
+			slog.Info("GPU_TRACE DrawInstanced", "n", n, "vtx", uint32(vtxCount), "inst", uint32(instCount), "startVtx", uint32(startVtx), "startInst", uint32(startInst))
+		}
+		return 0
+	})
+	cbListDrawIdx := syscall.NewCallback(func(this, idxCount, instCount, startIdx, baseVtx, startInst uintptr) uintptr {
+		listSlotHits[13].Add(1)
+		n := st.drawCalls.Add(1)
+		if gpuTrace && n <= 12 {
+			slog.Info("GPU_TRACE DrawIndexedInstanced", "n", n, "idx", uint32(idxCount), "inst", uint32(instCount), "startIdx", uint32(startIdx), "baseVtx", int32(baseVtx))
+		}
+		return 0
+	})
+	cbListDrawIdxX := syscall.NewCallback(func(this, idxCount, instCount, startIdx, baseVtx, startInst uintptr) uintptr {
+		listSlotHits[81].Add(1)
+		n := st.drawCalls.Add(1)
+		if gpuTrace && n <= 12 {
+			slog.Info("GPU_TRACE DrawIndexedX", "n", n, "idx", uint32(idxCount), "inst", uint32(instCount), "startIdx", uint32(startIdx))
+		}
 		return 0
 	})
 	cbListDispatch := syscall.NewCallback(func() uintptr {
+		listSlotHits[14].Add(1)
 		st.dispatchCalls.Add(1)
 		return 0
 	})
 	cbListClearRTV := syscall.NewCallback(func(this, rtvHandle, colorPtr, numRects, rects uintptr) uintptr {
-		st.clearRTVCalls.Add(1)
+		listSlotHits[52].Add(1)
+		n := st.clearRTVCalls.Add(1)
 		if colorPtr >= 0x10000 {
 			c := *(*[4]float32)(osPtr(colorPtr))
 			st.mu.Lock()
 			st.lastClearColor = c
 			st.hasClearColor = true
 			st.mu.Unlock()
+			if gpuTrace && n <= 8 {
+				slog.Info("GPU_TRACE ClearRenderTargetView", "n", n, "rtv", fmt.Sprintf("0x%X", rtvHandle), "rgba", c)
+			}
 		}
 		return 0
 	})
-	cmdListSlots[12] = cbListDraw         // DrawInstanced
-	cmdListSlots[13] = cbListDraw         // DrawIndexedInstanced
+	describeDXBC := func(p uintptr, l uint64) string {
+		if p < 0x10000 || l < 32 || l > (16<<20) {
+			return "none"
+		}
+		data := unsafe.Slice((*byte)(osPtr(p)), l)
+		c, err := shader.ParseDXBC(data)
+		if err != nil {
+			return fmt.Sprintf("len=%d err=%v", l, err)
+		}
+		var parts string
+		for _, pt := range c.Parts {
+			parts += pt.FourCC.String() + ","
+		}
+		progs, perr := shader.ExtractNativePrograms(c)
+		if perr != nil || len(progs) == 0 {
+			return fmt.Sprintf("len=%d parts=[%s] nativeErr=%v", l, parts, perr)
+		}
+		var nat string
+		for _, pr := range progs {
+			insts := shader.DecodeGFX10(pr.Code)
+			nat += fmt.Sprintf("%s(%dB/%dins/w64=%v/v%d/s%d/res=%d) ", pr.Stage, len(pr.Code), len(insts), pr.Wave64, pr.VGPRs, pr.SGPRs, len(pr.UsedResources))
+		}
+		return fmt.Sprintf("len=%d parts=[%s] native=[%s]", l, parts, nat)
+	}
+	cbListSetPSO := syscall.NewCallback(func(this, pso uintptr) uintptr {
+		listSlotHits[25].Add(1)
+		if gpuTrace && pso != 0 {
+			st.mu.Lock()
+			gp := st.psos[pso]
+			st.mu.Unlock()
+			if gp != nil && gp.logged.CompareAndSwap(false, true) {
+				slog.Info("GPU_TRACE Active PSO bound",
+					"pso", fmt.Sprintf("0x%X", pso),
+					"vs", describeDXBC(gp.vsPtr, gp.vsLen),
+					"ps", describeDXBC(gp.psPtr, gp.psLen),
+				)
+			}
+		}
+		return 0
+	})
+	cmdListSlots[12] = cbListDrawInst     // DrawInstanced
+	cmdListSlots[13] = cbListDrawIdx      // DrawIndexedInstanced
 	cmdListSlots[14] = cbListDispatch     // Dispatch
-	cmdListSlots[48] = cbListClearRTV     // ClearRenderTargetView
+	cmdListSlots[25] = cbListSetPSO       // SetPipelineState
+	cmdListSlots[52] = cbListClearRTV     // ClearRenderTargetView (Xbox slot 52 = PC slot 48)
 	cmdListSlots[60] = cbListCopyMem      // CopyMemoryToMemoryX (0x1E0)
 	cmdListSlots[78] = cbListDispatch     // DispatchX (0x270)
-	cmdListSlots[81] = cbListDraw         // DrawIndexedX (0x288)
+	cmdListSlots[81] = cbListDrawIdxX     // DrawIndexedX (0x288)
 	cmdListSlots[148] = cbListAllocUpload // AllocateUploadMemory (0x4A0)
 	cmdListProto := NewCOMObjectWithHeader("ID3D12GraphicsCommandListX", 160, 0x1000, cmdListSlots)
 	cmdListVtable := *(*uintptr)(osPtr(cmdListProto))
@@ -594,10 +702,68 @@ func newD3D12XDevice() uintptr {
 		}
 		return hresultOK
 	})
+	var psoTraceCount atomic.Int64
+	inspectPSO := func(kind string, desc uintptr) {
+		if !gpuTrace || desc < 0x10000 {
+			return
+		}
+		n := psoTraceCount.Add(1)
+		if n > 8 {
+			return
+		}
+		rootSig := *(*uintptr)(osPtr(desc + 0x00))
+		vsPtr := *(*uintptr)(osPtr(desc + 0x08))
+		vsLen := *(*uint64)(osPtr(desc + 0x10))
+		psPtr := *(*uintptr)(osPtr(desc + 0x18))
+		psLen := *(*uint64)(osPtr(desc + 0x20))
+		magicStr := func(p uintptr, l uint64) string {
+			if p < 0x10000 || l < 4 {
+				return "-"
+			}
+			b := unsafe.Slice((*byte)(osPtr(p)), 4)
+			return fmt.Sprintf("%q(%02X%02X%02X%02X)", string(b), b[0], b[1], b[2], b[3])
+		}
+		slog.Info("GPU_TRACE "+kind, "n", n, "rootSig", fmt.Sprintf("0x%X", rootSig),
+			"vsLen", vsLen, "vsMagic", magicStr(vsPtr, vsLen),
+			"psLen", psLen, "psMagic", magicStr(psPtr, psLen))
+	}
 	cbCreatePSO := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
 		slog.Debug("D3D12DeviceX!CreatePSO")
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
+		}
+		inspectPSO("CreatePSO", desc)
+		return hresultOK
+	})
+	cbCreatePSOStream := syscall.NewCallback(func(this, streamDesc, iid, outPtr uintptr) uintptr {
+		psoObj := newPipelineState()
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = psoObj
+		}
+		if streamDesc >= 0x10000 {
+			sz := *(*uint64)(osPtr(streamDesc + 0))
+			sub := *(*uintptr)(osPtr(streamDesc + 8))
+			if sub >= 0x10000 && sz >= 16 && sz <= 4096 {
+				q := unsafe.Slice((*uint64)(osPtr(sub)), sz/8)
+				gp := &guestPSO{}
+				for i := 0; i < len(q) && i < 32; i++ {
+					if q[i] >= 0x10000 && q[i] < 0x800000000000 && i+1 < len(q) && q[i+1] >= 32 && q[i+1] <= (16<<20) {
+						b := unsafe.Slice((*byte)(osPtr(uintptr(q[i]))), 4)
+						if b[0] == 'D' && b[1] == 'X' && b[2] == 'B' && b[3] == 'C' {
+							if gp.vsPtr == 0 {
+								gp.vsPtr, gp.vsLen = uintptr(q[i]), q[i+1]
+							} else if gp.psPtr == 0 {
+								gp.psPtr, gp.psLen = uintptr(q[i]), q[i+1]
+							}
+						}
+					}
+				}
+				if gp.vsPtr != 0 || gp.psPtr != 0 {
+					st.mu.Lock()
+					st.psos[psoObj] = gp
+					st.mu.Unlock()
+				}
+			}
 		}
 		return hresultOK
 	})
@@ -621,6 +787,7 @@ func newD3D12XDevice() uintptr {
 		if outPtr != 0 {
 			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
 		}
+		inspectPSO("CreateGraphicsPSOX", desc)
 		return hresultOK
 	})
 	cbCreateComputePSOX := syscall.NewCallback(func(this, desc, extensions, extended, iid, outPtr uintptr) uintptr {
@@ -1184,7 +1351,7 @@ func newD3D12XDevice() uintptr {
 		79:  cbScheduleFrameEvent,
 		80:  cbWaitFrameEvent,
 		81:  cbGetFrameStats,
-		86:  cbCreatePSO,
+		86:  cbCreatePSOStream,
 		108: cbAllocInfo2,
 		118: cbCreateShaderCacheSession,
 		127: cbCreateCommitted3,

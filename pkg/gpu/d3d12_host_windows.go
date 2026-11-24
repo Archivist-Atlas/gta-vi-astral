@@ -88,10 +88,12 @@ type HostD3D12 struct {
 	Fence        uintptr
 	FenceEvent   uintptr
 	FenceValue   uint64
-	UploadBuf    uintptr
-	UploadPtr    uintptr
-	UploadPitch  uint32
-	Ready        bool
+	UploadBuf     uintptr
+	UploadPtr     uintptr
+	UploadPitch   uint32
+	ReplayRootSig uintptr
+	ReplayPSO     uintptr
+	Ready         bool
 }
 
 var (
@@ -341,6 +343,7 @@ func (h *HostD3D12) initPresentPipeline() {
 		}
 	}
 
+	h.initReplayPipeline()
 	h.Ready = true
 }
 
@@ -357,9 +360,9 @@ func (h *HostD3D12) waitGPU() {
 	}
 }
 
-// PresentClear présente la trame courante en effaçant le backbuffer avec clearColor (RGBA)
-// ou en y copiant srcRGBA (s'il est non vide), puis en appelant IDXGISwapChain::Present.
-func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32) {
+// PresentClear présente la trame courante en effaçant le backbuffer avec clearColor (RGBA),
+// en rejouant les appels DrawInstanced hôtes (si présents) ou en copiant srcRGBA, puis en appelant Present.
+func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32, draws ...HostDrawPass) {
 	if h == nil || h.SwapChain == 0 {
 		return
 	}
@@ -371,11 +374,10 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 		bb := h.BackBuffers[idx]
 		rtv := h.RTVStart + idx*h.RTVStride
 
-		_ = comCall(h.CmdAlloc, 8)            // Allocator::Reset
+		_ = comCall(h.CmdAlloc, 8)                // Allocator::Reset
 		_ = comCall(h.CmdList, 10, h.CmdAlloc, 0) // CommandList::Reset
 
 		if len(srcRGBA) > 0 && h.UploadBuf != 0 && h.UploadPtr != 0 && srcW > 0 && srcH > 0 {
-			// Copie ligne à ligne (clippée à Width x Height) vers le buffer d'upload
 			copyW := srcW
 			if copyW > h.Width {
 				copyW = h.Width
@@ -421,6 +423,27 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 			// ID3D12GraphicsCommandList::ClearRenderTargetView (slot 48)
 			_ = comCall(h.CmdList, 48, rtv, uintptr(unsafe.Pointer(&clearColor[0])), 0, 0)
 
+			// Rejeu matériel des appels DrawInstanced sur le GPU Windows hôte
+			if len(draws) > 0 && h.ReplayRootSig != 0 && h.ReplayPSO != 0 {
+				vp := d3d12Viewport{Width: float32(h.Width), Height: float32(h.Height), MinDepth: 0, MaxDepth: 1}
+				sc := d3d12Rect{Right: int32(h.Width), Bottom: int32(h.Height)}
+				_ = comCall(h.CmdList, 46, 1, uintptr(unsafe.Pointer(&rtv)), 0, 0) // OMSetRenderTargets
+				_ = comCall(h.CmdList, 21, 1, uintptr(unsafe.Pointer(&vp)))        // RSSetViewports
+				_ = comCall(h.CmdList, 22, 1, uintptr(unsafe.Pointer(&sc)))        // RSSetScissorRects
+				_ = comCall(h.CmdList, 20, 4)                                      // IASetPrimitiveTopology(TRIANGLELIST)
+				_ = comCall(h.CmdList, 30, h.ReplayRootSig)                        // SetGraphicsRootSignature
+				_ = comCall(h.CmdList, 25, h.ReplayPSO)                            // SetPipelineState
+				total := uint32(len(draws))
+				for _, d := range draws {
+					if d.VertexCount == 0 || d.InstanceCount == 0 {
+						continue
+					}
+					consts := [4]uint32{d.FrameNumber, d.PassIndex, total, 0}
+					_ = comCall(h.CmdList, 36, 0, 4, uintptr(unsafe.Pointer(&consts[0])), 0) // SetGraphicsRoot32BitConstants
+					_ = comCall(h.CmdList, 12, uintptr(d.VertexCount), uintptr(d.InstanceCount), uintptr(d.StartVertex), uintptr(d.StartInstance))
+				}
+			}
+
 			b2 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x4 /* RENDER_TARGET */, StateAfter: 0 /* PRESENT */}
 			_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b2)))
 		}
@@ -451,12 +474,12 @@ func PresentHost(syncInterval uint32) {
 	}
 }
 
-// PresentHostFrame présente une trame avec couleur de clear et/ou framebuffer RGBA8 optionnel.
-func PresentHostFrame(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32) {
+// PresentHostFrame présente une trame avec couleur de clear, framebuffer optionnel et passes DrawInstanced.
+func PresentHostFrame(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32, draws ...HostDrawPass) {
 	hostMu.Lock()
 	h := hostInstance
 	hostMu.Unlock()
 	if h != nil {
-		h.PresentClear(syncInterval, clearColor, srcRGBA, srcW, srcH, srcPitch)
+		h.PresentClear(syncInterval, clearColor, srcRGBA, srcW, srcH, srcPitch, draws...)
 	}
 }
