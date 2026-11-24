@@ -5,6 +5,7 @@ package hle
 import (
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -33,9 +34,13 @@ var (
 	k32LoadLibExA    = k32.NewProc("LoadLibraryExA")
 	k32LoadLibExW    = k32.NewProc("LoadLibraryExW")
 	k32GetModHandleA = k32.NewProc("GetModuleHandleA")
-	k32GetModHandleW = k32.NewProc("GetModuleHandleW")
-	k32GetProcAddr   = k32.NewProc("GetProcAddress")
-	kbaseVirtAlloc2  = kbase.NewProc("VirtualAlloc2")
+	k32GetModHandleW  = k32.NewProc("GetModuleHandleW")
+	k32GetProcAddr    = k32.NewProc("GetProcAddress")
+	k32CreateFileW    = k32.NewProc("CreateFileW")
+	k32GetFileAttrW   = k32.NewProc("GetFileAttributesW")
+	k32GetFileAttrExW = k32.NewProc("GetFileAttributesExW")
+	k32FindFirstFileW = k32.NewProc("FindFirstFileW")
+	kbaseVirtAlloc2   = kbase.NewProc("VirtualAlloc2")
 	d3d12Host        = syscall.NewLazyDLL("d3d12.dll")
 	d3d12SerRoot     = d3d12Host.NewProc("D3D12SerializeRootSignature")
 	d3d12SerVerRoot  = d3d12Host.NewProc("D3D12SerializeVersionedRootSignature")
@@ -149,8 +154,8 @@ func dllNameForPseudo(h uintptr) (string, bool) {
 }
 
 // NewLiveTable instancie les shims exécutables de démarrage (XMem, VirtualAlloc,
-// GDK hors-ligne, réseau hors-ligne, D3D12.X root signature).
-func NewLiveTable(profile core.ConsoleProfile) *LiveTable {
+// VirtualFS, GDK hors-ligne, réseau hors-ligne, D3D12.X).
+func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	t := &LiveTable{funcs: make(map[string]uintptr)}
 
 	// --- 1. VirtualAlloc sanitisé (retire MEM_GRAPHICS / MEM_TITLE / PAGE_GRAPHICS_*) ---
@@ -333,12 +338,162 @@ func NewLiveTable(profile core.ConsoleProfile) *LiveTable {
 		21: cbGISuccess,         // SetFocusPolicy
 	})
 
+	var nextHandle atomic.Uint64
+	nextHandle.Store(0x1000)
+
+	putStr := func(s string, size, bufPtr, usedPtr uintptr) uintptr {
+		need := uintptr(len(s) + 1)
+		if bufPtr == 0 || size < need {
+			return 0x8007007A // HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)
+		}
+		dst := unsafe.Slice((*byte)(osPtr(bufPtr)), need)
+		copy(dst, s)
+		dst[len(s)] = 0
+		if usedPtr != 0 {
+			*(*uintptr)(osPtr(usedPtr)) = need
+		}
+		return hresultOK
+	}
+
+	cbTaskQueueCreate := syscall.NewCallback(func(this, workMode, compMode, outPtr uintptr) uintptr {
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = uintptr(nextHandle.Add(1))
+		}
+		return hresultOK
+	})
+	cbRegisterToken5 := syscall.NewCallback(func(this, a1, a2, a3, outToken uintptr) uintptr {
+		if outToken != 0 {
+			*(*uint64)(osPtr(outToken)) = nextHandle.Add(1)
+		}
+		return hresultOK
+	})
+	cbNetConnectivityHint := syscall.NewCallback(func(this, outPtr uintptr) uintptr {
+		if outPtr != 0 {
+			// ConnectivityHint: level=1 (None), cost=0, iface=0, initialized=true
+			b := unsafe.Slice((*byte)(osPtr(outPtr)), 16)
+			for i := range b {
+				b[i] = 0
+			}
+			b[0] = 1  // level = 1
+			b[12] = 1 // initialized = true
+		}
+		return hresultOK
+	})
+	cbGameGetTitleID := syscall.NewCallback(func(this, outPtr uintptr) uintptr {
+		if outPtr != 0 {
+			*(*uint32)(osPtr(outPtr)) = 0x7952987A // GTA VI Xbox Series TitleId
+		}
+		return hresultOK
+	})
+	cbSysConsoleID := syscall.NewCallback(func(this, size, bufPtr, usedPtr uintptr) uintptr {
+		return putStr("00000000000000000000000000000000000001", size, bufPtr, usedPtr)
+	})
+	cbSysSandboxID := syscall.NewCallback(func(this, size, bufPtr, usedPtr uintptr) uintptr {
+		return putStr("RETAIL", size, bufPtr, usedPtr)
+	})
+	cbSysDeviceID := syscall.NewCallback(func(this, size, bufPtr, usedPtr uintptr) uintptr {
+		return putStr("QVNUUkFMIG9mZmxpbmUgZGV2aWNlIGlkZW50aXR5ISE=", size, bufPtr, usedPtr)
+	})
+
 	gdkProviders := map[string]uintptr{
-		"{073B7DCB-1FCF-4030-94BE-E3C9EB623428}": NewCOMObject("xasync", 64, nil),
-		"{37E56907-2F10-41E8-B72F-36EDB185331A}": NewCOMObject("xnetworking", 64, nil),
-		"{01ACD177-91F9-4763-A38E-CCBB55CE32E0}": NewCOMObject("xuser", 64, nil),
-		"{973A344E-24BF-4D0F-8457-56C534892B29}": NewCOMObject("xgame", 64, nil),
-		"{E349BD1A-FC20-4E40-B99C-4178CC6B409F}": NewCOMObject("xsystem", 64, nil),
+		"{073B7DCB-1FCF-4030-94BE-E3C9EB623428}": NewCOMObject("xasync", 64, map[int]uintptr{
+			12: cbTaskQueueCreate, // 0x60 XTaskQueueCreate
+			13: cbTaskQueueCreate, // 0x68 XTaskQueueCreateComposite
+			29: cbGISuccess,       // 0xE8 CheckThread
+		}),
+		"{37E56907-2F10-41E8-B72F-36EDB185331A}": NewCOMObject("xnetworking", 64, map[int]uintptr{
+			15: cbNetConnectivityHint, // 0x78 GetConnectivityHint
+			16: cbRegisterToken5,      // 0x80 RegisterConnectivityHintChanged
+			17: cbReturnTrue,          // 0x88 UnregisterConnectivityHintChanged
+		}),
+		"{01ACD177-91F9-4763-A38E-CCBB55CE32E0}": NewCOMObject("xuser", 64, map[int]uintptr{
+			33: cbRegisterToken5, // 0x108 XUserRegisterForChangeEvent
+			34: cbReturnTrue,     // 0x110 XUserUnregisterForChangeEvent
+		}),
+		"{973A344E-24BF-4D0F-8457-56C534892B29}": NewCOMObject("xgame", 64, map[int]uintptr{
+			3: cbGameGetTitleID, // 0x18 XGameGetXboxTitleId
+		}),
+		"{E349BD1A-FC20-4E40-B99C-4178CC6B409F}": NewCOMObject("xsystem", 64, map[int]uintptr{
+			3: cbSysConsoleID, // 0x18 ConsoleId
+			4: cbSysSandboxID, // 0x20 SandboxId ("RETAIL")
+			5: cbSysDeviceID,  // 0x28 DeviceId
+		}),
+	}
+
+	// --- 3d. Réécriture des chemins console (VirtualFS : G:\ / GAME:\ / T:\) ---
+	if vfs != nil {
+		rewriteW := func(pathPtr uintptr, isWrite bool) (*uint16, bool) {
+			if pathPtr == 0 {
+				return nil, false
+			}
+			orig := readUTF16Str(pathPtr)
+			var mapped string
+			var changed bool
+			if isWrite {
+				if m, err := vfs.ResolveWrite(orig); err == nil && m != orig {
+					mapped, changed = m, true
+				}
+			} else {
+				mapped, changed = vfs.ResolveRead(orig)
+			}
+			if !changed {
+				return nil, false
+			}
+			slog.Debug("VirtualFS rewrite", "from", orig, "to", mapped)
+			p, err := syscall.UTF16PtrFromString(mapped)
+			if err != nil {
+				return nil, false
+			}
+			return p, true
+		}
+
+		cbCreateFileW := syscall.NewCallback(func(namePtr, access, share, sec, disp, flags, tmpl uintptr) uintptr {
+			isWrite := (access & 0x40000000) != 0 // GENERIC_WRITE
+			if mapped, ok := rewriteW(namePtr, isWrite); ok {
+				r, _, _ := k32CreateFileW.Call(uintptr(unsafe.Pointer(mapped)), access, share, sec, disp, flags, tmpl)
+				return r
+			}
+			r, _, _ := k32CreateFileW.Call(namePtr, access, share, sec, disp, flags, tmpl)
+			return r
+		})
+		cbGetFileAttrW := syscall.NewCallback(func(namePtr uintptr) uintptr {
+			if mapped, ok := rewriteW(namePtr, false); ok {
+				r, _, _ := k32GetFileAttrW.Call(uintptr(unsafe.Pointer(mapped)))
+				return r
+			}
+			r, _, _ := k32GetFileAttrW.Call(namePtr)
+			return r
+		})
+		cbGetFileAttrExW := syscall.NewCallback(func(namePtr, level, infoPtr uintptr) uintptr {
+			if mapped, ok := rewriteW(namePtr, false); ok {
+				r, _, _ := k32GetFileAttrExW.Call(uintptr(unsafe.Pointer(mapped)), level, infoPtr)
+				return r
+			}
+			r, _, _ := k32GetFileAttrExW.Call(namePtr, level, infoPtr)
+			return r
+		})
+		cbFindFirstFileW := syscall.NewCallback(func(namePtr, dataPtr uintptr) uintptr {
+			if mapped, ok := rewriteW(namePtr, false); ok {
+				r, _, _ := k32FindFirstFileW.Call(uintptr(unsafe.Pointer(mapped)), dataPtr)
+				return r
+			}
+			r, _, _ := k32FindFirstFileW.Call(namePtr, dataPtr)
+			return r
+		})
+
+		for _, dll := range []string{
+			"kernel32.dll",
+			"kernelbase.dll",
+			"api-ms-win-core-file-l1-1-0.dll",
+			"api-ms-win-core-file-l1-2-0.dll",
+			"api-ms-win-core-file-l1-2-1.dll",
+			"api-ms-win-core-file-l1-2-2.dll",
+		} {
+			t.bind(dll, "CreateFileW", cbCreateFileW)
+			t.bind(dll, "GetFileAttributesW", cbGetFileAttrW)
+			t.bind(dll, "GetFileAttributesExW", cbGetFileAttrExW)
+			t.bind(dll, "FindFirstFileW", cbFindFirstFileW)
+		}
 	}
 
 	cbQueryApiImpl := syscall.NewCallback(func(provider, iid, outPtr uintptr) uintptr {

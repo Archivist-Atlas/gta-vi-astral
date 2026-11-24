@@ -493,7 +493,7 @@ func cmdRun(args []string) error {
 		CacheDir:      cfg.Paths.CacheDir,
 		DataDir:       cfg.Paths.DataDir,
 		Unimplemented: cfg.Runtime.Unimplemented,
-		LiveHLE:       hle.NewLiveTable(cfg.Runtime.ConsoleProfile),
+		LiveHLE:       hle.NewLiveTable(cfg.Runtime.ConsoleProfile, vfs),
 		HostPolicy:    hle.DefaultHostPolicy(),
 	})
 	if err != nil {
