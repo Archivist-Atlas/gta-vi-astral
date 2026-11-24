@@ -353,7 +353,7 @@ func newD3D12XDevice() uintptr {
 	newDescriptorHeap := func(descPtr uintptr) uintptr {
 		st.heapsCreated.Add(1)
 		// D3D12_DESCRIPTOR_HEAP_DESC : { Type u32, NumDescriptors u32, Flags u32, NodeMask u32 }
-		// Suivi sur Xbox Series (GTA VI) de Placement { Address u64 (+16), Size u64 (+24) }.
+		// Suivi sur Xbox Series (GTA VI) d'un Placement optionnel { Address u64 (+16), Size u64 (+24) }.
 		var baseAddr uintptr
 		numDescs := uintptr(4096)
 		stride := uintptr(128)
@@ -361,7 +361,7 @@ func newD3D12XDevice() uintptr {
 			heapType := *(*uint32)(osPtr(descPtr))
 			n := *(*uint32)(osPtr(descPtr + 4))
 			placementAddr := *(*uint64)(osPtr(descPtr + 16))
-			if placementAddr != 0 {
+			if placementAddr >= 0x10000 && placementAddr < 0x800000000000 {
 				baseAddr = uintptr(placementAddr)
 			}
 			if n > 0 && n <= 1_048_576 {
@@ -894,14 +894,18 @@ func newD3D12XDevice() uintptr {
 		}
 		return hresultOK
 	})
-	cbGetFrameStats := syscall.NewCallback(func(this, outStats uintptr) uintptr {
-		slog.Debug("D3D12DeviceX!GetFrameStatisticsX")
-		if outStats != 0 {
+	cbGetFrameStats := syscall.NewCallback(func(this, token, ty, countPtr, outStats uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!GetFrameStatisticsX", "token", token, "ty", uint32(ty))
+		if countPtr >= 0x10000 {
+			*(*uint32)(osPtr(countPtr)) = 1
+		}
+		if outStats >= 0x10000 {
 			b := unsafe.Slice((*byte)(osPtr(outStats)), 64)
-			for i := range b {
-				b[i] = 0
-			}
-			*(*uint64)(osPtr(outStats)) = nextFrameToken.Load()
+			clear(b)
+			*(*uint32)(osPtr(outStats + 0)) = uint32(ty)
+			now := uint64(time.Now().UnixNano() / 100)
+			*(*uint64)(osPtr(outStats + 0x10)) = now
+			*(*uint64)(osPtr(outStats + 0x18)) = now
 		}
 		return hresultOK
 	})

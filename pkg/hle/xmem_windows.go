@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	xmemPageSize uintptr = 64 << 10 // 64 KiB par page physique console
+	xmemPageSize   uintptr = 64 << 10 // 64 KiB par page physique console
+	xmemPageFrames uintptr = 16       // PFN en unités de 4 KiB (64 KiB / 4 KiB = 16)
 
 	secReserve            uintptr = 0x04000000
 	memCommitFlag         uintptr = 0x00001000
@@ -48,7 +49,7 @@ type physAllocator struct {
 
 func newPhysAllocator() *physAllocator {
 	return &physAllocator{
-		nextPage: 0x100000, // 0 reste inutilisé
+		nextPage: 0x100000, // 0 reste inutilisé, aligné sur 16 (PFN 4 KiB)
 		pages:    make(map[uintptr]physSlice),
 		views:    make(map[uintptr]physView),
 	}
@@ -78,10 +79,10 @@ func (p *physAllocator) allocate(flags, countPtr, pagesPtr uintptr) uintptr {
 
 	p.mu.Lock()
 	first := p.nextPage
-	p.nextPage += n
+	p.nextPage += n * xmemPageFrames
 	out := unsafe.Slice((*uintptr)(osPtr(pagesPtr)), n)
 	for i := uintptr(0); i < n; i++ {
-		id := first + i
+		id := first + i*xmemPageFrames
 		p.pages[id] = physSlice{section: hSection, index: i}
 		out[i] = id
 	}

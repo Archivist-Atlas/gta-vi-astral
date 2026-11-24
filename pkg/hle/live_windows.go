@@ -1173,8 +1173,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	t.bind("d3d12_xs.dll", "D3D12XboxCreateDevice", cbCreateDeviceX)
 	t.bind("d3d12_xs.dll", "IID_ID3D12Device", uintptr(unsafe.Pointer(&iidID3D12Device[0])))
 
-	// --- 6. xg_xs.dll (layout & swizzle textures Xbox Series) ---
+	// --- 6. xg_xs.dll (layout & swizzle textures Xbox Series) & AcpHal.dll (audio APU) ---
 	bindXG(t)
+	bindAcpHal(t)
 	t.bind("d3d12_xs.dll", "D3D12SerializeRootSignature", cbSerRootSig)
 	t.bind("d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", cbSerVerRootSig)
 
