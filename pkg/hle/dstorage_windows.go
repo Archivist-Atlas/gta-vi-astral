@@ -177,7 +177,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 					ds.bytesRead.Add(uint64(written))
 				}
 				rc := ds.readCount.Add(1)
-				if rc <= 5 || rc%200 == 0 {
+				if rc <= 5 || rc%500 == 0 {
 					slog.Info("IDStorageQueueX!EnqueueRequest", "count", rc, "opts", opts, "srcSize", srcSize, "dstSize", dstSize, "written", written)
 				}
 				return 0

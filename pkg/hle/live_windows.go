@@ -33,9 +33,11 @@ var (
 	k32LoadLibW      = k32.NewProc("LoadLibraryW")
 	k32LoadLibExA    = k32.NewProc("LoadLibraryExA")
 	k32LoadLibExW    = k32.NewProc("LoadLibraryExW")
-	k32GetModHandleA = k32.NewProc("GetModuleHandleA")
-	k32GetModHandleW  = k32.NewProc("GetModuleHandleW")
-	k32GetProcAddr    = k32.NewProc("GetProcAddress")
+	k32GetModHandleA        = k32.NewProc("GetModuleHandleA")
+	k32GetModHandleW        = k32.NewProc("GetModuleHandleW")
+	k32GetModFileNameA      = k32.NewProc("GetModuleFileNameA")
+	k32GetModFileNameW      = k32.NewProc("GetModuleFileNameW")
+	k32GetProcAddr          = k32.NewProc("GetProcAddress")
 	k32CreateFileW          = k32.NewProc("CreateFileW")
 	k32CreateFileA          = k32.NewProc("CreateFileA")
 	k32CreateFile2          = kbase.NewProc("CreateFile2")
@@ -48,6 +50,10 @@ var (
 	k32DeleteFileW          = k32.NewProc("DeleteFileW")
 	k32GetProcessMemoryInfo = k32.NewProc("K32GetProcessMemoryInfo")
 	kbaseVirtAlloc2         = kbase.NewProc("VirtualAlloc2")
+	ucrtbase         = syscall.NewLazyDLL("ucrtbase.dll")
+	ucrtFopen        = ucrtbase.NewProc("fopen")
+	ucrtWFopen       = ucrtbase.NewProc("_wfopen")
+	ucrtWStat64      = ucrtbase.NewProc("_wstat64")
 	d3d12Host        = syscall.NewLazyDLL("d3d12.dll")
 	d3d12SerRoot     = d3d12Host.NewProc("D3D12SerializeRootSignature")
 	d3d12SerVerRoot  = d3d12Host.NewProc("D3D12SerializeVersionedRootSignature")
@@ -822,6 +828,49 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			t.bind(dll, "CreateDirectoryW", cbCreateDirW)
 			t.bind(dll, "DeleteFileW", cbDeleteFileW)
 		}
+
+		// Hooks CRT stdio / filesystem (ucrtbase) pour réécrire G:\ / GAME:\ / T:\
+		cbFopen := syscall.NewCallback(func(namePtr, modePtr uintptr) uintptr {
+			isWrite := false
+			if modePtr != 0 {
+				m := readANSIStr(modePtr)
+				isWrite = strings.ContainsAny(m, "wa+")
+			}
+			if mapped, ok := rewriteA(namePtr, isWrite); ok {
+				r, _, _ := ucrtFopen.Call(uintptr(unsafe.Pointer(&mapped[0])), modePtr)
+				return r
+			}
+			r, _, _ := ucrtFopen.Call(namePtr, modePtr)
+			return r
+		})
+		cbWFopen := syscall.NewCallback(func(namePtr, modePtr uintptr) uintptr {
+			isWrite := false
+			if modePtr != 0 {
+				m := readUTF16Str(modePtr)
+				isWrite = strings.ContainsAny(m, "wa+")
+			}
+			if mapped, ok := rewriteW(namePtr, isWrite); ok {
+				r, _, _ := ucrtWFopen.Call(uintptr(unsafe.Pointer(mapped)), modePtr)
+				return r
+			}
+			r, _, _ := ucrtWFopen.Call(namePtr, modePtr)
+			return r
+		})
+		cbWStat64 := syscall.NewCallback(func(namePtr, statPtr uintptr) uintptr {
+			if mapped, ok := rewriteW(namePtr, false); ok {
+				r, _, _ := ucrtWStat64.Call(uintptr(unsafe.Pointer(mapped)), statPtr)
+				return r
+			}
+			r, _, _ := ucrtWStat64.Call(namePtr, statPtr)
+			return r
+		})
+		for _, dll := range []string{"ucrtbase.dll", "api-ms-win-crt-stdio-l1-1-0.dll"} {
+			t.bind(dll, "fopen", cbFopen)
+			t.bind(dll, "_wfopen", cbWFopen)
+		}
+		for _, dll := range []string{"ucrtbase.dll", "api-ms-win-crt-filesystem-l1-1-0.dll"} {
+			t.bind(dll, "_wstat64", cbWStat64)
+		}
 	}
 
 	cbQueryApiImpl := syscall.NewCallback(func(provider, iid, outPtr uintptr) uintptr {
@@ -901,7 +950,11 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		return r
 	})
 	cbGetModA := syscall.NewCallback(func(namePtr uintptr) uintptr {
-		if namePtr != 0 {
+		if namePtr == 0 {
+			if b := mainImageBase.Load(); b != 0 {
+				return b
+			}
+		} else {
 			name := readANSIStr(namePtr)
 			if h, ok := pseudoHandleFor(name); ok {
 				return h
@@ -911,13 +964,49 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		return r
 	})
 	cbGetModW := syscall.NewCallback(func(namePtr uintptr) uintptr {
-		if namePtr != 0 {
+		if namePtr == 0 {
+			if b := mainImageBase.Load(); b != 0 {
+				return b
+			}
+		} else {
 			name := readUTF16Str(namePtr)
 			if h, ok := pseudoHandleFor(name); ok {
 				return h
 			}
 		}
 		r, _, _ := k32GetModHandleW.Call(namePtr)
+		return r
+	})
+	cbGetModFileA := syscall.NewCallback(func(hMod, bufPtr, nSize uintptr) uintptr {
+		sz := uint32(nSize)
+		if (hMod == 0 || hMod == mainImageBase.Load()) && bufPtr != 0 && sz > 0 {
+			const s = `G:\game_scarlett_master.exe`
+			n := len(s)
+			if uint32(n) >= sz {
+				n = int(sz - 1)
+			}
+			dst := unsafe.Slice((*byte)(osPtr(bufPtr)), n+1)
+			copy(dst, s[:n])
+			dst[n] = 0
+			return uintptr(n)
+		}
+		r, _, _ := k32GetModFileNameA.Call(hMod, bufPtr, nSize)
+		return r
+	})
+	cbGetModFileW := syscall.NewCallback(func(hMod, bufPtr, nSize uintptr) uintptr {
+		sz := uint32(nSize)
+		if (hMod == 0 || hMod == mainImageBase.Load()) && bufPtr != 0 && sz > 0 {
+			u16, _ := syscall.UTF16FromString(`G:\game_scarlett_master.exe`)
+			n := len(u16) - 1
+			if uint32(n) >= sz {
+				n = int(sz - 1)
+			}
+			dst := unsafe.Slice((*uint16)(osPtr(bufPtr)), n+1)
+			copy(dst, u16[:n])
+			dst[n] = 0
+			return uintptr(n)
+		}
+		r, _, _ := k32GetModFileNameW.Call(hMod, bufPtr, nSize)
 		return r
 	})
 	cbGetProcAddr := syscall.NewCallback(func(hMod, namePtr uintptr) uintptr {
@@ -948,6 +1037,8 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		t.bind(dll, "LoadLibraryExW", cbLoadLibExW)
 		t.bind(dll, "GetModuleHandleA", cbGetModA)
 		t.bind(dll, "GetModuleHandleW", cbGetModW)
+		t.bind(dll, "GetModuleFileNameA", cbGetModFileA)
+		t.bind(dll, "GetModuleFileNameW", cbGetModFileW)
 		t.bind(dll, "GetProcAddress", cbGetProcAddr)
 	}
 
@@ -1005,14 +1096,27 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		_pad    uint32
 		Desc    rootSigDesc
 	}
+	var serRootFallbackCount atomic.Uint64
 	cbSerRootSig := syscall.NewCallback(func(descPtr, version, blobOut, errOut uintptr) uintptr {
 		if d3d12SerRoot.Find() != nil {
 			return 0x80004001 // E_NOTIMPL
 		}
 		if descPtr != 0 {
 			cp := *(*rootSigDesc)(osPtr(descPtr))
+			origFlags := cp.Flags
 			cp.Flags = gpu.SanitizeRootSignatureFlags(cp.Flags) &^ 0xFF000000
 			r, _, _ := d3d12SerRoot.Call(uintptr(unsafe.Pointer(&cp)), version, blobOut, errOut)
+			if int32(r) < 0 {
+				cp.Flags &= 0x3FF
+				r, _, _ = d3d12SerRoot.Call(uintptr(unsafe.Pointer(&cp)), version, blobOut, errOut)
+			}
+			if int32(r) < 0 {
+				empty := rootSigDesc{}
+				r, _, _ = d3d12SerRoot.Call(uintptr(unsafe.Pointer(&empty)), 1, blobOut, errOut)
+				if c := serRootFallbackCount.Add(1); c <= 5 {
+					slog.Debug("D3D12SerializeRootSignature fallback vide", "n", c, "origFlags", origFlags, "params", cp.NumParameters, "samplers", cp.NumStaticSamplers, "hr", uint32(r))
+				}
+			}
 			return r
 		}
 		r, _, _ := d3d12SerRoot.Call(descPtr, version, blobOut, errOut)
@@ -1024,8 +1128,20 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		}
 		if descPtr != 0 {
 			cp := *(*versionedRootSigDesc)(osPtr(descPtr))
+			origFlags := cp.Desc.Flags
 			cp.Desc.Flags = gpu.SanitizeRootSignatureFlags(cp.Desc.Flags) &^ 0xFF000000
 			r, _, _ := d3d12SerVerRoot.Call(uintptr(unsafe.Pointer(&cp)), blobOut, errOut)
+			if int32(r) < 0 {
+				cp.Desc.Flags &= 0x3FF
+				r, _, _ = d3d12SerVerRoot.Call(uintptr(unsafe.Pointer(&cp)), blobOut, errOut)
+			}
+			if int32(r) < 0 {
+				empty := versionedRootSigDesc{Version: 1}
+				r, _, _ = d3d12SerVerRoot.Call(uintptr(unsafe.Pointer(&empty)), blobOut, errOut)
+				if fc := serRootFallbackCount.Add(1); fc <= 5 {
+					slog.Debug("D3D12SerializeVersionedRootSignature fallback vide", "n", fc, "ver", cp.Version, "origFlags", origFlags, "params", cp.Desc.NumParameters, "samplers", cp.Desc.NumStaticSamplers, "hr", uint32(r))
+				}
+			}
 			return r
 		}
 		r, _, _ := d3d12SerVerRoot.Call(descPtr, blobOut, errOut)

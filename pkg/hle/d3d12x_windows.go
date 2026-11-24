@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/gpu"
@@ -257,28 +258,35 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
-	cbListWrite32 := syscall.NewCallback(func(this, addr, val, flush, flags uintptr) uintptr {
-		if addr >= 0x10000 {
-			*(*uint32)(osPtr(addr)) = uint32(val)
+	cbListAllocUpload := syscall.NewCallback(func(this, size, align uintptr) uintptr {
+		if size == 0 || size > (256<<20) {
+			return 0
 		}
-		return 0
-	})
-	cbListWrite64 := syscall.NewCallback(func(this, addr, val, flush, flags uintptr) uintptr {
-		if addr >= 0x10000 {
-			*(*uint64)(osPtr(addr)) = uint64(val)
+		a := align
+		if a < 16 {
+			a = 16
 		}
-		return 0
+		// Allocation alignée dans la mémoire virtuelle OS (64 KiB aligné par VirtualAlloc)
+		allocSize := (size + a + 4095) &^ 4095
+		mem, _, _ := k32VirtualAlloc.Call(0, allocSize, 0x3000, 0x04)
+		return mem
 	})
+	// Enregistre les slots réellement appelés sur ID3D12GraphicsCommandListX (une fois par slot)
+	var listSlotLogged [160]atomic.Bool
 	cmdListSlots := map[int]uintptr{
 		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
 	}
 	for s := 8; s < 160; s++ {
-		cmdListSlots[s] = cbOK
+		slotIdx := s
+		cmdListSlots[s] = syscall.NewCallback(func() uintptr {
+			if listSlotLogged[slotIdx].CompareAndSwap(false, true) {
+				slog.Debug("ID3D12GraphicsCommandListX slot appelé", "slot", slotIdx, "offset", fmt.Sprintf("0x%X", slotIdx*8))
+			}
+			return hresultOK
+		})
 	}
-	cmdListSlots[60] = cbListCopyMem // CopyMemoryX (2020)
-	cmdListSlots[62] = cbListCopyMem // CopyMemoryX (2026)
-	cmdListSlots[71] = cbListWrite32 // WriteValueBottomOfPipe32 (2026, 0x238)
-	cmdListSlots[72] = cbListWrite64 // WriteValueBottomOfPipe64 (2026, 0x240)
+	cmdListSlots[60] = cbListCopyMem      // CopyMemoryToMemoryX (0x1E0)
+	cmdListSlots[148] = cbListAllocUpload // AllocateUploadMemory (0x4A0)
 	cmdListProto := NewCOMObjectWithHeader("ID3D12GraphicsCommandListX", 160, 0x1000, cmdListSlots)
 	cmdListVtable := *(*uintptr)(osPtr(cmdListProto))
 
@@ -493,6 +501,15 @@ func newD3D12XDevice() uintptr {
 		})
 	}
 
+	newPipelineState := func() uintptr {
+		st.psoCreated.Add(1)
+		// En-tête 0x40 octets mis à zéro (16 octets Object + 32 octets paquet inline Xbox)
+		return NewCOMObjectWithHeader("ID3D12PipelineStateX", 16, 0x40, map[int]uintptr{
+			3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
+			8: cbOK, // GetCachedBlob
+		})
+	}
+
 	// --- Callbacks des slots ID3D12DeviceX ---
 	cbCreateQueue := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
 		slog.Debug("D3D12DeviceX!CreateCommandQueue", "iid", FormatGUID(iid))
@@ -510,9 +527,8 @@ func newD3D12XDevice() uintptr {
 	})
 	cbCreatePSO := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
 		slog.Debug("D3D12DeviceX!CreatePSO")
-		st.psoCreated.Add(1)
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newGenericChild("ID3D12PipelineStateX")
+			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
 		}
 		return hresultOK
 	})
@@ -526,25 +542,22 @@ func newD3D12XDevice() uintptr {
 		return 0x80070005 // E_ACCESSDENIED
 	})
 	cbCreateDerivedPSOX := syscall.NewCallback(func(this, base, count, patches, iid, outPtr uintptr) uintptr {
-		st.psoCreated.Add(1)
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newGenericChild("ID3D12PipelineStateX")
+			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
 		}
 		return hresultOK
 	})
 	cbCreateGraphicsPSOX := syscall.NewCallback(func(this, desc, extensions, extended, iid, outPtr uintptr) uintptr {
 		slog.Debug("D3D12DeviceX!CreateGraphicsPipelineStateX", "ext", extensions)
-		st.psoCreated.Add(1)
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newGenericChild("ID3D12PipelineStateX")
+			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
 		}
 		return hresultOK
 	})
 	cbCreateComputePSOX := syscall.NewCallback(func(this, desc, extensions, extended, iid, outPtr uintptr) uintptr {
 		slog.Debug("D3D12DeviceX!CreateComputePipelineStateX", "ext", extensions)
-		st.psoCreated.Add(1)
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newGenericChild("ID3D12PipelineStateX")
+			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
 		}
 		return hresultOK
 	})
@@ -602,6 +615,29 @@ func newD3D12XDevice() uintptr {
 		}
 		return outPtr
 	})
+	calcDescSize := func(d uintptr) uint64 {
+		if d == 0 {
+			return 65536
+		}
+		dim := *(*uint32)(osPtr(d))
+		w := *(*uint64)(osPtr(d + 16))
+		h := uint64(*(*uint32)(osPtr(d + 24)))
+		fmtID := *(*uint32)(osPtr(d + 32))
+		if dim == 1 && w > 0 {
+			return (w + 65535) &^ 65535
+		}
+		if w > 0 && h > 0 {
+			bpe, block := xgFormatMetrics(fmtID)
+			bw := (w + uint64(block) - 1) / uint64(block)
+			bh := (h + uint64(block) - 1) / uint64(block)
+			s := bw * bh * uint64(bpe)
+			if s < 65536 {
+				s = 65536
+			}
+			return (s + 65535) &^ 65535
+		}
+		return 65536
+	}
 	cbAllocInfo := syscall.NewCallback(func(a0, a1, a2, a3, a4 uintptr) uintptr {
 		outPtr := a1
 		descPtr := a4
@@ -609,21 +645,7 @@ func newD3D12XDevice() uintptr {
 			outPtr = a0
 			descPtr = a4
 		}
-		size := uint64(65536)
-		if descPtr != 0 {
-			dim := *(*uint32)(osPtr(descPtr))
-			w := *(*uint64)(osPtr(descPtr + 16))
-			h := uint64(*(*uint32)(osPtr(descPtr + 24)))
-			if dim == 1 && w > 0 {
-				size = (w + 65535) &^ 65535
-			} else if w > 0 && h > 0 {
-				s := w * h * 4
-				if s < 65536 {
-					s = 65536
-				}
-				size = (s + 65535) &^ 65535
-			}
-		}
+		size := calcDescSize(descPtr)
 		slog.Debug("D3D12DeviceX!GetResourceAllocationInfo", "size", size)
 		if outPtr != 0 {
 			words := unsafe.Slice((*uint64)(osPtr(outPtr)), 2)
@@ -639,19 +661,7 @@ func newD3D12XDevice() uintptr {
 			// D3D12_RESOURCE_DESC1 fait 72 octets (56 + SamplerFeedbackMipRegion)
 			size := uint64(65536)
 			if descsPtr != 0 {
-				d := descsPtr + i*72
-				dim := *(*uint32)(osPtr(d))
-				w := *(*uint64)(osPtr(d + 16))
-				h := uint64(*(*uint32)(osPtr(d + 24)))
-				if dim == 1 && w > 0 {
-					size = (w + 65535) &^ 65535
-				} else if w > 0 && h > 0 {
-					s := w * h * 4
-					if s < 65536 {
-						s = 65536
-					}
-					size = (s + 65535) &^ 65535
-				}
+				size = calcDescSize(descsPtr + i*72)
 			}
 			if eachPtr != 0 {
 				e := unsafe.Slice((*uint64)(osPtr(eachPtr+i*24)), 3)
@@ -876,6 +886,7 @@ func newD3D12XDevice() uintptr {
 		return hresultOK
 	})
 	cbWaitFrameEvent := syscall.NewCallback(func(this, eventType, timeout, reserved, flags, outToken uintptr) uintptr {
+		time.Sleep(16 * time.Millisecond)
 		tok := nextFrameToken.Add(1)
 		slog.Debug("D3D12DeviceX!WaitFrameEventX", "event", eventType, "token", tok)
 		if outToken != 0 {
@@ -954,6 +965,76 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
+	var nextPagePool atomic.Uint64
+	cbRegisterPagePool := syscall.NewCallback(func(this, addr, pages, outHandle uintptr) uintptr {
+		if outHandle == 0 || uint32(pages) == 0 {
+			return hresultInvalidArg
+		}
+		id := nextPagePool.Add(1)
+		*(*uintptr)(osPtr(outHandle)) = uintptr(id)
+		slog.Debug("D3D12DeviceX!RegisterPagePool", "addr", fmt.Sprintf("0x%X", addr), "pages", uint32(pages), "handle", id)
+		return hresultOK
+	})
+	cbCopyDescs := syscall.NewCallback(func(this, numDstArg, dstStarts, dstSizes, numSrcArg, srcStarts, srcSizes, heapType uintptr) uintptr {
+		numDst := int(uint32(numDstArg))
+		numSrc := int(uint32(numSrcArg))
+		if numDst == 0 || numSrc == 0 || dstStarts == 0 || srcStarts == 0 {
+			return 0
+		}
+		stride := uintptr(128)
+		switch uint32(heapType) {
+		case 0:
+			stride = 32
+		case 1:
+			stride = 16
+		}
+		dStarts := unsafe.Slice((*uintptr)(osPtr(dstStarts)), numDst)
+		sStarts := unsafe.Slice((*uintptr)(osPtr(srcStarts)), numSrc)
+		var dSizes, sSizes []uint32
+		if dstSizes != 0 {
+			dSizes = unsafe.Slice((*uint32)(osPtr(dstSizes)), numDst)
+		}
+		if srcSizes != 0 {
+			sSizes = unsafe.Slice((*uint32)(osPtr(srcSizes)), numSrc)
+		}
+		di, doff := 0, uintptr(0)
+		si, soff := 0, uintptr(0)
+		for di < numDst && si < numSrc {
+			dn := uintptr(1)
+			if dSizes != nil {
+				dn = uintptr(dSizes[di])
+			}
+			sn := uintptr(1)
+			if sSizes != nil {
+				sn = uintptr(sSizes[si])
+			}
+			dRem := dn - doff
+			sRem := sn - soff
+			if dRem == 0 {
+				di++
+				doff = 0
+				continue
+			}
+			if sRem == 0 {
+				si++
+				soff = 0
+				continue
+			}
+			chunk := dRem
+			if sRem < chunk {
+				chunk = sRem
+			}
+			if dStarts[di] >= 0x10000 && sStarts[si] >= 0x10000 {
+				copy(
+					unsafe.Slice((*byte)(osPtr(dStarts[di]+doff*stride)), chunk*stride),
+					unsafe.Slice((*byte)(osPtr(sStarts[si]+soff*stride)), chunk*stride),
+				)
+			}
+			doff += chunk
+			soff += chunk
+		}
+		return 0
+	})
 	cbCopyDescSimple := syscall.NewCallback(func(this, num, dstStart, srcStart, heapType uintptr) uintptr {
 		cnt := uintptr(uint32(num))
 		if cnt == 0 || dstStart < 0x10000 || srcStart < 0x10000 {
@@ -995,7 +1076,7 @@ func newD3D12XDevice() uintptr {
 		20:  cbCreateRTV,
 		21:  cbCreateDSV,
 		22:  logOK("CreateSampler"),
-		23:  logOK("CopyDescriptors"),
+		23:  cbCopyDescs,
 		24:  cbCopyDescSimple,
 		25:  cbAllocInfo,
 		26:  cbCustomHeapProps,
@@ -1020,7 +1101,7 @@ func newD3D12XDevice() uintptr {
 		70:  logOK("CreatePlacedSRV"),
 		71:  logOK("CreatePlacedUAV"),
 		73:  cbCreateListX, // CreateCommandListX
-		74:  logOK("RegisterPagePool"),
+		74:  cbRegisterPagePool,
 		75:  logOK("UnregisterPagePool"),
 		76:  cbCreateCommitted,
 		78:  cbSetFrameInterval,

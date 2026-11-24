@@ -25,12 +25,12 @@
 - [x] Mémoire physique console complète (`pkg/hle/xmem_windows.go` + trampolines natifs x64 `__XMemAllocationHooks__`, pool streaming 6,2 Go alloué en live).
 - [x] Moteur DirectStorage réel (`pkg/hle/dstorage_windows.go` : 12 `.rpf` ouverts, 17 queues, +4 200 lectures `ReadAt` + décompression `zlib`).
 - [x] Calculateur de layouts/swizzles textures `xg_xs.dll` (`pkg/hle/xg_windows.go` : `XGSuggestSwizzleMode`, `XGCreateTextureComputer`, `IXGTextureAddressComputer`).
-- [x] Shims exécutables live : `VirtualFS` (`CreateFileW/A/2`, `FindFirstFile*`, `G:\`/`T:\`), `xgameruntime` (`xasync`, `xnetworking`, `xuser`, `xgame`, `xsystem`, `xpackage`, `storage`, `display`), `GameInputCreate`, `OutputDebugString`, isolation réseau hors-ligne.
+- [x] Shims exécutables live : `VirtualFS` (`CreateFileW/A/2`, `FindFirstFile*`, `fopen`/`_wfopen`/`_wstat64`, `GetModuleHandle`/`GetModuleFileName`, `G:\`/`T:\`), `xgameruntime` (`xasync`, `xnetworking`, `xuser`, `xgame`, `xsystem`, `xpackage`, `storage`, `display`), `GameInputCreate`, `OutputDebugString`, isolation réseau hors-ligne.
 - [ ] Implémentation complète des codecs audio/texture temps réel (`BCPack` BC1–BC7, `AcpHal` XMA2, `xapu` Opus) et sauvegardes `XGameSave`.
 
 ## Phase 4 — Exécution GPU (Boot -> Menus -> Monde)
-- [x] Proxy COM Xbox `d3d12_xs.dll` (`pkg/hle/d3d12x_windows.go` : `ID3D12DeviceX` 200 slots, `IDXGIDevice`/`Adapter`/`Factory`/`Output`, `XboxBvhBuilder.dll` XDXR initialisé, `ID3D12CommandQueueX` 2026 + `PresentX`, `ID3D12FenceX::GetAddress`, `WriteValue32/64`, `CopyMemoryX`, création des premiers PSOs).
+- [x] Proxy COM Xbox `d3d12_xs.dll` (`pkg/hle/d3d12x_windows.go` : `ID3D12DeviceX` 200 slots, `IDXGIDevice`/`Adapter`/`Factory`/`Output`, `XboxBvhBuilder.dll` XDXR initialisé, `ID3D12CommandQueueX` 2026 + `PresentX`, `ID3D12FenceX::GetAddress`, `AllocateUploadMemory`, `RegisterPagePool`, `CopyDescriptors`, `CopyMemoryX`, `D3D12Serialize*RootSignature` avec fallback PC, création des premiers PSOs et premier `DrawInstanced`).
 - [x] Fenêtre Win32 native (`pkg/gpu/window_windows.go`) + **`ID3D12Device` matériel Windows** et **SwapChain DXGI** (`pkg/gpu/d3d12_host_windows.go`) recevant le premier appel `PresentX` (frame 1).
-- [ ] Déblocage du premier dessin post-frame 1 (`+0xB5A5F8`), enregistrement/rejeu des command lists sur le `ID3D12Device` hôte + synchronisation mémoire unifiée (WriteWatch / shadow buffers) et détuilage textures RDNA2.
+- [ ] Déblocage du dessin post-frame 1 (résolution du décalage/écrasement de buffer shader en mémoire physique 64 KiB avant la création de la RootSignature), enregistrement/rejeu des command lists sur le `ID3D12Device` hôte + synchronisation mémoire unifiée (WriteWatch / shadow buffers) et détuilage textures RDNA2.
 - [ ] Compilation asynchrone des PSO + persistance sur disque + garde-fou `ExecuteIndirect`.
 - [ ] Support Mesh Shaders, 64-bit image atomics et constructeur XDXR BVH4 pour le rendu du monde.
