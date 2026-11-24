@@ -585,7 +585,7 @@ func runInteractiveMenu() {
 					runErr = saveErr
 				} else {
 					gameDir = entered
-					fmt.Printf("Dossier mémorisé dans %s (ignoré par Git).\n", savedPath)
+					fmt.Printf("Dossier mémorisé dans %s.\n", savedPath)
 				}
 			}
 		case "2":
