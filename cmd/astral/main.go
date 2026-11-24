@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -29,8 +30,8 @@ func main() {
 	core.InitLogger(os.Stderr)
 
 	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(2)
+		runInteractiveMenu()
+		return
 	}
 
 	var err error
@@ -528,4 +529,92 @@ func previewList(items []string, maxItems int) string {
 		return strings.Join(items, ", ")
 	}
 	return fmt.Sprintf("%s ... (+%d)", strings.Join(items[:maxItems], ", "), len(items)-maxItems)
+}
+
+func runInteractiveMenu() {
+	reader := bufio.NewReader(os.Stdin)
+	cfg, _ := core.LoadConfig("")
+	gameDir := cfg.Paths.GameDir
+
+	for {
+		fmt.Println("============================================================")
+		fmt.Printf("  gta-vi-astral %s — Menu interactif\n", version)
+		fmt.Println("============================================================")
+		fmt.Printf("  Dossier jeu : %s\n\n", orNone(gameDir))
+		fmt.Println("  1) Définir / changer le dossier du jeu")
+		fmt.Println("  2) Vérifier la copie du jeu (verify)")
+		fmt.Println("  3) Inspecter game_scarlett_master.exe (inspect)")
+		fmt.Println("  4) Recenser les imports IAT (census)")
+		fmt.Println("  5) Analyser les shaders RDNA2 (shader-info, 500 premiers)")
+		fmt.Println("  6) Mapper l'exécutable + TLS + IAT (run -map)")
+		fmt.Println("  7) Lancer le démarrage natif expérimental (run -execute)")
+		fmt.Println("  8) Afficher la configuration (config)")
+		fmt.Println("  0) Quitter")
+		fmt.Print("\nChoix : ")
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		choice := strings.TrimSpace(line)
+		fmt.Println()
+
+		var runErr error
+		switch choice {
+		case "0", "q", "Q":
+			return
+		case "1":
+			fmt.Print("Chemin complet du dossier GTA VI : ")
+			p, _ := reader.ReadString('\n')
+			gameDir = strings.Trim(strings.TrimSpace(p), `"'`)
+			continue
+		case "2":
+			if gameDir == "" {
+				runErr = fmt.Errorf("définissez d'abord le dossier du jeu (option 1) ou astral.toml")
+			} else {
+				runErr = cmdVerify([]string{gameDir})
+			}
+		case "3":
+			if gameDir == "" {
+				runErr = fmt.Errorf("définissez d'abord le dossier du jeu (option 1)")
+			} else {
+				runErr = cmdInspect([]string{filepath.Join(gameDir, game.ExpectedExecutable)})
+			}
+		case "4":
+			if gameDir == "" {
+				runErr = fmt.Errorf("définissez d'abord le dossier du jeu (option 1)")
+			} else {
+				runErr = cmdCensus([]string{filepath.Join(gameDir, game.ExpectedExecutable)})
+			}
+		case "5":
+			if gameDir == "" {
+				runErr = fmt.Errorf("définissez d'abord le dossier du jeu (option 1)")
+			} else {
+				runErr = cmdShaderInfo([]string{"-limit", "500", filepath.Join(gameDir, "shaders.rpf")})
+			}
+		case "6":
+			if gameDir == "" {
+				runErr = fmt.Errorf("définissez d'abord le dossier du jeu (option 1)")
+			} else {
+				runErr = cmdRun([]string{"-map", filepath.Join(gameDir, game.ExpectedExecutable)})
+			}
+		case "7":
+			if gameDir == "" {
+				runErr = fmt.Errorf("définissez d'abord le dossier du jeu (option 1)")
+			} else {
+				runErr = cmdRun([]string{"-execute", "-unimplemented", "log", filepath.Join(gameDir, game.ExpectedExecutable)})
+			}
+		case "8":
+			runErr = cmdConfig(nil)
+		default:
+			fmt.Println("Choix inconnu.")
+		}
+
+		if runErr != nil {
+			fmt.Fprintf(os.Stderr, "\nerreur : %v\n", runErr)
+		}
+		fmt.Print("\nAppuyez sur Entrée pour revenir au menu...")
+		_, _ = reader.ReadString('\n')
+		fmt.Println()
+	}
 }
