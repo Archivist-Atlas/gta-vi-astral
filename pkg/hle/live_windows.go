@@ -298,6 +298,7 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	t.bind("xmem.dll", "XMemVirtualQuery", cbXMemVirtualQuery)
 	t.bind("xmem.dll", "XMemGetWorkingSetStatistics", cbXMemWorkingSet)
 	t.bind("xmem.dll", "XMemIsToolsMemAvailable", cbReturnFalse)
+	bindXMemPhysical(t)
 
 	// --- 3. xgameruntime.dll (GDK hors-ligne minimal pour boot) ---
 	devType := uintptr(0x00030001) // Xbox Series X
@@ -418,6 +419,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			4: cbSysSandboxID, // 0x20 SandboxId ("RETAIL")
 			5: cbSysDeviceID,  // 0x28 DeviceId
 		}),
+		"{AF406016-E850-4AA8-A88D-2F3DCB9DAC7E}": NewCOMObject("xpackage", 64, nil),
+		"{F4FAF4D4-2D04-4FCE-B3E0-474A713A3E84}": NewCOMObject("storage", 64, nil),
+		"{03F0FE74-FDD9-4E5C-B630-F9339C47ACC5}": NewCOMObject("display", 64, nil),
 	}
 
 	// --- 3d. Réécriture des chemins console (VirtualFS : G:\ / GAME:\ / T:\) ---
