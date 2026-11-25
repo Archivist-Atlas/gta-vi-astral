@@ -52,7 +52,7 @@ func readSaveCStr(ptr uintptr) string {
 
 // newXGameSaveProvider crée l'objet COM xgamesave ({704C3F58-E629-4CC2-B197-30511B996FE2})
 // adossé au répertoire overlay hors dépôt (<overlay>/saves).
-func newXGameSaveProvider(vfs *VirtualFS) uintptr {
+func newXGameSaveProvider(vfs *VirtualFS, dispatchAsync func(uintptr)) uintptr {
 	saveRoot := filepath.Join(os.TempDir(), "astral-saves")
 	if vfs != nil && vfs.OverlayDir != "" {
 		saveRoot = filepath.Join(vfs.OverlayDir, "saves")
@@ -81,6 +81,12 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 	_ = traceSlot
 	completeAsync := func(asyncBlock uintptr) {
 		if asyncBlock >= 0x10000 {
+			atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), 0)
+			atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x28)), 0)
+			if dispatchAsync != nil {
+				dispatchAsync(asyncBlock)
+				return
+			}
 			cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
 			if cb >= 0x10000 && cb < 0x800000000000 {
 				go func() {

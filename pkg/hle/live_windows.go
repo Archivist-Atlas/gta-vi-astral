@@ -533,19 +533,24 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		ctx uintptr
 		cb  uintptr
 	}
+	type tqPort struct {
+		mode uint32
+		mu   sync.Mutex
+		q    []tqTask
+	}
 	type tqQueue struct {
-		workMode uint32
-		compMode uint32
-		mu       sync.Mutex
-		workQ    []tqTask
-		compQ    []tqTask
+		work *tqPort
+		comp *tqPort
 	}
 	var (
 		tqMu            sync.Mutex
 		tqQueues        = map[uintptr]*tqQueue{}
 		processTQHandle = uintptr(0x00007A5C00000001)
 	)
-	tqQueues[processTQHandle] = &tqQueue{workMode: 1 /* ThreadPool */, compMode: 1 /* ThreadPool */}
+	tqQueues[processTQHandle] = &tqQueue{
+		work: &tqPort{mode: 1 /* ThreadPool */},
+		comp: &tqPort{mode: 1 /* ThreadPool */},
+	}
 
 	getOrCreateTQ := func(h uintptr) *tqQueue {
 		if h == 0 {
@@ -554,16 +559,26 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		tqMu.Lock()
 		q := tqQueues[h]
 		if q == nil {
-			q = &tqQueue{workMode: 1, compMode: 1}
+			q = &tqQueue{work: &tqPort{mode: 1}, comp: &tqPort{mode: 1}}
 			tqQueues[h] = q
 		}
 		tqMu.Unlock()
 		return q
 	}
+	getTQPort := func(portHandle uintptr) *tqPort {
+		q := getOrCreateTQ(portHandle >> 1)
+		if (portHandle & 1) == 0 {
+			return q.work
+		}
+		return q.comp
+	}
 	cbTaskQueueCreate := syscall.NewCallback(func(this, workMode, compMode, outPtr uintptr) uintptr {
 		h := uintptr(nextHandle.Add(1))
 		tqMu.Lock()
-		tqQueues[h] = &tqQueue{workMode: uint32(workMode), compMode: uint32(compMode)}
+		tqQueues[h] = &tqQueue{
+			work: &tqPort{mode: uint32(workMode)},
+			comp: &tqPort{mode: uint32(compMode)},
+		}
 		tqMu.Unlock()
 		if outPtr >= 0x10000 {
 			*(*uintptr)(osPtr(outPtr)) = h
@@ -571,11 +586,11 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		return hresultOK
 	})
 	cbTaskQueueCreateComposite := syscall.NewCallback(func(this, workPort, compPort, outPtr uintptr) uintptr {
-		wq := getOrCreateTQ(workPort >> 1)
-		cq := getOrCreateTQ(compPort >> 1)
+		wp := getTQPort(workPort)
+		cp := getTQPort(compPort)
 		h := uintptr(nextHandle.Add(1))
 		tqMu.Lock()
-		tqQueues[h] = &tqQueue{workMode: wq.workMode, compMode: cq.compMode}
+		tqQueues[h] = &tqQueue{work: wp, comp: cp}
 		tqMu.Unlock()
 		if outPtr >= 0x10000 {
 			*(*uintptr)(osPtr(outPtr)) = h
@@ -593,13 +608,19 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		}
 		qHandle := *(*uintptr)(osPtr(asyncBlock + 0x00))
 		q := getOrCreateTQ(qHandle)
-		if q.compMode == 0 { // Manual -> enqueue for XTaskQueueDispatch
-			q.mu.Lock()
-			q.compQ = append(q.compQ, tqTask{ctx: asyncBlock, cb: cb})
-			q.mu.Unlock()
+		if q.comp.mode == 0 { // Manual -> enqueue for XTaskQueueDispatch (port partagé)
+			q.comp.mu.Lock()
+			q.comp.q = append(q.comp.q, tqTask{ctx: asyncBlock, cb: cb})
+			q.comp.mu.Unlock()
 			return
 		}
-		_, _, _ = syscall.SyscallN(cb, asyncBlock)
+		if q.comp.mode == 3 { // Immediate
+			_, _, _ = syscall.SyscallN(cb, asyncBlock)
+			return
+		}
+		go func() {
+			_, _, _ = syscall.SyscallN(cb, asyncBlock)
+		}()
 	}
 	cbXAsyncGetStatus := syscall.NewCallback(func(this, asyncBlock, wait uintptr) uintptr {
 		if asyncBlock < 0x10000 {
@@ -627,7 +648,7 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), uint64(uint32(hr)))
 			dispatchAsyncCompletion(asyncBlock)
 		}
-		if q.workMode == 3 { // Immediate
+		if q.work.mode == 3 { // Immediate
 			runWork()
 		} else {
 			go runWork()
@@ -654,19 +675,17 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	})
 	cbTaskQueueDispatch := syscall.NewCallback(func(this, qHandle, port, timeoutMs uintptr) uintptr {
 		q := getOrCreateTQ(qHandle)
-		q.mu.Lock()
+		p := q.comp
+		if uint32(port) == 0 {
+			p = q.work
+		}
+		p.mu.Lock()
 		var item tqTask
 		var ok bool
-		if uint32(port) == 0 {
-			if len(q.workQ) > 0 {
-				item, q.workQ, ok = q.workQ[0], q.workQ[1:], true
-			}
-		} else {
-			if len(q.compQ) > 0 {
-				item, q.compQ, ok = q.compQ[0], q.compQ[1:], true
-			}
+		if len(p.q) > 0 {
+			item, p.q, ok = p.q[0], p.q[1:], true
 		}
-		q.mu.Unlock()
+		p.mu.Unlock()
 		if ok && item.cb >= 0x10000 && item.cb < 0x800000000000 {
 			_, _, _ = syscall.SyscallN(item.cb, item.ctx, 0)
 			return 1
@@ -678,21 +697,17 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			return hresultOK
 		}
 		q := getOrCreateTQ(qHandle)
-		mode := q.compMode
+		p := q.comp
 		if uint32(port) == 0 {
-			mode = q.workMode
+			p = q.work
 		}
-		if mode == 0 { // Manual -> mis en file pour XTaskQueueDispatch
-			q.mu.Lock()
-			if uint32(port) == 0 {
-				q.workQ = append(q.workQ, tqTask{ctx: ctx, cb: cb})
-			} else {
-				q.compQ = append(q.compQ, tqTask{ctx: ctx, cb: cb})
-			}
-			q.mu.Unlock()
+		if p.mode == 0 { // Manual -> mis en file pour XTaskQueueDispatch
+			p.mu.Lock()
+			p.q = append(p.q, tqTask{ctx: ctx, cb: cb})
+			p.mu.Unlock()
 			return hresultOK
 		}
-		if mode == 3 { // Immediate
+		if p.mode == 3 { // Immediate
 			_, _, _ = syscall.SyscallN(cb, ctx, 0)
 			return hresultOK
 		}
@@ -778,19 +793,17 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	})
 	cbCompleteAsync4 := syscall.NewCallback(func(this, a1, a2, asyncBlock uintptr) uintptr {
 		if asyncBlock >= 0x10000 {
-			cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
-			if cb >= 0x10000 && cb < 0x800000000000 {
-				_, _, _ = syscall.SyscallN(cb, asyncBlock)
-			}
+			atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), 0)
+			atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x28)), 0)
+			dispatchAsyncCompletion(asyncBlock)
 		}
 		return hresultOK
 	})
 	cbCompleteAsync5 := syscall.NewCallback(func(this, a1, a2, a3, asyncBlock uintptr) uintptr {
 		if asyncBlock >= 0x10000 {
-			cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
-			if cb >= 0x10000 && cb < 0x800000000000 {
-				_, _, _ = syscall.SyscallN(cb, asyncBlock)
-			}
+			atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), 0)
+			atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x28)), 0)
+			dispatchAsyncCompletion(asyncBlock)
 		}
 		return hresultOK
 	})
@@ -938,10 +951,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				slog.Info("xuser!XUserAddAsync -> connexion utilisateur hors-ligne AstralPlayer", "opts", uint32(opts))
 				gpu.ReportBootProgress(0.86)
 				if asyncBlock >= 0x10000 {
-					cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
-					if cb >= 0x10000 && cb < 0x800000000000 {
-						_, _, _ = syscall.SyscallN(cb, asyncBlock)
-					}
+					atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), 0)
+					atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x28)), 8)
+					dispatchAsyncCompletion(asyncBlock)
 				}
 				return hresultOK
 			}),
@@ -1007,10 +1019,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			22: cbGISuccess,      // 0xB0 XUserResolvePrivilegeWithUiResult
 			23: syscall.NewCallback(func(this, user, opts, method, url, hdrCount, hdrs, bodySz, body, asyncBlock uintptr) uintptr { // 0xB8 XUserGetTokenAndSignatureAsync (hors-ligne)
 				if asyncBlock >= 0x10000 {
-					cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
-					if cb >= 0x10000 && cb < 0x800000000000 {
-						_, _, _ = syscall.SyscallN(cb, asyncBlock)
-					}
+					atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), 0x89245111) // E_GAMEUSER_FAILED_TO_GET_TOKEN
+					atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x28)), 0)
+					dispatchAsyncCompletion(asyncBlock)
 				}
 				return hresultOK
 			}),
@@ -1018,9 +1029,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				if outSize >= 0x10000 {
 					*(*uintptr)(osPtr(outSize)) = 0
 				}
-				return 0x89245102 // E_GAMEUSER_FAILED_TO_GET_TOKEN (hors-ligne)
+				return 0x89245111 // E_GAMEUSER_FAILED_TO_GET_TOKEN (hors-ligne, conforme VIctory)
 			}),
-			25: syscall.NewCallback(func() uintptr { return 0x89245102 }), // 0xC8 XUserGetTokenAndSignatureResult
+			25: syscall.NewCallback(func() uintptr { return 0x89245111 }), // 0xC8 XUserGetTokenAndSignatureResult
 			29: cbCompleteAsync4,                                          // 0xE8 XUserResolveIssueWithUiAsync
 			30: cbGISuccess,                                               // 0xF0 XUserResolveIssueWithUiResult
 			33: cbRegisterToken5,                                          // 0x108 XUserRegisterForChangeEvent
@@ -1034,7 +1045,7 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			4: cbRegisterToken5, // 0x20 XUserRegisterForDeviceAssociationChanged
 			5: cbReturnTrue,     // 0x28 XUserUnregisterForDeviceAssociationChanged
 		}),
-		"{704C3F58-E629-4CC2-B197-30511B996FE2}": newXGameSaveProvider(vfs),
+		"{704C3F58-E629-4CC2-B197-30511B996FE2}": newXGameSaveProvider(vfs, dispatchAsyncCompletion),
 		"{973A344E-24BF-4D0F-8457-56C534892B29}": NewCOMObject("xgame", 64, map[int]uintptr{
 			3: cbGameGetTitleID, // 0x18 XGameGetXboxTitleId
 		}),
@@ -1162,13 +1173,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			28: syscall.NewCallback(func(this, ctx, asyncBlock uintptr) uintptr { // 0xE0 XStoreQueryGameLicenseAsync
 				slog.Info("xstore!XStoreQueryGameLicenseAsync -> licence locale active hors-ligne")
 				if asyncBlock >= 0x10000 {
-					cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
-					if cb >= 0x10000 && cb < 0x800000000000 {
-						go func() {
-							time.Sleep(2 * time.Millisecond)
-							_, _, _ = syscall.SyscallN(cb, asyncBlock)
-						}()
-					}
+					atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), 0)
+					atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x28)), 104)
+					dispatchAsyncCompletion(asyncBlock)
 				}
 				return hresultOK
 			}),
@@ -1254,6 +1261,23 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			return append([]byte(mapped), 0), true
 		}
 
+		diagFS := os.Getenv("ASTRAL_DIAG") == "1"
+		var diagFSMu sync.Mutex
+		diagFSSeen := map[string]bool{}
+		logFSFail := func(op, path string) {
+			if !diagFS || path == "" {
+				return
+			}
+			diagFSMu.Lock()
+			if len(diagFSSeen) < 60 && !diagFSSeen[op+":"+path] {
+				diagFSSeen[op+":"+path] = true
+				diagFSMu.Unlock()
+				slog.Info("DIAG_FS_FAIL", "op", op, "path", path)
+				return
+			}
+			diagFSMu.Unlock()
+		}
+
 		cbCreateFileW := syscall.NewCallback(func(namePtr, access, share, sec, disp, flags, tmpl uintptr) uintptr {
 			isWrite := (access & 0x40000000) != 0 // GENERIC_WRITE
 			var r uintptr
@@ -1263,7 +1287,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				r, _, _ = k32CreateFileW.Call(namePtr, access, share, sec, disp, flags, tmpl)
 			}
 			if r == ^uintptr(0) && namePtr != 0 {
-				slog.Debug("CreateFileW échoué", "path", readUTF16Str(namePtr))
+				p := readUTF16Str(namePtr)
+				slog.Debug("CreateFileW échoué", "path", p)
+				logFSFail("CreateFileW", p)
 			}
 			return r
 		})
@@ -1276,7 +1302,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				r, _, _ = k32CreateFileA.Call(namePtr, access, share, sec, disp, flags, tmpl)
 			}
 			if r == ^uintptr(0) && namePtr != 0 {
-				slog.Debug("CreateFileA échoué", "path", readANSIStr(namePtr))
+				p := readANSIStr(namePtr)
+				slog.Debug("CreateFileA échoué", "path", p)
+				logFSFail("CreateFileA", p)
 			}
 			return r
 		})
@@ -1289,7 +1317,9 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				r, _, _ = k32CreateFile2.Call(namePtr, access, share, disp, extParams)
 			}
 			if r == ^uintptr(0) && namePtr != 0 {
-				slog.Debug("CreateFile2 échoué", "path", readUTF16Str(namePtr))
+				p := readUTF16Str(namePtr)
+				slog.Debug("CreateFile2 échoué", "path", p)
+				logFSFail("CreateFile2", p)
 			}
 			return r
 		})

@@ -89,9 +89,11 @@ type d3d12xState struct {
 	activeTopology  uint32
 	activeRTVCount  uint32
 	activeRTVVA     uint64
-	activeRootVA    uintptr
-	activeRootSize  uint32
-	activeCBSlot    uint32
+	activeRootVA     uintptr
+	activeRootSize   uint32
+	activeCSRootVA   uintptr
+	activeCSRootSize uint32
+	activeCBSlot     uint32
 	activeCBVSlots  [8]struct {
 		va   uintptr
 		size uint32
@@ -338,14 +340,14 @@ func newD3D12XDevice() uintptr {
 				"dispatches", st.dispatchCalls.Load(),
 				"clears", st.clearRTVCalls.Load(),
 			)
-			if gpuTrace && n == 60 {
+			if gpuTrace && (n == 60 || n == 840) {
 				var summary string
 				for s := 8; s < 160; s++ {
 					if c := listSlotHits[s].Load(); c > 0 {
 						summary += fmt.Sprintf(" #%d=%d", s, c)
 					}
 				}
-				slog.Info("GPU_TRACE CommandListX slots @ frame 60", "slots", summary, "psos", st.psoCreated.Load(), "heaps", st.heapsCreated.Load(), "res", st.resCreated.Load())
+				slog.Info("GPU_TRACE CommandListX slots", "frame", n, "slots", summary, "psos", st.psoCreated.Load(), "heaps", st.heapsCreated.Load(), "res", st.resCreated.Load())
 			}
 		}
 		if dumpFrame && ((len(draws) >= 8 && introDumped.CompareAndSwap(false, true)) || (introDumped.Load() && len(draws) == 5 && nextScreenDumped.CompareAndSwap(false, true))) {
@@ -675,9 +677,23 @@ func newD3D12XDevice() uintptr {
 				Z:       uint32(z),
 				HostPSO: st.activeHostCSPSO,
 			}
-			if st.activeRootVA >= 0x10000 {
-				dp.CBData = make([]byte, 256)
-				copy(dp.CBData, unsafe.Slice((*byte)(osPtr(st.activeRootVA)), 256))
+			csVA := st.activeCSRootVA
+			csSz := st.activeCSRootSize
+			if csVA < 0x10000 {
+				csVA = st.activeRootVA
+				csSz = st.activeRootSize
+			}
+			if csVA >= 0x10000 {
+				if csSz < 256 {
+					csSz = 256
+				}
+				if csSz > 4096 {
+					csSz = 4096
+				}
+				if isGuestReadable(csVA, uint64(csSz)) {
+					dp.CBData = make([]byte, csSz)
+					copy(dp.CBData, unsafe.Slice((*byte)(osPtr(csVA)), csSz))
+				}
 			}
 			st.frameDispatches = append(st.frameDispatches, dp)
 		}
@@ -1019,14 +1035,59 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
-	cmdListSlots[12] = cbListDrawInst     // DrawInstanced
-	cmdListSlots[13] = cbListDrawIdx      // DrawIndexedInstanced
-	cmdListSlots[14] = cbListDispatch     // Dispatch
-	cmdListSlots[20] = cbListSetTopo      // IASetPrimitiveTopology
-	cmdListSlots[25] = cbListSetPSO       // SetPipelineState
-	cmdListSlots[36] = cbListSetRootTable // SetGraphicsRootDescriptorTable (Xbox #36 = PC #32)
-	cmdListSlots[42] = cbListSetRootCBV   // SetGraphicsRootConstantBufferView (Xbox #42 = PC #38)
-	cmdListSlots[44] = cbListSetRootSRV   // SetGraphicsRootShaderResourceView (Xbox #44 = PC #40)
+	cbListSetComputeRootTable := syscall.NewCallback(func(this, rootIdx, baseDesc uintptr) uintptr {
+		listSlotHits[35].Add(1)
+		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
+			st.mu.Lock()
+			for s := uintptr(0); s < 8; s++ {
+				slotPtr := baseDesc + s*32
+				if *(*uint32)(osPtr(slotPtr)) == 0x43425631 { // "CBV1"
+					cbVA := *(*uintptr)(osPtr(slotPtr + 8))
+					cbSz := *(*uint32)(osPtr(slotPtr + 16))
+					if cbVA >= 0x10000 && cbVA < 0x800000000000 {
+						st.activeCSRootVA = cbVA
+						st.activeCSRootSize = cbSz
+						break
+					}
+				}
+			}
+			st.mu.Unlock()
+		}
+		return 0
+	})
+	cbListSetComputeRootCBV := syscall.NewCallback(func(this, rootIdx, gpuVA uintptr) uintptr {
+		listSlotHits[41].Add(1)
+		if gpuVA >= 0x10000 && gpuVA < 0x800000000000 {
+			st.mu.Lock()
+			st.activeCSRootVA = gpuVA
+			st.activeCSRootSize = 4096
+			st.mu.Unlock()
+		}
+		return 0
+	})
+	cbListSetComputeRootSRV := syscall.NewCallback(func(this, rootIdx, gpuVA uintptr) uintptr {
+		listSlotHits[43].Add(1)
+		if gpuVA >= 0x10000 && gpuVA < 0x800000000000 {
+			st.mu.Lock()
+			if st.activeCSRootVA == 0 {
+				st.activeCSRootVA = gpuVA
+				st.activeCSRootSize = 4096
+			}
+			st.mu.Unlock()
+		}
+		return 0
+	})
+	cmdListSlots[12] = cbListDrawInst            // DrawInstanced
+	cmdListSlots[13] = cbListDrawIdx             // DrawIndexedInstanced
+	cmdListSlots[14] = cbListDispatch            // Dispatch
+	cmdListSlots[20] = cbListSetTopo             // IASetPrimitiveTopology
+	cmdListSlots[25] = cbListSetPSO              // SetPipelineState
+	cmdListSlots[35] = cbListSetComputeRootTable // SetComputeRootDescriptorTable (Xbox #35 = PC #31)
+	cmdListSlots[36] = cbListSetRootTable        // SetGraphicsRootDescriptorTable (Xbox #36 = PC #32)
+	cmdListSlots[41] = cbListSetComputeRootCBV   // SetComputeRootConstantBufferView (Xbox #41 = PC #37)
+	cmdListSlots[42] = cbListSetRootCBV          // SetGraphicsRootConstantBufferView (Xbox #42 = PC #38)
+	cmdListSlots[43] = cbListSetComputeRootSRV   // SetComputeRootShaderResourceView (Xbox #43 = PC #39)
+	cmdListSlots[44] = cbListSetRootSRV          // SetGraphicsRootShaderResourceView (Xbox #44 = PC #40)
 	cmdListSlots[47] = cbListSetIB        // IASetIndexBuffer (Xbox #47 = PC #43)
 	cmdListSlots[48] = cbListSetVB        // IASetVertexBuffers (Xbox #48 = PC #44)
 	cmdListSlots[50] = cbListSetRTVs      // OMSetRenderTargets (Xbox #50 = PC #46)
@@ -1410,7 +1471,7 @@ func newD3D12XDevice() uintptr {
 				gp := &guestPSO{}
 				// Un subobject shader dans D3D12_PIPELINE_STATE_STREAM_DESC est précédé de son tag u32
 				// (1=VS, 2=PS, 6=CS) aligné sur 8 octets, suivi de { pShaderBytecode u64, BytecodeLength u64 }.
-				for i := 1; i+1 < len(q) && i < 32; i++ {
+				for i := 1; i+1 < len(q); i++ {
 					tag := uint32(q[i-1])
 					if tag != 1 && tag != 2 && tag != 6 {
 						continue
@@ -1448,8 +1509,19 @@ func newD3D12XDevice() uintptr {
 		return 0x80070005 // E_ACCESSDENIED
 	})
 	cbCreateDerivedPSOX := syscall.NewCallback(func(this, base, count, patches, iid, outPtr uintptr) uintptr {
+		psoObj := newPipelineState()
+		if base != 0 {
+			st.mu.Lock()
+			if bp, ok := st.psos[base]; ok && bp != nil {
+				st.psos[psoObj] = &guestPSO{
+					vsHash: bp.vsHash, psHash: bp.psHash, csHash: bp.csHash,
+					hasVS: bp.hasVS, hasPS: bp.hasPS, hasCS: bp.hasCS,
+				}
+			}
+			st.mu.Unlock()
+		}
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
+			*(*uintptr)(osPtr(outPtr)) = psoObj
 		}
 		return hresultOK
 	})
