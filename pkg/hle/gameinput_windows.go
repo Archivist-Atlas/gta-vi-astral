@@ -98,12 +98,12 @@ type joyInfoEx struct {
 	Reserved2    uint32
 }
 
-// joyCapsW correspond au début de JOYCAPSW (winmm.dll) pour identifier VID/PID (Sony 0x054C, Nintendo 0x057E, etc.).
+// joyCapsW correspond à JOYCAPSW (728 octets exacts, winmm.dll) pour identifier VID/PID (Sony 0x054C, Nintendo 0x057E, etc.).
 type joyCapsW struct {
 	Mid  uint16
 	Pid  uint16
 	Name [32]uint16
-	_pad [360]byte
+	_pad [660]byte // 4 + 64 + 660 = 728 octets (sizeof(JOYCAPSW) Windows)
 }
 
 var (
