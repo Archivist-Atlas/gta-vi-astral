@@ -8,22 +8,22 @@ Système modulaire en **Go** pour l'analyse, la recompilation de shaders et l'ex
 > **Projet expérimental en cours de développement — NON JOUABLE actuellement.**
 > Le moteur démarre et tourne en boucle continue sans crash (480+ frames `PresentX` avec recompilation live de ses premiers shaders RDNA2 sur GPU Windows), mais le rendu 3D complet, les menus, les contrôles et l'audio ne sont **pas encore fonctionnels**.
 
-## Avancement global : ~35 %
+## Avancement global : ~37 %
 
 ```text
-Progression globale : [███████░░░░░░░░░░░░░] 35 %
+Progression globale : [███████░░░░░░░░░░░░░] 37 %
 ```
 
 - **Boot natif continu (480+ frames `PresentX`, 0 crash)** : ✅ Terminé (`100 %`)
 - **Premiers vrais pixels / écrans d'intro** : 🔄 En cours (`~75 %`)
-- **Menus principaux navigables** : ⏳ À venir (`~45 %`)
+- **Menus principaux navigables** : ⏳ À venir (`~50 %`)
 - **Monde ouvert 3D jouable (audio, contrôles, ray tracing)** : ⏳ À venir (`~30 %`)
 
 | Sous-système | Avancement | État actuel | Reste à faire |
 | :--- | :---: | :--- | :--- |
 | **Chargeur PE / Mémoire / CPU x64** | `90 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, VEH + émulation `CLZERO`/`MONITORX`/`MWAITX`, pools physiques 64 KiB (`xmem` 6,2 Go sans aliasing). | Ajustements ponctuels sur de nouveaux chemins CPU en jeu. |
 | **Stockage & Streaming (`VirtualFS` / `DirectStorage`)** | `75 %` | 12 `.rpf`, `core_bvh4.rpf` et toutes les archives virtuelles TTDB `.ttpf` ouverts ; +7 000 requêtes `ReadAt` + `zlib`. | Décompression matérielle **BCPack** (BC1–BC7) et `PAGE_DESTINATION` pour le streaming lourd du monde. |
-| **OS Console / HLE (`xgameruntime`, `GameInput`, Audio)** | `55 %` | `xasync`, `xuser`, `xnetworking` (hors-ligne), `AcpHal`, `xapu`, `chad` initialisés sans crash. | Vrai mapping clavier/souris/manette (`GameInput`), sauvegardes (`XGameSave`), décodage audio réel (`xapu` Opus / `chad` XDsp). |
+| **OS Console / HLE (`xgameruntime`, `GameInput`, Audio)** | `65 %` | `xasync`, `xuser`, `xnetworking` (hors-ligne), `AcpHal`/`xapu`/`chad` initialisés, et **`GameInput` réel connecté à XInput (manette Xbox/PC) + Clavier Windows** (`pkg/hle/gameinput_windows.go`). | Sauvegardes (`XGameSave`) et décodage audio réel (`xapu` Opus / `chad` XDsp). |
 | **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `30 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10, IR SSA, `ISG1`/`OSG1`, et recompilation live RDNA2 -> HLSL -> `ID3D12PipelineState` (~93 % de couverture sur les 3 PSOs actifs du boot). | Flux de contrôle structuré (branches + masque `EXEC`), descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), Compute (`CS`), compilation asynchrone. |
 | **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `25 %` | Fenêtre Win32, `ID3D12Device` matériel + `SwapChain3`, `PresentX` à 30 fps, rejeu matériel `DrawInstanced`, upload VB/CB, cache `Texture2D`/SRV (64 slots), `GetDeviceRemovedReason`. | Décodage des descripteurs SRV Xbox natifs, détuilage textures RDNA2, rendu multi-passes (G-Buffer/ombres/post-process), `Dispatch`, `ExecuteIndirect`, BVH4. |
 

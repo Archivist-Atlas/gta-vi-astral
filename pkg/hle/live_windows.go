@@ -506,31 +506,8 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	cbGetApiVerImpl := syscall.NewCallback(func() uintptr {
 		return 1
 	})
-	// --- 3a. Objets COM GDK (QueryApiImpl) & IGameInput ---
-	// IGameInput (22 slots) : renvoie READING_NOT_FOUND sur GetCurrentReading et S_OK sur les callbacks
-	cbGIReadingNotFound := syscall.NewCallback(func() uintptr { return giReadingNotFound })
+	// --- 3a. Objets COM GDK (QueryApiImpl) ---
 	cbGISuccess := syscall.NewCallback(func() uintptr { return hresultOK })
-	cbGITimestamp := syscall.NewCallback(func() uintptr { return 1000 })
-	gameInputObj := NewCOMObject("IGameInput", 22, map[int]uintptr{
-		3:  cbGITimestamp,       // GetCurrentTimestamp
-		4:  cbGIReadingNotFound, // GetCurrentReading
-		5:  cbGIReadingNotFound, // GetNextReading
-		6:  cbGIReadingNotFound, // GetPreviousReading
-		7:  cbGIReadingNotFound, // GetTemporalReading
-		8:  cbGISuccess,         // RegisterReadingCallback
-		9:  cbGISuccess,         // RegisterDeviceCallback
-		10: cbGISuccess,         // RegisterSystemButtonCallback
-		11: cbGISuccess,         // RegisterGuideButtonCallback
-		12: cbGISuccess,         // RegisterKeyboardLayoutCallback
-		13: cbGISuccess,         // StopCallback
-		14: cbReturnTrue,        // UnregisterCallback
-		16: cbGISuccess,         // FindDeviceFromId
-		17: cbGISuccess,         // FindDeviceFromObject
-		18: cbGISuccess,         // FindDeviceFromPlatformHandle
-		19: cbGISuccess,         // FindDeviceFromPlatformString
-		20: cbGISuccess,         // EnableOemDeviceSupport
-		21: cbGISuccess,         // SetFocusPolicy
-	})
 
 	var nextHandle atomic.Uint64
 	nextHandle.Store(0x1000)
@@ -906,15 +883,8 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		}
 		return hresultNoIface
 	})
-	cbGameInputCreate := syscall.NewCallback(func(outPtr uintptr) uintptr {
-		slog.Info("GameInput!GameInputCreate -> IGameInput COM actif")
-		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = gameInputObj
-		}
-		return hresultOK
-	})
-	t.bind("gameinput.dll", "#1", cbGameInputCreate)
-	t.bind("gameinput.dll", "GameInputCreate", cbGameInputCreate)
+	// --- 3b. GameInput.dll (XInput + Clavier Windows via pkg/hle/gameinput_windows.go) ---
+	bindGameInput(t)
 
 	// --- 3c. XCRDAPI.dll!DStorageGetFactory (DirectStorage réel via pkg/hle/dstorage_windows.go) ---
 	bindDirectStorage(t, vfs)
