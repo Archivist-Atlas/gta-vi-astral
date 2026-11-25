@@ -79,6 +79,7 @@ type hostTexEntry struct {
 	height   uint32
 	format   uint32
 	srvGPU   uintptr
+	hash     uint64
 	uploaded bool
 }
 
@@ -610,7 +611,7 @@ float4 PSMain(VSOut i) : SV_Target {
 	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(32 << 20)
 	h.UploadIB, h.UploadIBPtr, h.UploadIBGPU = h.createUploadBuffer(16 << 20)
 	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(1 << 20)
-	h.UploadTex, h.UploadTexPtr, _ = h.createUploadBuffer(16 << 20)
+	h.UploadTex, h.UploadTexPtr, _ = h.createUploadBuffer(32 << 20)
 	h.initComputePipeline()
 	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS+CS DXBC, RootCBV b0 + SRV t0x64 + UAV u0 + VB/IB)",
 		"rootSig", fmt.Sprintf("0x%X", rootSig), "pso", fmt.Sprintf("0x%X", pso))
@@ -668,24 +669,93 @@ func (h *HostD3D12) initComputePipeline() {
 	}
 }
 
-// ensureHostTexture crée (ou retrouve) une Texture2D hôte + son SRV et planifie son upload si besoin.
-func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
-	if tx == nil || tx.GuestVA == 0 || tx.Width == 0 || tx.Height == 0 || tx.Width > 4096 || tx.Height > 4096 || h.SRVHeap == 0 || h.UploadTex == 0 || h.UploadTexPtr == 0 {
-		return h.SRVGPUStart
+func fastPixelHash(b []byte) uint64 {
+	var h uint64 = 0xcbf29ce484222325
+	n := len(b)
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		v := *(*uint64)(unsafe.Pointer(&b[i]))
+		h ^= v
+		h *= 0x100000001b3
 	}
-	if e, ok := h.TexCache[tx.GuestVA]; ok && e.width == tx.Width && e.height == tx.Height {
-		return e.srvGPU
+	for ; i < n; i++ {
+		h ^= uint64(b[i])
+		h *= 0x100000001b3
 	}
-	if h.NextSRVSlot >= 64 {
-		return h.SRVGPUStart
+	return h ^ uint64(n)
+}
+
+func (h *HostD3D12) uploadTexturePixels(res uintptr, tx *HostTextureUpload, fmtID, bpe, block uint32) bool {
+	if len(tx.Pixels) == 0 || h.UploadTex == 0 || h.UploadTexPtr == 0 {
+		return false
 	}
-	bpe, block, fmtID := DXGIFormatMetrics(tx.Format)
 	bw := (tx.Width + block - 1) / block
 	bh := (tx.Height + block - 1) / block
 	srcRow := bw * bpe
 	rowPitch := (srcRow + 255) &^ 255
 	needBytes := uint64(rowPitch) * uint64(bh)
-	if needBytes == 0 || needBytes > (16<<20) {
+	const stagingCap = uint64(32 << 20)
+	off := (h.texUploadOff + 511) &^ 511
+	if needBytes == 0 || off+needBytes > stagingCap {
+		return false
+	}
+	linear := DetileRDNA2(tx.Pixels, tx.Width, tx.Height, bpe, block, tx.Swizzle)
+	if len(linear) == 0 {
+		return false
+	}
+	dstSlice := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadTexPtr))), stagingCap)[off : off+needBytes]
+	for y := uint32(0); y < bh; y++ {
+		sOff := uintptr(y) * uintptr(srcRow)
+		dOff := uintptr(y) * uintptr(rowPitch)
+		if sOff+uintptr(srcRow) <= uintptr(len(linear)) && dOff+uintptr(srcRow) <= uintptr(len(dstSlice)) {
+			copy(dstSlice[dOff:dOff+uintptr(srcRow)], linear[sOff:sOff+uintptr(srcRow)])
+		}
+	}
+	dstLoc := d3d12TextureCopyLocation{Resource: res, Type: 0 /* SUBRESOURCE_INDEX */}
+	srcLoc := d3d12TextureCopyLocation{
+		Resource: h.UploadTex,
+		Type:     1, // PLACED_FOOTPRINT
+		Offset:   off,
+		Format:   fmtID,
+		Width:    tx.Width,
+		Height:   tx.Height,
+		Depth:    1,
+		RowPitch: rowPitch,
+	}
+	_ = comCall(h.CmdList, 16, uintptr(unsafe.Pointer(&dstLoc)), 0, 0, 0, uintptr(unsafe.Pointer(&srcLoc)), 0)
+	h.texUploadOff = off + needBytes
+	return true
+}
+
+// ensureHostTexture crée (ou retrouve et rafraîchit si modifiée) une Texture2D hôte + son SRV.
+func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
+	if tx == nil || tx.GuestVA == 0 || tx.Width == 0 || tx.Height == 0 || tx.Width > 4096 || tx.Height > 4096 || h.SRVHeap == 0 || h.UploadTex == 0 || h.UploadTexPtr == 0 {
+		return h.SRVGPUStart
+	}
+	bpe, block, fmtID := DXGIFormatMetrics(tx.Format)
+	pixHash := fastPixelHash(tx.Pixels)
+	if e, ok := h.TexCache[tx.GuestVA]; ok && e.width == tx.Width && e.height == tx.Height {
+		// Rafraîchit automatiquement les textures dynamiques (ex: atlas de glyphes Scaleform 2048x2048 R8)
+		if len(tx.Pixels) > 0 && e.hash != pixHash {
+			bToCopy := d3d12ResourceBarrier{Resource: e.res, Subresource: 0xFFFFFFFF, StateBefore: 0xC0, StateAfter: 0x400}
+			_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&bToCopy)))
+			if h.uploadTexturePixels(e.res, tx, fmtID, bpe, block) {
+				e.hash = pixHash
+			}
+			bToSRV := d3d12ResourceBarrier{Resource: e.res, Subresource: 0xFFFFFFFF, StateBefore: 0x400, StateAfter: 0xC0}
+			_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&bToSRV)))
+		}
+		return e.srvGPU
+	}
+	if h.NextSRVSlot >= 64 {
+		return h.SRVGPUStart
+	}
+	bw := (tx.Width + block - 1) / block
+	bh := (tx.Height + block - 1) / block
+	srcRow := bw * bpe
+	rowPitch := (srcRow + 255) &^ 255
+	needBytes := uint64(rowPitch) * uint64(bh)
+	if needBytes == 0 || needBytes > (32<<20) {
 		return h.SRVGPUStart
 	}
 	heapProps := d3d12HeapProperties{Type: 1 /* DEFAULT */, CreationNodeMask: 1, VisibleNodeMask: 1}
@@ -712,30 +782,7 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 	}
 
 	// Détuilage RDNA2 -> linéaire puis copie dans le buffer staging UPLOAD + CopyTextureRegion
-	if len(tx.Pixels) > 0 {
-		linear := DetileRDNA2(tx.Pixels, tx.Width, tx.Height, bpe, block, tx.Swizzle)
-		if len(linear) > 0 {
-			dstSlice := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadTexPtr))), 16<<20)
-			for y := uint32(0); y < bh; y++ {
-				sOff := uintptr(y) * uintptr(srcRow)
-				dOff := uintptr(y) * uintptr(rowPitch)
-				if sOff+uintptr(srcRow) <= uintptr(len(linear)) && dOff+uintptr(srcRow) <= uintptr(len(dstSlice)) {
-					copy(dstSlice[dOff:dOff+uintptr(srcRow)], linear[sOff:sOff+uintptr(srcRow)])
-				}
-			}
-			dstLoc := d3d12TextureCopyLocation{Resource: res, Type: 0 /* SUBRESOURCE_INDEX */}
-			srcLoc := d3d12TextureCopyLocation{
-				Resource: h.UploadTex,
-				Type:     1, // PLACED_FOOTPRINT
-				Format:   fmtID,
-				Width:    tx.Width,
-				Height:   tx.Height,
-				Depth:    1,
-				RowPitch: rowPitch,
-			}
-			_ = comCall(h.CmdList, 16, uintptr(unsafe.Pointer(&dstLoc)), 0, 0, 0, uintptr(unsafe.Pointer(&srcLoc)), 0)
-		}
-	}
+	_ = h.uploadTexturePixels(res, tx, fmtID, bpe, block)
 	b := d3d12ResourceBarrier{Resource: res, Subresource: 0xFFFFFFFF, StateBefore: 0x400 /* COPY_DEST */, StateAfter: 0xC0 /* NON_PIXEL | PIXEL_SHADER_RESOURCE */}
 	_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b)))
 
@@ -743,10 +790,20 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 	h.NextSRVSlot++
 	cpuHandle := h.SRVCPUStart + uintptr(slot)*h.SRVStride
 	gpuHandle := h.SRVGPUStart + uintptr(slot)*h.SRVStride
+	// Mapping des composantes adapté aux formats 1/2 canaux utilisés par l'UI Scaleform :
+	// - R8_UNORM (61)   -> RRRR (0x1000) : alpha = couverture glyphe R (évite les glyphes cyan/opaques)
+	// - R8G8_UNORM (49) -> RRRG (0x1200) : luminance + alpha (évite les bandes jaune vif R+G sans bleu)
+	compMap := uint32(0x1688) // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING (RGBA)
+	switch fmtID {
+	case 61: // R8_UNORM
+		compMap = 0x1000 // RRRR
+	case 49: // R8G8_UNORM
+		compMap = 0x1200 // RRRG
+	}
 	srvDesc := d3d12SRVDesc{
 		Format:                  fmtID,
-		ViewDimension:           4,      // TEXTURE2D
-		Shader4ComponentMapping: 0x1688, // DEFAULT
+		ViewDimension:           4, // TEXTURE2D
+		Shader4ComponentMapping: compMap,
 		MipLevels:               1,
 	}
 	_ = comCall(h.Device, 18, res, uintptr(unsafe.Pointer(&srvDesc)), cpuHandle)
@@ -756,6 +813,7 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 		height:   tx.Height,
 		format:   fmtID,
 		srvGPU:   gpuHandle,
+		hash:     pixHash,
 		uploaded: true,
 	}
 	slog.Info("Host D3D12 Texture2D SRV créée et uploadée", "va", fmt.Sprintf("0x%X", tx.GuestVA), "w", tx.Width, "h", tx.Height, "fmt", fmtID, "swz", fmt.Sprintf("0x%X", tx.Swizzle), "slot", slot)

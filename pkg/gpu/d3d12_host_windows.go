@@ -117,6 +117,7 @@ type HostD3D12 struct {
 	UploadCBGPU   uint64
 	UploadTex      uintptr
 	UploadTexPtr   uintptr
+	texUploadOff   uint64
 	ReplayRootSig  uintptr
 	ReplayPSO      uintptr
 	ComputeRootSig uintptr
@@ -565,6 +566,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 			}
 
 			// Rejeu matériel des appels DrawInstanced sur le GPU Windows hôte
+			h.texUploadOff = 0
 			if len(draws) > 0 && h.ReplayRootSig != 0 && h.ReplayPSO != 0 {
 				vp := d3d12Viewport{Width: float32(h.Width), Height: float32(h.Height), MinDepth: 0, MaxDepth: 1}
 				sc := d3d12Rect{Right: int32(h.Width), Bottom: int32(h.Height)}
