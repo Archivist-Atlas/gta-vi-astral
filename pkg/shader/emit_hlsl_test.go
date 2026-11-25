@@ -98,3 +98,31 @@ func TestEmitHLSLComparisonsAndSelect(t *testing.T) {
 		t.Fatalf("comparaisons absentes :\n%s", out.Source)
 	}
 }
+
+func TestEmitHLSLStructuredBranch(t *testing.T) {
+	code := make([]byte, 0, 16)
+	w := func(u uint32) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], u)
+		code = append(code, b[:]...)
+	}
+	// PC=0: s_cmp_eq_u32 s0, s1
+	w((0b101111110 << 23) | (0x06 << 16) | (1 << 8) | 0)
+	// PC=4: s_cbranch_scc1 +1 dword (-> PC = 4 + 4 + 4 = 12)
+	w((0b101111111 << 23) | (0x05 << 16) | 1)
+	// PC=8: v_mov_b32 v1, 1.0
+	w((0x3F << 25) | (1 << 17) | (1 << 9) | 242)
+	// PC=12: s_endpgm
+	w((0b101111111 << 23) | (0x01 << 16))
+
+	out, err := EmitHLSL(nil, NativeProgram{Stage: StageVS, Code: code})
+	if err != nil {
+		t.Fatalf("EmitHLSL branch échoué : %v", err)
+	}
+	if out.UnsupportedOps != 0 {
+		t.Fatalf("ops non supportés : %v", out.MissingOps)
+	}
+	if !strings.Contains(out.Source, "switch (_pc)") || !strings.Contains(out.Source, "_pc = (scc) ? 12u : 8u;") {
+		t.Fatalf("structure de branchement absente :\n%s", out.Source)
+	}
+}

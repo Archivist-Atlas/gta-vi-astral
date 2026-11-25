@@ -186,36 +186,98 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 		}
 	}
 
+	// Détection de la présence de branches SOPP pour choisir entre émission linéaire ou CFG switch/loop
+	hasBranches := false
 	for _, gi := range insts {
-		if isSchedulingOnly(gi) || gi.IsEndPgm {
-			out.LoweredInsts++
-			continue
+		if gi.IsBranch {
+			hasBranches = true
+			break
 		}
-		if gi.Encoding == EncSOPP && ((gi.Word0>>16)&0x7F) == 0x20 { // s_clause
-			out.LoweredInsts++
-			continue
+	}
+
+	if !hasBranches {
+		for _, gi := range insts {
+			emitSingleInst(&b, gi, isPS, isCS, inputs, out, "    ")
 		}
-		if gi.Encoding == EncSOPP && ((gi.Word0>>16)&0x7F) == 0x0A && isCS { // s_barrier
-			b.WriteString("    GroupMemoryBarrierWithGroupSync();\n")
-			out.LoweredInsts++
-			continue
-		}
-		if gi.Encoding == EncVOP3 && ((gi.Word0>>16)&0x3FF) == 0x180 { // v_nop (metadata tag)
-			out.LoweredInsts++
-			continue
-		}
-		if stmt, ok := lowerGFX10ToHLSL(gi, isPS, isCS, inputs); ok {
-			if stmt != "" {
-				b.WriteString("    " + stmt + "\n")
+	} else {
+		// Découpage en blocs de base par PC cible (branches SOPP + PC suivant)
+		targets := map[uint32]bool{0: true}
+		for _, gi := range insts {
+			if gi.IsBranch {
+				simm := int32(int16(gi.Word0 & 0xFFFF))
+				tgt := uint32(int32(gi.PC) + 4 + simm*4)
+				targets[tgt] = true
+				targets[gi.PC+uint32(gi.Size)] = true
 			}
-			out.LoweredInsts++
-		} else {
-			out.UnsupportedOps++
-			if len(out.MissingOps) < 12 {
-				out.MissingOps = append(out.MissingOps, fmt.Sprintf("%s(%08X/%08X)", gi.Encoding, gi.Word0, gi.Word1))
-			}
-			b.WriteString(fmt.Sprintf("    // unimpl %04x %s %08x %08x\n", gi.PC, gi.Encoding, gi.Word0, gi.Word1))
 		}
+		type hlslBlock struct {
+			startPC uint32
+			insts   []GFX10Inst
+			nextPC  uint32
+		}
+		var blocks []hlslBlock
+		for i, gi := range insts {
+			if len(blocks) == 0 || targets[gi.PC] {
+				if len(blocks) > 0 {
+					blocks[len(blocks)-1].nextPC = gi.PC
+				}
+				blocks = append(blocks, hlslBlock{startPC: gi.PC, nextPC: 0xFFFFFFFF})
+			}
+			blocks[len(blocks)-1].insts = append(blocks[len(blocks)-1].insts, gi)
+			if i == len(insts)-1 {
+				blocks[len(blocks)-1].nextPC = 0xFFFFFFFF
+			}
+		}
+
+		b.WriteString("    uint _pc = 0u;\n")
+		b.WriteString("    [loop] for (uint _step = 0u; _step < 256u; _step++) {\n")
+		b.WriteString("        switch (_pc) {\n")
+		for _, blk := range blocks {
+			b.WriteString(fmt.Sprintf("        case %du:\n", blk.startPC))
+			terminated := false
+			for _, gi := range blk.insts {
+				if gi.IsEndPgm {
+					out.LoweredInsts++
+					b.WriteString("            _step = 256u; break;\n")
+					terminated = true
+					break
+				}
+				if gi.IsBranch {
+					op := (gi.Word0 >> 16) & 0x7F
+					simm := int32(int16(gi.Word0 & 0xFFFF))
+					tgt := uint32(int32(gi.PC) + 4 + simm*4)
+					out.LoweredInsts++
+					switch op {
+					case 0x02: // s_branch
+						b.WriteString(fmt.Sprintf("            _pc = %du; break;\n", tgt))
+					case 0x04: // s_cbranch_scc0
+						b.WriteString(fmt.Sprintf("            _pc = (!scc) ? %du : %du; break;\n", tgt, blk.nextPC))
+					case 0x05: // s_cbranch_scc1
+						b.WriteString(fmt.Sprintf("            _pc = (scc) ? %du : %du; break;\n", tgt, blk.nextPC))
+					case 0x06: // s_cbranch_vccz
+						b.WriteString(fmt.Sprintf("            _pc = (!vcc) ? %du : %du; break;\n", tgt, blk.nextPC))
+					case 0x07: // s_cbranch_vccnz
+						b.WriteString(fmt.Sprintf("            _pc = (vcc) ? %du : %du; break;\n", tgt, blk.nextPC))
+					case 0x08, 0x09: // s_cbranch_execz / execnz (lane active)
+						b.WriteString(fmt.Sprintf("            _pc = %du; break;\n", blk.nextPC))
+					default:
+						b.WriteString(fmt.Sprintf("            _pc = %du; break;\n", blk.nextPC))
+					}
+					terminated = true
+					break
+				}
+				emitSingleInst(&b, gi, isPS, isCS, inputs, out, "            ")
+			}
+			if !terminated {
+				if blk.nextPC == 0xFFFFFFFF {
+					b.WriteString("            _step = 256u; break;\n")
+				} else {
+					b.WriteString(fmt.Sprintf("            _pc = %du; break;\n", blk.nextPC))
+				}
+			}
+		}
+		b.WriteString("        default:\n            _step = 256u; break;\n")
+		b.WriteString("        }\n    }\n")
 	}
 
 	if isCS {
@@ -258,6 +320,38 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 
 	out.Source = b.String()
 	return out, nil
+}
+
+func emitSingleInst(b *strings.Builder, gi GFX10Inst, isPS, isCS bool, inputs []SigElement, out *HLSLOutput, indent string) {
+	if isSchedulingOnly(gi) || gi.IsEndPgm {
+		out.LoweredInsts++
+		return
+	}
+	if gi.Encoding == EncSOPP && ((gi.Word0>>16)&0x7F) == 0x20 { // s_clause
+		out.LoweredInsts++
+		return
+	}
+	if gi.Encoding == EncSOPP && ((gi.Word0>>16)&0x7F) == 0x0A && isCS { // s_barrier
+		b.WriteString(indent + "GroupMemoryBarrierWithGroupSync();\n")
+		out.LoweredInsts++
+		return
+	}
+	if gi.Encoding == EncVOP3 && ((gi.Word0>>16)&0x3FF) == 0x180 { // v_nop (metadata tag)
+		out.LoweredInsts++
+		return
+	}
+	if stmt, ok := lowerGFX10ToHLSL(gi, isPS, isCS, inputs); ok {
+		if stmt != "" {
+			b.WriteString(indent + stmt + "\n")
+		}
+		out.LoweredInsts++
+	} else {
+		out.UnsupportedOps++
+		if len(out.MissingOps) < 12 {
+			out.MissingOps = append(out.MissingOps, fmt.Sprintf("%s(%08X/%08X)", gi.Encoding, gi.Word0, gi.Word1))
+		}
+		b.WriteString(fmt.Sprintf("%s// unimpl %04x %s %08x %08x\n", indent, gi.PC, gi.Encoding, gi.Word0, gi.Word1))
+	}
 }
 
 func swizzleForMask(expr string, el SigElement) string {

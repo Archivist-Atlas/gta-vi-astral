@@ -55,6 +55,8 @@ type d3d12xState struct {
 	activeIBVA      uintptr
 	activeIBSize    uint32
 	activeIBFormat  uint32
+	activeTopology  uint32
+	activeRTVCount  uint32
 	activeRootVA    uintptr
 	activeSRVTex    *gpu.HostTextureUpload
 	frameDispatches []gpu.HostDispatchPass
@@ -394,6 +396,7 @@ func newD3D12XDevice() uintptr {
 		if len(st.frameDraws) < 64 {
 			pass := gpu.HostDrawPass{
 				Indexed:       indexed,
+				Topology:      st.activeTopology,
 				VertexCount:   count,
 				InstanceCount: instCount,
 				StartVertex:   startLoc,
@@ -737,14 +740,30 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
+	cbListSetTopo := syscall.NewCallback(func(this, topo uintptr) uintptr {
+		listSlotHits[20].Add(1)
+		st.mu.Lock()
+		st.activeTopology = uint32(topo)
+		st.mu.Unlock()
+		return 0
+	})
+	cbListSetRTVs := syscall.NewCallback(func(this, numRTVs, rtvsPtr, single, dsvPtr uintptr) uintptr {
+		listSlotHits[50].Add(1)
+		st.mu.Lock()
+		st.activeRTVCount = uint32(numRTVs)
+		st.mu.Unlock()
+		return 0
+	})
 	cmdListSlots[12] = cbListDrawInst     // DrawInstanced
 	cmdListSlots[13] = cbListDrawIdx      // DrawIndexedInstanced
 	cmdListSlots[14] = cbListDispatch     // Dispatch
+	cmdListSlots[20] = cbListSetTopo      // IASetPrimitiveTopology
 	cmdListSlots[25] = cbListSetPSO       // SetPipelineState
 	cmdListSlots[36] = cbListSetRootTable // SetGraphicsRootDescriptorTable (Xbox #36 = PC #32)
 	cmdListSlots[44] = cbListSetRootSRV   // SetGraphicsRootShaderResourceView (Xbox #44 = PC #40)
 	cmdListSlots[47] = cbListSetIB        // IASetIndexBuffer (Xbox #47 = PC #43)
 	cmdListSlots[48] = cbListSetVB        // IASetVertexBuffers (Xbox #48 = PC #44)
+	cmdListSlots[50] = cbListSetRTVs      // OMSetRenderTargets (Xbox #50 = PC #46)
 	cmdListSlots[52] = cbListClearRTV     // ClearRenderTargetView (Xbox slot 52 = PC slot 48)
 	cmdListSlots[60] = cbListCopyMem      // CopyMemoryToMemoryX (0x1E0)
 	cmdListSlots[78] = cbListDispatch     // DispatchX (0x270)

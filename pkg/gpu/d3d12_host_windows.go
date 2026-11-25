@@ -522,7 +522,13 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 					} else if h.SRVGPUStart != 0 {
 						_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart)
 					}
-					_ = comCall(h.CmdList, 25, pso) // SetPipelineState
+					topo := d.Topology
+					if topo == 0 || topo == 17 || topo >= 32 {
+						// Topologie par défaut ou Xbox RECTLIST -> TRIANGLELIST (4) sur PC
+						topo = 4
+					}
+					_ = comCall(h.CmdList, 20, uintptr(topo)) // IASetPrimitiveTopology
+					_ = comCall(h.CmdList, 25, pso)           // SetPipelineState
 					// Upload Constant Buffer (1024 octets alignés sur 256 octets, slot = idxPass % 64)
 					if h.UploadCBPtr != 0 && h.UploadCBGPU != 0 {
 						cbSlot := uint64(idxPass%64) * 1024

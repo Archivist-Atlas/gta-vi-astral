@@ -39,6 +39,7 @@ type HostTextureUpload struct {
 // HostDrawPass décrit un appel DrawInstanced ou DrawIndexedInstanced rejoué sur le GPU hôte.
 type HostDrawPass struct {
 	Indexed       bool
+	Topology      uint32 // 4=TRIANGLELIST, 5=TRIANGLESTRIP, 17/32=Xbox RECTLIST
 	VertexCount   uint32 // VertexCountPerInstance ou IndexCountPerInstance
 	InstanceCount uint32
 	StartVertex   uint32 // StartVertexLocation ou StartIndexLocation
