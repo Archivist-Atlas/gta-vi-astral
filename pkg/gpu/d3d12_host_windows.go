@@ -750,8 +750,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					// Upload Vertex Buffer si fourni par le titre
 					if len(drawVB) > 0 && d.VBStride > 0 && h.UploadVBPtr != 0 && h.UploadVBGPU != 0 {
 						nBytes := uint64(len(drawVB))
-						if vbOff+nBytes <= (8 << 20) {
-							dstVB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadVBPtr))), 8<<20)[vbOff : vbOff+nBytes]
+						if vbOff+nBytes <= (32 << 20) {
+							dstVB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadVBPtr))), 32<<20)[vbOff : vbOff+nBytes]
 							copy(dstVB, drawVB)
 							vbv := d3d12VertexBufferView{
 								BufferLocation: h.UploadVBGPU + vbOff,
@@ -765,8 +765,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					}
 					if d.Indexed && len(d.IBData) > 0 && h.UploadIBPtr != 0 && h.UploadIBGPU != 0 {
 						nBytes := uint64(len(d.IBData))
-						if ibOff+nBytes <= (8 << 20) {
-							dstIB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadIBPtr))), 8<<20)[ibOff : ibOff+nBytes]
+						if ibOff+nBytes <= (16 << 20) {
+							dstIB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadIBPtr))), 16<<20)[ibOff : ibOff+nBytes]
 							copy(dstIB, d.IBData)
 							ibFmt := d.IBFormat
 							if ibFmt != 57 && ibFmt != 42 {
