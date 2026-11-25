@@ -792,11 +792,11 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 	cpuHandle := h.SRVCPUStart + uintptr(slot)*h.SRVStride
 	gpuHandle := h.SRVGPUStart + uintptr(slot)*h.SRVStride
 	// Mapping des composantes adapté aux formats 1/2 canaux utilisés par l'UI Scaleform :
-	// - R8_UNORM (61)   -> RRRR (0x1000) : alpha = couverture glyphe R (évite les glyphes cyan/opaques)
-	// - R8G8_UNORM (49) -> RRRG (0x1200) : luminance + alpha (évite les bandes jaune vif R+G sans bleu)
+	// - R8_UNORM (61), R16_FLOAT (54), R16_UNORM (56) -> RRRR (0x1000)
+	// - R8G8_UNORM (49) -> RRRG (0x1200)
 	compMap := uint32(0x1688) // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING (RGBA)
 	switch fmtID {
-	case 61: // R8_UNORM
+	case 54, 56, 61: // R16_FLOAT / R16_UNORM / R8_UNORM
 		compMap = 0x1000 // RRRR
 	case 49: // R8G8_UNORM
 		compMap = 0x1200 // RRRG
@@ -817,7 +817,7 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 		hash:     pixHash,
 		uploaded: true,
 	}
-	slog.Info("Host D3D12 Texture2D SRV créée et uploadée", "va", fmt.Sprintf("0x%X", tx.GuestVA), "w", tx.Width, "h", tx.Height, "fmt", fmtID, "swz", fmt.Sprintf("0x%X", tx.Swizzle), "slot", slot)
+	slog.Info("Host D3D12 Texture2D SRV créée et uploadée", "va", fmt.Sprintf("0x%X", tx.GuestVA), "w", tx.Width, "h", tx.Height, "guestFmt", tx.Format, "fmt", fmtID, "swz", fmt.Sprintf("0x%X", tx.Swizzle), "slot", slot)
 	return gpuHandle
 }
 

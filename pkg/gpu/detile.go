@@ -6,8 +6,18 @@ func DXGIFormatMetrics(dxgiFmt uint32) (bpe uint32, block uint32, hostFmt uint32
 	switch dxgiFmt {
 	case 60, 61, 62, 63, 64, 65: // R8_* / A8
 		return 1, 1, 61 // DXGI_FORMAT_R8_UNORM
-	case 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59: // R8G8 / R16
+	case 48, 49, 50, 51, 52: // R8G8_*
 		return 2, 1, 49 // DXGI_FORMAT_R8G8_UNORM
+	case 53, 54: // R16_TYPELESS / R16_FLOAT
+		return 2, 1, 54 // DXGI_FORMAT_R16_FLOAT
+	case 55, 56: // D16_UNORM / R16_UNORM
+		return 2, 1, 56 // DXGI_FORMAT_R16_UNORM
+	case 57: // R16_UINT
+		return 2, 1, 57
+	case 58: // R16_SNORM
+		return 2, 1, 58
+	case 59: // R16_SINT
+		return 2, 1, 59
 	case 27, 28, 29, 30, 31, 32: // R8G8B8A8_*
 		if dxgiFmt == 29 {
 			return 4, 1, 29
