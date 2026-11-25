@@ -851,6 +851,46 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			29: cbGISuccess,              // 0xE8 XTaskQueueCheckThread
 		}),
 		"{37E56907-2F10-41E8-B72F-36EDB185331A}": NewCOMObject("xnetworking", 64, map[int]uintptr{
+			3: syscall.NewCallback(func(this, outPort uintptr) uintptr { // 0x18 QueryPreferredLocalUdpMultiplayerPort
+				if outPort >= 0x10000 {
+					*(*uint16)(osPtr(outPort)) = 3074
+				}
+				return hresultOK
+			}),
+			4: syscall.NewCallback(func(this, asyncBlock uintptr) uintptr { // 0x20 QueryPreferredLocalUdpMultiplayerPortAsync
+				if asyncBlock >= 0x10000 {
+					atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), 0)
+					dispatchAsyncCompletion(asyncBlock)
+				}
+				return hresultOK
+			}),
+			5: syscall.NewCallback(func(this, asyncBlock, outPort uintptr) uintptr { // 0x28 QueryPreferredLocalUdpMultiplayerPortResult
+				if outPort >= 0x10000 {
+					*(*uint16)(osPtr(outPort)) = 3074
+				}
+				return hresultOK
+			}),
+			6:  cbRegisterToken5, // 0x30 RegisterPreferredLocalUdpMultiplayerPortChanged
+			7:  cbReturnTrue,     // 0x38 UnregisterPreferredLocalUdpMultiplayerPortChanged
+			8:  syscall.NewCallback(func(this, url, asyncBlock uintptr) uintptr { // 0x40 QuerySecurityInformationForUrlAsync
+				if asyncBlock >= 0x10000 {
+					atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), 0x800704CF) // ERROR_NETWORK_UNREACHABLE
+					dispatchAsyncCompletion(asyncBlock)
+				}
+				return hresultOK
+			}),
+			9:  syscall.NewCallback(func() uintptr { return 0x800704CF }), // 0x48 Size
+			10: syscall.NewCallback(func() uintptr { return 0x800704CF }), // 0x50 Result
+			11: syscall.NewCallback(func(this, url, asyncBlock uintptr) uintptr { // 0x58 Utf16Async
+				if asyncBlock >= 0x10000 {
+					atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), 0x800704CF)
+					dispatchAsyncCompletion(asyncBlock)
+				}
+				return hresultOK
+			}),
+			12: syscall.NewCallback(func() uintptr { return 0x800704CF }), // 0x60 Size
+			13: syscall.NewCallback(func() uintptr { return 0x800704CF }), // 0x68 Result
+			14: syscall.NewCallback(func() uintptr { return 0x800704CF }), // 0x70 VerifyServerCertificate
 			15: cbNetConnectivityHint, // 0x78 GetConnectivityHint
 			16: cbRegisterToken5,      // 0x80 RegisterConnectivityHintChanged
 			17: cbReturnTrue,          // 0x88 UnregisterConnectivityHintChanged
@@ -1002,6 +1042,27 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			3: cbSysConsoleID, // 0x18 ConsoleId
 			4: cbSysSandboxID, // 0x20 SandboxId ("RETAIL")
 			5: cbSysDeviceID,  // 0x28 DeviceId
+		}),
+		// XSystem Analytics ({B884675D-B738-4A9C-815D-9A9A1E0C6C9B}) : XSystemGetAnalyticsInfo
+		"{B884675D-B738-4A9C-815D-9A9A1E0C6C9B}": NewCOMObject("xsystem_analytics", 8, map[int]uintptr{
+			3: syscall.NewCallback(func(this, outInfo uintptr) uintptr { // 0x18 XSystemGetAnalyticsInfo
+				if outInfo >= 0x10000 {
+					b := unsafe.Slice((*byte)(osPtr(outInfo)), 144)
+					clear(b)
+					// osVersion + hostingOsVersion : 10.0.22000.0
+					*(*uint16)(osPtr(outInfo + 0)) = 10
+					*(*uint16)(osPtr(outInfo + 4)) = 22000
+					*(*uint16)(osPtr(outInfo + 8)) = 10
+					*(*uint16)(osPtr(outInfo + 12)) = 22000
+					copy(b[16:80], "Xbox")
+					if profile == core.ConsoleSeriesS {
+						copy(b[80:144], "Xbox Series S")
+					} else {
+						copy(b[80:144], "Xbox Series X")
+					}
+				}
+				return outInfo
+			}),
 		}),
 		"{AF406016-E850-4AA8-A88D-2F3DCB9DAC7E}": NewCOMObject("xpackage", 64, map[int]uintptr{
 			3: syscall.NewCallback(func(this, size, bufPtr uintptr) uintptr { // XPackageGetCurrentProcessPackageIdentifier
@@ -1692,6 +1753,101 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		t.bind(dll, "ShowWindow", cbTitleShowWin)
 		t.bind(dll, "ShowWindowAsync", cbTitleShowWin)
 		t.bind(dll, "SetWindowPos", cbTitleSetWinPos)
+	}
+
+	// --- 4c. Cycle de vie console (AppState / AppConstrained) & Registre ConsoleMode (Xbox Series X|S) ---
+	var nextNotifID atomic.Uintptr
+	cbRegAppNotif := syscall.NewCallback(func(routine, ctx, outReg uintptr) uintptr {
+		if routine == 0 || outReg < 0x10000 {
+			return 87 // ERROR_INVALID_PARAMETER
+		}
+		*(*uintptr)(osPtr(outReg)) = nextNotifID.Add(1)
+		return 0 // ERROR_SUCCESS
+	})
+	cbUnregAppNotif := syscall.NewCallback(func(reg uintptr) uintptr { return 0 })
+	for _, dll := range []string{
+		"api-ms-win-core-psm-appnotify-l1-1-0.dll",
+		"api-ms-win-core-psm-appnotify-l1-1-1.dll",
+	} {
+		t.bind(dll, "RegisterAppStateChangeNotification", cbRegAppNotif)
+		t.bind(dll, "UnregisterAppStateChangeNotification", cbUnregAppNotif)
+		t.bind(dll, "RegisterAppConstrainedChangeNotification", cbRegAppNotif)
+		t.bind(dll, "UnregisterAppConstrainedChangeNotification", cbUnregAppNotif)
+	}
+
+	// Registre OEM\ConsoleMode (0x64 = Series X, 0x60 = Series S) lu par XSystemGetDeviceType() dans le titre
+	adv32 := syscall.NewLazyDLL("advapi32.dll")
+	procRegOpenKeyW := adv32.NewProc("RegOpenKeyW")
+	procRegOpenKeyExW := adv32.NewProc("RegOpenKeyExW")
+	procRegQueryValExW := adv32.NewProc("RegQueryValueExW")
+	procRegCloseKey := adv32.NewProc("RegCloseKey")
+	const (
+		hkeyLocalMachine uintptr = 0xFFFFFFFF80000002
+		oemFakeKey       uintptr = 0x0000A57A00000E01
+	)
+	consoleModeVal := uint32(0x64) // Xbox Series X
+	if profile == core.ConsoleSeriesS {
+		consoleModeVal = 0x60 // Xbox Series S
+	}
+	cbRegOpenKeyW := syscall.NewCallback(func(root, subPtr, outKey uintptr) uintptr {
+		if root == oemFakeKey {
+			return 2 // ERROR_FILE_NOT_FOUND
+		}
+		if root == hkeyLocalMachine && strings.EqualFold(readUTF16Str(subPtr), `Software\Microsoft\Windows NT\CurrentVersion\OEM`) && outKey >= 0x10000 {
+			*(*uintptr)(osPtr(outKey)) = oemFakeKey
+			return 0
+		}
+		r, _, _ := procRegOpenKeyW.Call(root, subPtr, outKey)
+		return r
+	})
+	cbRegOpenKeyExW := syscall.NewCallback(func(root, subPtr, opts, access, outKey uintptr) uintptr {
+		if root == oemFakeKey {
+			return 2
+		}
+		if root == hkeyLocalMachine && strings.EqualFold(readUTF16Str(subPtr), `Software\Microsoft\Windows NT\CurrentVersion\OEM`) && outKey >= 0x10000 {
+			*(*uintptr)(osPtr(outKey)) = oemFakeKey
+			return 0
+		}
+		r, _, _ := procRegOpenKeyExW.Call(root, subPtr, opts, access, outKey)
+		return r
+	})
+	cbRegQueryValExW := syscall.NewCallback(func(key, namePtr, reserved, typePtr, dataPtr, sizePtr uintptr) uintptr {
+		if key != oemFakeKey {
+			r, _, _ := procRegQueryValExW.Call(key, namePtr, reserved, typePtr, dataPtr, sizePtr)
+			return r
+		}
+		if !strings.EqualFold(readUTF16Str(namePtr), "ConsoleMode") {
+			return 2 // ERROR_FILE_NOT_FOUND
+		}
+		if typePtr >= 0x10000 {
+			*(*uint32)(osPtr(typePtr)) = 4 // REG_DWORD
+		}
+		if sizePtr < 0x10000 {
+			return 0
+		}
+		room := *(*uint32)(osPtr(sizePtr))
+		*(*uint32)(osPtr(sizePtr)) = 4
+		if dataPtr == 0 {
+			return 0
+		}
+		if room < 4 {
+			return 234 // ERROR_MORE_DATA
+		}
+		*(*uint32)(osPtr(dataPtr)) = consoleModeVal
+		return 0
+	})
+	cbRegCloseKey := syscall.NewCallback(func(key uintptr) uintptr {
+		if key == oemFakeKey {
+			return 0
+		}
+		r, _, _ := procRegCloseKey.Call(key)
+		return r
+	})
+	for _, dll := range []string{"advapi32.dll", "api-ms-win-core-registry-l1-1-0.dll"} {
+		t.bind(dll, "RegOpenKeyW", cbRegOpenKeyW)
+		t.bind(dll, "RegOpenKeyExW", cbRegOpenKeyExW)
+		t.bind(dll, "RegQueryValueExW", cbRegQueryValExW)
+		t.bind(dll, "RegCloseKey", cbRegCloseKey)
 	}
 
 	// --- 5. d3d12_xs.dll (Root Signature PC + log CreateDevice) ---

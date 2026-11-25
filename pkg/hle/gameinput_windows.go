@@ -477,15 +477,15 @@ func bindGameInput(t *LiveTable) {
 		}
 		return 0
 	})
-	// Vtable partagée IGameInputReading (28 slots, ABI GDK)
+	// Vtable partagée IGameInputReading (28 slots, ABI GDK) — Gamepad dédié (0x40000)
 	readingProto := NewCOMObjectWithHeader("IGameInputReading", 28, 64, map[int]uintptr{
 		3: syscall.NewCallback(func(this uintptr) uintptr { // GetInputKind
 			logGI(2, "Reading.GetInputKind")
-			return uintptr(giKindGamepad | giKindKeyboard)
+			return uintptr(giKindGamepad)
 		}),
 		4: syscall.NewCallback(func(this, kind uintptr) uintptr { // GetSequenceNumber
 			logGI(3, "Reading.GetSequenceNumber", "kind", fmt.Sprintf("0x%X", uint32(kind)))
-			if this >= 0x10000 && (uint32(kind) == 0 || uint32(kind)&(giKindGamepad|giKindKeyboard) != 0) {
+			if this >= 0x10000 && (uint32(kind) == 0 || uint32(kind)&giKindGamepad != 0) {
 				return uintptr(*(*uint64)(osPtr(this + 0x08)))
 			}
 			return 0
@@ -504,41 +504,8 @@ func bindGameInput(t *LiveTable) {
 			}
 			return 0
 		}),
-		14: syscall.NewCallback(func(this uintptr) uintptr { // GetKeyCount (0x70)
-			var n uintptr
-			for _, vk := range []uintptr{0x0D, 0x20, 0x1B, 0x08, 0x09, 0x25, 0x26, 0x27, 0x28, 'Y', 'X', 'A', 'B', 'W', 'S', 'D', 'F', 'E', 'Q', 'R'} {
-				if keyDown(vk) {
-					n++
-				}
-			}
-			return n
-		}),
-		15: syscall.NewCallback(func(this, cnt, out uintptr) uintptr { // GetKeyState (0x78) — GameInputKeyState (12 octets)
-			if out < 0x10000 || cnt == 0 {
-				return 0
-			}
-			type giKeyState struct {
-				ScanCode   uint32
-				CodePoint  uint32
-				VirtualKey uint8
-				IsDeadKey  uint8
-				_pad       uint16
-			}
-			var written uintptr
-			for _, vk := range []uintptr{0x0D, 0x20, 0x1B, 0x08, 0x09, 0x25, 0x26, 0x27, 0x28, 'Y', 'X', 'A', 'B', 'W', 'S', 'D', 'F', 'E', 'Q', 'R'} {
-				if written >= cnt {
-					break
-				}
-				if keyDown(vk) {
-					*(*giKeyState)(osPtr(out + written*12)) = giKeyState{
-						CodePoint:  uint32(vk),
-						VirtualKey: uint8(vk),
-					}
-					written++
-				}
-			}
-			return written
-		}),
+		14: syscall.NewCallback(func(this uintptr) uintptr { return 0 }), // GetKeyCount (0 sur manette)
+		15: syscall.NewCallback(func(this, cnt, out uintptr) uintptr { return 0 }), // GetKeyState
 		22: cbGetGamepadState, // GetGamepadState (0xB0)
 		24: syscall.NewCallback(func(this, outNav uintptr) uintptr { // GetUiNavigationState (0xC0)
 			if this < 0x10000 || outNav < 0x10000 {
@@ -579,6 +546,60 @@ func bindGameInput(t *LiveTable) {
 			*(*uint32)(osPtr(outNav)) = nav
 			return 1
 		}),
+	})
+	// Objet IGameInputReading dédié au clavier (0x10) pour ne pas interférer avec le verrouillage manette
+	var kbdSeq atomic.Uint64
+	kbdReadingObj := NewCOMObject("IGameInputReading_Kbd", 28, map[int]uintptr{
+		3: syscall.NewCallback(func(this uintptr) uintptr { return uintptr(giKindKeyboard) }),
+		4: syscall.NewCallback(func(this, kind uintptr) uintptr {
+			if uint32(kind) == 0 || uint32(kind)&giKindKeyboard != 0 {
+				return uintptr(kbdSeq.Load())
+			}
+			return 0
+		}),
+		5: syscall.NewCallback(func(this uintptr) uintptr { return uintptr(nowUS()) }),
+		6: syscall.NewCallback(func(this, outDev uintptr) uintptr {
+			if outDev >= 0x10000 {
+				*(*uintptr)(osPtr(outDev)) = kbdDeviceObj
+			}
+			return 0
+		}),
+		14: syscall.NewCallback(func(this uintptr) uintptr { // GetKeyCount (0x70)
+			var n uintptr
+			for _, vk := range []uintptr{0x0D, 0x20, 0x1B, 0x08, 0x09, 0x25, 0x26, 0x27, 0x28, 'Y', 'X', 'A', 'B', 'W', 'S', 'D', 'F', 'E', 'Q', 'R'} {
+				if keyDown(vk) {
+					n++
+				}
+			}
+			return n
+		}),
+		15: syscall.NewCallback(func(this, cnt, out uintptr) uintptr { // GetKeyState (0x78)
+			if out < 0x10000 || cnt == 0 {
+				return 0
+			}
+			type giKeyState struct {
+				ScanCode   uint32
+				CodePoint  uint32
+				VirtualKey uint8
+				IsDeadKey  uint8
+				_pad       uint16
+			}
+			var written uintptr
+			for _, vk := range []uintptr{0x0D, 0x20, 0x1B, 0x08, 0x09, 0x25, 0x26, 0x27, 0x28, 'Y', 'X', 'A', 'B', 'W', 'S', 'D', 'F', 'E', 'Q', 'R'} {
+				if written >= cnt {
+					break
+				}
+				if keyDown(vk) {
+					*(*giKeyState)(osPtr(out + written*12)) = giKeyState{
+						CodePoint:  uint32(vk),
+						VirtualKey: uint8(vk),
+					}
+					written++
+				}
+			}
+			return written
+		}),
+		22: syscall.NewCallback(func(this, outState uintptr) uintptr { return 0 }), // false sur clavier
 	})
 	readingVtable := *(*uintptr)(osPtr(readingProto))
 
@@ -658,7 +679,14 @@ func bindGameInput(t *LiveTable) {
 	cbGetCurrentReading := syscall.NewCallback(func(this, inputKind, device, outReading uintptr) uintptr {
 		kind := uint32(inputKind)
 		logGI(7, "GetCurrentReading", "kind", fmt.Sprintf("0x%X", kind), "dev", fmt.Sprintf("0x%X", device))
-		if kind == 0 || kind&(giKindGamepad|giKindKeyboard|0x01000000) != 0 {
+		if device == kbdDeviceObj || (kind&giKindKeyboard != 0 && kind&giKindGamepad == 0) {
+			if outReading >= 0x10000 {
+				kbdSeq.Add(1)
+				*(*uintptr)(osPtr(outReading)) = kbdReadingObj
+				return hresultOK
+			}
+		}
+		if kind == 0 || kind&(giKindGamepad|0x01000000) != 0 {
 			if outReading >= 0x10000 {
 				p, _ := sampleIfChanged(true)
 				*(*uintptr)(osPtr(outReading)) = p
