@@ -136,7 +136,7 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 		})),
 		12: traceSlot("DeleteContainerResult", cbOK), // 0x60 XGameSaveDeleteContainerResult
 		13: traceSlot("GetContainerInfo", syscall.NewCallback(func(this, prov, namePtr, ctx, cb uintptr) uintptr { // 0x68 XGameSaveGetContainerInfo
-			return 0x80830008 // E_GS_BLOB_NOT_FOUND / container non encore créé
+			return hresultOK // Aucun conteneur existant -> S_OK sans invoquer callback (ABI GDK)
 		})),
 		14: traceSlot("EnumerateContainerInfo", cbOK),       // 0x70 XGameSaveEnumerateContainerInfo
 		15: traceSlot("EnumerateContainerInfoByName", cbOK), // 0x78 XGameSaveEnumerateContainerInfoByName

@@ -5,6 +5,7 @@ package hle
 import (
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -23,6 +24,7 @@ var (
 )
 
 const (
+	giKindKeyboard     uint32 = 0x00000010 // GameInputKindKeyboard (1 << 4)
 	giKindGamepad      uint32 = 0x00040000 // GameInputKindGamepad (1 << 18 = 262144)
 	giDeviceConnected  uint32 = 0x00000003 // GameInputDeviceConnected (0x1) | GameInputDeviceInputEnabled (0x2)
 	giBtnMenu          uint32 = 0x00000001
@@ -209,7 +211,12 @@ func pollLiveGamepad() gameInputGamepadState {
 			isSony := false
 			if procJoyGetDevCaps.Find() == nil {
 				if rc, _, _ := procJoyGetDevCaps.Call(id, uintptr(unsafe.Pointer(&caps)), uintptr(unsafe.Sizeof(caps))); rc == 0 {
+					if caps.Mid == 0 && caps.Pid == 0 {
+						continue // Périphérique virtuel/fantôme sans VID/PID réel
+					}
 					isSony = caps.Mid == 0x054C // Sony Interactive Entertainment (DualSense / DualShock 4)
+				} else {
+					continue
 				}
 			}
 			if giLoggedController.CompareAndSwap(false, true) {
@@ -394,32 +401,39 @@ func bindGameInput(t *LiveTable) {
 		return uint64(time.Since(startTime).Microseconds()) + 1000
 	}
 
-	// Allocation d'une structure GameInputDeviceInfo (512 octets, ABI GDK exact)
+	// Allocation d'une structure GameInputDeviceInfo (512 octets, ABI GDK exact : 320 octets)
 	devInfoMem, _, _ := k32VirtualAlloc.Call(0, 512, 0x3000, 0x04)
 	if devInfoMem != 0 {
-		*(*uint32)(osPtr(devInfoMem + 0x00)) = 304           // infoSize
+		*(*uint32)(osPtr(devInfoMem + 0x00)) = 320           // infoSize (0x140)
 		*(*uint16)(osPtr(devInfoMem + 0x04)) = 0x045E        // vendorId = Microsoft
 		*(*uint16)(osPtr(devInfoMem + 0x06)) = 0x0B12        // productId = Xbox Series X|S Controller
 		*(*uint32)(osPtr(devInfoMem + 0x20)) = 0x41535452    // deviceId[0..3] non nul
 		*(*uint32)(osPtr(devInfoMem + 0x40)) = 0x41535452    // deviceRootId[0..3] non nul
-		*(*uint32)(osPtr(devInfoMem + 0x60)) = 3             // deviceFamily = GameInputFamilyXboxOne
+		*(*uint32)(osPtr(devInfoMem + 0x60)) = 0             // deviceFamily = 0 (comme ScarlettPort)
 		*(*uint32)(osPtr(devInfoMem + 0x68)) = giKindGamepad // supportedInput (offset +0x68!)
-		*(*uint32)(osPtr(devInfoMem + 0x6C)) = 0x0F          // supportedRumbleMotors
-		*(*uint32)(osPtr(devInfoMem + 0x7C)) = 6             // controllerAxisCount
-		*(*uint32)(osPtr(devInfoMem + 0x80)) = 14            // controllerButtonCount
-		*(*uint32)(osPtr(devInfoMem + 0x84)) = 1             // controllerSwitchCount
+		*(*uint32)(osPtr(devInfoMem + 0x6C)) = 0x03          // supportedRumbleMotors (low + high)
 	}
 
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
 	cbTrue := syscall.NewCallback(func() uintptr { return 1 })
 	cbNotFound := syscall.NewCallback(func() uintptr { return giReadingNotFound })
 
+	giTrace := os.Getenv("ASTRAL_GI_TRACE") == "1"
+	var traceCounts [32]atomic.Int32
+	logGI := func(idx int, name string, args ...any) {
+		if giTrace && traceCounts[idx].Add(1) <= 3 {
+			slog.Info("GI_TRACE "+name, args...)
+		}
+	}
+
 	// IGameInputDevice (16 slots)
 	deviceObj := NewCOMObject("IGameInputDevice", 16, map[int]uintptr{
 		3: syscall.NewCallback(func(this uintptr) uintptr { // GetDeviceInfo
+			logGI(0, "Device.GetDeviceInfo", "this", fmt.Sprintf("0x%X", this))
 			return devInfoMem
 		}),
 		4: syscall.NewCallback(func(this uintptr) uintptr { // GetDeviceStatus
+			logGI(1, "Device.GetDeviceStatus", "this", fmt.Sprintf("0x%X", this))
 			return uintptr(giDeviceConnected)
 		}),
 		5:  cbOK, // GetBatteryState
@@ -427,7 +441,21 @@ func bindGameInput(t *LiveTable) {
 		12: cbOK, // SetRumbleState (GDK 2020)
 	})
 
+	// Périphérique Clavier (GameInputKindKeyboard = 0x10)
+	kbdInfoMem, _, _ := k32VirtualAlloc.Call(0, 512, 0x3000, 0x04)
+	if kbdInfoMem != 0 {
+		*(*uint32)(osPtr(kbdInfoMem + 0x00)) = 320
+		*(*uint32)(osPtr(kbdInfoMem + 0x20)) = 0x4B424431 // "1DBK"
+		*(*uint32)(osPtr(kbdInfoMem + 0x40)) = 0x4B424431
+		*(*uint32)(osPtr(kbdInfoMem + 0x68)) = giKindKeyboard
+	}
+	kbdDeviceObj := NewCOMObject("IGameInputDevice_Kbd", 16, map[int]uintptr{
+		3: syscall.NewCallback(func(this uintptr) uintptr { return kbdInfoMem }),
+		4: syscall.NewCallback(func(this uintptr) uintptr { return uintptr(giDeviceConnected) }),
+	})
+
 	var gamepadPolls atomic.Uint64
+	var btnDelivered atomic.Int32
 	// Layout natif d'un objet IGameInputReading (64 octets en mémoire OS, GC-safe) :
 	//   +0x00 : vtable (uintptr)
 	//   +0x08 : seq (uint64)
@@ -440,6 +468,11 @@ func bindGameInput(t *LiveTable) {
 			if n := gamepadPolls.Add(1); n == 1 {
 				slog.Info("IGameInputReading!GetGamepadState actif (manette XInput/HID + clavier Windows connectés)")
 			}
+			if st.Buttons != 0 {
+				if c := btnDelivered.Add(1); c <= 5 || c%60 == 0 {
+					slog.Info("IGameInputReading!GetGamepadState -> bouton transmis au jeu", "n", c, "buttons", fmt.Sprintf("0x%04X", st.Buttons), "seq", *(*uint64)(osPtr(this + 0x08)))
+				}
+			}
 			return 1
 		}
 		return 0
@@ -447,27 +480,105 @@ func bindGameInput(t *LiveTable) {
 	// Vtable partagée IGameInputReading (28 slots, ABI GDK)
 	readingProto := NewCOMObjectWithHeader("IGameInputReading", 28, 64, map[int]uintptr{
 		3: syscall.NewCallback(func(this uintptr) uintptr { // GetInputKind
-			return uintptr(giKindGamepad)
+			logGI(2, "Reading.GetInputKind")
+			return uintptr(giKindGamepad | giKindKeyboard)
 		}),
 		4: syscall.NewCallback(func(this, kind uintptr) uintptr { // GetSequenceNumber
-			if this >= 0x10000 {
+			logGI(3, "Reading.GetSequenceNumber", "kind", fmt.Sprintf("0x%X", uint32(kind)))
+			if this >= 0x10000 && (uint32(kind) == 0 || uint32(kind)&(giKindGamepad|giKindKeyboard) != 0) {
 				return uintptr(*(*uint64)(osPtr(this + 0x08)))
 			}
 			return 0
 		}),
 		5: syscall.NewCallback(func(this uintptr) uintptr { // GetTimestamp
+			logGI(4, "Reading.GetTimestamp")
 			if this >= 0x10000 {
 				return uintptr(*(*uint64)(osPtr(this + 0x10)))
 			}
 			return uintptr(nowUS())
 		}),
 		6: syscall.NewCallback(func(this, outDev uintptr) uintptr { // GetDevice
+			logGI(5, "Reading.GetDevice")
 			if outDev >= 0x10000 {
 				*(*uintptr)(osPtr(outDev)) = deviceObj
 			}
 			return 0
 		}),
+		14: syscall.NewCallback(func(this uintptr) uintptr { // GetKeyCount (0x70)
+			var n uintptr
+			for _, vk := range []uintptr{0x0D, 0x20, 0x1B, 0x08, 0x09, 0x25, 0x26, 0x27, 0x28, 'Y', 'X', 'A', 'B', 'W', 'S', 'D', 'F', 'E', 'Q', 'R'} {
+				if keyDown(vk) {
+					n++
+				}
+			}
+			return n
+		}),
+		15: syscall.NewCallback(func(this, cnt, out uintptr) uintptr { // GetKeyState (0x78) — GameInputKeyState (12 octets)
+			if out < 0x10000 || cnt == 0 {
+				return 0
+			}
+			type giKeyState struct {
+				ScanCode   uint32
+				CodePoint  uint32
+				VirtualKey uint8
+				IsDeadKey  uint8
+				_pad       uint16
+			}
+			var written uintptr
+			for _, vk := range []uintptr{0x0D, 0x20, 0x1B, 0x08, 0x09, 0x25, 0x26, 0x27, 0x28, 'Y', 'X', 'A', 'B', 'W', 'S', 'D', 'F', 'E', 'Q', 'R'} {
+				if written >= cnt {
+					break
+				}
+				if keyDown(vk) {
+					*(*giKeyState)(osPtr(out + written*12)) = giKeyState{
+						CodePoint:  uint32(vk),
+						VirtualKey: uint8(vk),
+					}
+					written++
+				}
+			}
+			return written
+		}),
 		22: cbGetGamepadState, // GetGamepadState (0xB0)
+		24: syscall.NewCallback(func(this, outNav uintptr) uintptr { // GetUiNavigationState (0xC0)
+			if this < 0x10000 || outNav < 0x10000 {
+				return 0
+			}
+			st := *(*gameInputGamepadState)(osPtr(this + 0x18))
+			var nav uint32
+			if st.Buttons&giBtnMenu != 0 {
+				nav |= 0x0001
+			}
+			if st.Buttons&giBtnView != 0 {
+				nav |= 0x0002
+			}
+			if st.Buttons&giBtnA != 0 {
+				nav |= 0x0004 // Accept
+			}
+			if st.Buttons&giBtnB != 0 {
+				nav |= 0x0008 // Cancel
+			}
+			if st.Buttons&giBtnDPadUp != 0 || st.LeftThumbstickY > 0.5 {
+				nav |= 0x0010
+			}
+			if st.Buttons&giBtnDPadDown != 0 || st.LeftThumbstickY < -0.5 {
+				nav |= 0x0020
+			}
+			if st.Buttons&giBtnDPadLeft != 0 || st.LeftThumbstickX < -0.5 {
+				nav |= 0x0040
+			}
+			if st.Buttons&giBtnDPadRight != 0 || st.LeftThumbstickX > 0.5 {
+				nav |= 0x0080
+			}
+			if st.Buttons&giBtnX != 0 {
+				nav |= 0x0100 // Context1
+			}
+			if st.Buttons&giBtnY != 0 {
+				nav |= 0x0200 // Context2
+			}
+			*(*uint32)(osPtr(outNav)) = nav
+			return 1
+		}),
 	})
 	readingVtable := *(*uintptr)(osPtr(readingProto))
 
@@ -476,11 +587,13 @@ func bindGameInput(t *LiveTable) {
 	const ringCap = 64
 	ringMem, _, _ := k32VirtualAlloc.Call(0, ringCap*64, 0x3000, 0x04)
 	var (
-		ringMu      sync.Mutex
-		latestSeq   uint64
-		lastState   gameInputGamepadState
-		readingCbs  []struct{ tok uint64; ctx, cb uintptr }
+		ringMu       sync.Mutex
+		latestSeq    uint64
+		lastState    gameInputGamepadState
+		latchedBtns  uint32 // Boutons maintenus au moins jusqu'à la prochaine lecture du jeu (anti-perte d'appui court)
+		readingCbs   []struct{ tok uint64; ctx, cb uintptr }
 	)
+	autoMode := os.Getenv("ASTRAL_AUTO_INPUT")
 	slotPtr := func(seq uint64) uintptr {
 		return ringMem + uintptr((seq-1)%ringCap)*64
 	}
@@ -494,11 +607,27 @@ func bindGameInput(t *LiveTable) {
 		lastState = st
 		return p
 	}
-	sampleIfChanged := func() (uintptr, bool) {
+	sampleIfChanged := func(consumeLatch bool) (uintptr, bool) {
 		st := pollLiveGamepad()
+		if autoMode != "" {
+			elapsed := time.Since(startTime)
+			if elapsed > 45*time.Second && elapsed < 120*time.Second && (elapsed.Milliseconds()%2000) < 250 {
+				if autoMode == "y" {
+					st.Buttons |= giBtnY
+				} else {
+					st.Buttons |= giBtnA
+				}
+			}
+		}
 		ringMu.Lock()
-		if latestSeq == 0 || st != lastState {
-			p := pushReadingLocked(st)
+		latchedBtns |= st.Buttons
+		eff := st
+		eff.Buttons |= latchedBtns
+		if consumeLatch {
+			latchedBtns = st.Buttons
+		}
+		if latestSeq == 0 || eff != lastState {
+			p := pushReadingLocked(eff)
 			cbs := append([]struct{ tok uint64; ctx, cb uintptr }(nil), readingCbs...)
 			ringMu.Unlock()
 			for _, c := range cbs {
@@ -513,35 +642,41 @@ func bindGameInput(t *LiveTable) {
 		return p, false
 	}
 	// Initialise le tout premier reading (état neutre) puis poll toutes les 8 ms en arrière-plan
-	_, _ = sampleIfChanged()
+	_, _ = sampleIfChanged(false)
 	go func() {
 		tk := time.NewTicker(8 * time.Millisecond)
 		defer tk.Stop()
 		for range tk.C {
-			_, _ = sampleIfChanged()
+			_, _ = sampleIfChanged(false)
 		}
 	}()
 
 	cbGetTimestamp := syscall.NewCallback(func(this uintptr) uintptr {
+		logGI(6, "GetCurrentTimestamp")
 		return uintptr(nowUS())
 	})
 	cbGetCurrentReading := syscall.NewCallback(func(this, inputKind, device, outReading uintptr) uintptr {
 		kind := uint32(inputKind)
-		if kind == 0 || kind&giKindGamepad != 0 {
+		logGI(7, "GetCurrentReading", "kind", fmt.Sprintf("0x%X", kind), "dev", fmt.Sprintf("0x%X", device))
+		if kind == 0 || kind&(giKindGamepad|giKindKeyboard|0x01000000) != 0 {
 			if outReading >= 0x10000 {
-				p, _ := sampleIfChanged()
+				p, _ := sampleIfChanged(true)
 				*(*uintptr)(osPtr(outReading)) = p
 				return hresultOK
 			}
+		}
+		if outReading >= 0x10000 {
+			*(*uintptr)(osPtr(outReading)) = 0
 		}
 		return giReadingNotFound
 	})
 	cbGetNextReading := syscall.NewCallback(func(this, refReading, inputKind, device, outReading uintptr) uintptr {
 		kind := uint32(inputKind)
+		logGI(8, "GetNextReading", "kind", fmt.Sprintf("0x%X", kind))
 		if (kind != 0 && kind&giKindGamepad == 0) || refReading < 0x10000 || outReading < 0x10000 {
 			return giReadingNotFound
 		}
-		_, _ = sampleIfChanged()
+		_, _ = sampleIfChanged(true)
 		refSeq := *(*uint64)(osPtr(refReading + 0x08))
 		ringMu.Lock()
 		curLatest := latestSeq
@@ -560,6 +695,7 @@ func bindGameInput(t *LiveTable) {
 	})
 	cbGetPrevReading := syscall.NewCallback(func(this, refReading, inputKind, device, outReading uintptr) uintptr {
 		kind := uint32(inputKind)
+		logGI(9, "GetPreviousReading", "kind", fmt.Sprintf("0x%X", kind))
 		if (kind != 0 && kind&giKindGamepad == 0) || refReading < 0x10000 || outReading < 0x10000 {
 			return giReadingNotFound
 		}
@@ -592,10 +728,30 @@ func bindGameInput(t *LiveTable) {
 		if outToken >= 0x10000 {
 			*(*uint64)(osPtr(outToken)) = tok
 		}
-		// Si le titre demande l'énumération initiale des périphériques connectés (Async=1 ou Blocking=2)
-		// et filtre les manettes (kind == 0 ou giKindGamepad), on notifie immédiatement notre manette virtuelle.
-		if uint32(enumKind) != 0 && (uint32(kind) == 0 || uint32(kind)&giKindGamepad != 0) && cb >= 0x10000 && cb < 0x800000000000 {
-			_, _, _ = syscall.SyscallN(cb, uintptr(tok), ctx, deviceObj, uintptr(nowUS()), uintptr(giDeviceConnected), 0)
+		slog.Info("IGameInput!RegisterDeviceCallback",
+			"kind", fmt.Sprintf("0x%X", uint32(kind)),
+			"status", fmt.Sprintf("0x%X", uint32(status)),
+			"enumKind", uint32(enumKind),
+		)
+		if uint32(enumKind) != 0 && cb >= 0x10000 && cb < 0x800000000000 {
+			var devs []uintptr
+			if uint32(kind) == 0 || uint32(kind)&giKindGamepad != 0 {
+				devs = append(devs, deviceObj)
+			}
+			if uint32(kind) == 0 || uint32(kind)&giKindKeyboard != 0 {
+				devs = append(devs, kbdDeviceObj)
+			}
+			for _, d := range devs {
+				d := d
+				if uint32(enumKind) == 1 { // GameInputAsyncEnumeration -> après retour de RegisterDeviceCallback !
+					go func() {
+						time.Sleep(10 * time.Millisecond)
+						_, _, _ = syscall.SyscallN(cb, uintptr(tok), ctx, d, uintptr(nowUS()), uintptr(giDeviceConnected), 0)
+					}()
+				} else { // GameInputBlockingEnumeration (2) -> synchrone
+					_, _, _ = syscall.SyscallN(cb, uintptr(tok), ctx, d, uintptr(nowUS()), uintptr(giDeviceConnected), 0)
+				}
+			}
 		}
 		return hresultOK
 	})
@@ -612,26 +768,42 @@ func bindGameInput(t *LiveTable) {
 		return hresultOK
 	})
 
-	gameInputObj := NewCOMObject("IGameInput", 22, map[int]uintptr{
-		3:  cbGetTimestamp,      // GetCurrentTimestamp
-		4:  cbGetCurrentReading, // GetCurrentReading (XInput/HID + Clavier live, snapshots ring-buffer)
-		5:  cbGetNextReading,    // GetNextReading
-		6:  cbGetPrevReading,    // GetPreviousReading
-		7:  cbNotFound,          // GetTemporalReading
-		8:  cbRegReading,        // RegisterReadingCallback (7 args)
-		9:  cbRegDevice,         // RegisterDeviceCallback (8 args)
-		10: cbRegSysBtn,         // RegisterSystemButtonCallback (6 args)
-		11: cbReg5,              // RegisterGuideButtonCallback (5 args)
-		12: cbReg5,              // RegisterKeyboardLayoutCallback (5 args)
-		13: cbOK,                // StopCallback
-		14: cbTrue,              // UnregisterCallback
-		16: cbOK,                // FindDeviceFromId
-		17: cbOK,                // FindDeviceFromObject
-		18: cbOK,                // FindDeviceFromPlatformHandle
-		19: cbOK,                // FindDeviceFromPlatformString
-		20: cbOK,                // EnableOemDeviceSupport
-		21: cbOK,                // SetFocusPolicy
+	cbFindById := syscall.NewCallback(func(this, idPtr, outDev uintptr) uintptr {
+		if outDev >= 0x10000 {
+			*(*uintptr)(osPtr(outDev)) = deviceObj
+			return hresultOK
+		}
+		return hresultInvalidArg
 	})
+	cbDevNotFound := syscall.NewCallback(func(this, val, outDev uintptr) uintptr {
+		if outDev >= 0x10000 {
+			*(*uintptr)(osPtr(outDev)) = 0
+		}
+		return 0x838A0002 // GAMEINPUT_E_DEVICE_NOT_FOUND
+	})
+
+	gameInputObj := NewCOMObject("IGameInput", 22, map[int]uintptr{
+		3:  cbGetTimestamp,      // 0x18 GetCurrentTimestamp
+		4:  cbGetCurrentReading, // 0x20 GetCurrentReading (XInput/HID + Clavier live, snapshots ring-buffer)
+		5:  cbGetNextReading,    // 0x28 GetNextReading
+		6:  cbGetPrevReading,    // 0x30 GetPreviousReading
+		7:  cbNotFound,          // 0x38 GetTemporalReading
+		8:  cbRegReading,        // 0x40 RegisterReadingCallback (7 args)
+		9:  cbRegDevice,         // 0x48 RegisterDeviceCallback (8 args)
+		10: cbReg5,              // 0x50 RegisterGuideButtonCallback
+		11: cbReg5,              // 0x58 RegisterKeyboardLayoutCallback
+		12: cbOK,                // 0x60 StopCallback
+		13: cbTrue,              // 0x68 UnregisterCallback
+		14: cbOK,                // 0x70 CreateDispatcher
+		15: cbOK,                // 0x78 CreateAggregateDevice
+		16: cbFindById,          // 0x80 FindDeviceFromId
+		17: cbDevNotFound,       // 0x88 FindDeviceFromObject
+		18: cbDevNotFound,       // 0x90 FindDeviceFromPlatformHandle
+		19: cbDevNotFound,       // 0x98 FindDeviceFromPlatformString
+		20: cbOK,                // 0xA0 EnableOemDeviceSupport
+		21: cbOK,                // 0xA8 SetFocusPolicy
+	})
+	_ = cbRegSysBtn
 
 	cbGameInputCreate := syscall.NewCallback(func(outPtr uintptr) uintptr {
 		slog.Info("GameInput!GameInputCreate -> IGameInput COM actif (XInput + Clavier Windows)")

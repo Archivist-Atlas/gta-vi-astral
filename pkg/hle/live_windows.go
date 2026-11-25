@@ -882,11 +882,11 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				return hresultOK
 			}),
 			4: cbGISuccess, // XUserCloseHandle
-			5: syscall.NewCallback(func(this, u1, u2, outCmp uintptr) uintptr { // XUserCompare
-				if outCmp >= 0x10000 {
-					*(*int32)(osPtr(outCmp)) = 0
+			5: syscall.NewCallback(func(this, u1, u2 uintptr) uintptr { // XUserCompare (retourne int32 : 0 si égaux, 1 sinon)
+				if u1 == u2 {
+					return 0
 				}
-				return hresultOK
+				return 1
 			}),
 			6: syscall.NewCallback(func(this, outMax uintptr) uintptr { // XUserGetMaxUsers
 				if outMax >= 0x10000 {
@@ -986,14 +986,11 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			33: cbRegisterToken5,                                          // 0x108 XUserRegisterForChangeEvent
 			34: cbReturnTrue,                                              // 0x110 XUserUnregisterForChangeEvent
 		}),
-		// XUSER_DEVICE : associe toutes les manettes (DualSense/Xbox/HID) à AstralPlayer
+		// XUSER_DEVICE : conforme VIctory/ScarlettPort (aucun périphérique lié matériellement -> USER_NOT_FOUND)
 		"{7D824997-10DC-45AB-86B7-2737767C0BF1}": NewCOMObject("xuser_device", 12, map[int]uintptr{
-			3: syscall.NewCallback(func(this, devIdPtr, outUser uintptr) uintptr { // 0x18 XUserFindForDevice
-				if outUser >= 0x10000 {
-					*(*uintptr)(osPtr(outUser)) = offlineUserHandle
-				}
-				return hresultOK
-			}),
+			3: traceGDK("XUserFindForDevice", syscall.NewCallback(func(this, devIdPtr, outUser uintptr) uintptr { // 0x18 XUserFindForDevice
+				return 0x89245104 // E_GAMEUSER_USER_NOT_FOUND (comme VIctory / ScarlettPort)
+			})),
 			4: cbRegisterToken5, // 0x20 XUserRegisterForDeviceAssociationChanged
 			5: cbReturnTrue,     // 0x28 XUserUnregisterForDeviceAssociationChanged
 		}),
@@ -1594,37 +1591,101 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	t.bind("winhttp.dll", "WinHttpGetProxyForUrl", cbWinHttpProxy)
 	t.bind("winhttp.dll", "WinHttpGetProxyForUrlEx", cbWinHttpProxy)
 
-	// --- 4b. Masquage de la fenêtre Win32 fantôme du titre ("Americas" 3840x2160) ---
-	// Le jeu conserve un HWND parfaitement valide, mais seule la fenêtre GTA VI Astral reste visible.
+	// --- 4b. Fenêtre Win32 unique du titre (redimensionnée 1280x720 + titre/icône GTA VI Astral) ---
+	// Le jeu crée sa propre fenêtre ("Americas" 3840x2160) 1 ms avant D3D12XboxCreateDevice.
+	// On la redimensionne directement en 1280x720 centré, avec le titre et l'icône GTA VI Astral,
+	// puis on attache le SwapChain D3D12 directement dessus : une seule fenêtre, zéro flash "Americas",
+	// et un focus Windows 100 % natif pour la boucle de messages et les entrées du jeu.
 	u32Title := syscall.NewLazyDLL("user32.dll")
 	u32CreateWinW := u32Title.NewProc("CreateWindowExW")
 	u32CreateWinA := u32Title.NewProc("CreateWindowExA")
+	u32ShowWin := u32Title.NewProc("ShowWindow")
 	u32SetWinPos := u32Title.NewProc("SetWindowPos")
-	const wsVisible uintptr = 0x10000000
-	const swpShowWindow uintptr = 0x0040
+	u32SetWinTextW := u32Title.NewProc("SetWindowTextW")
+	u32SendMsgW := u32Title.NewProc("SendMessageW")
+	u32GetSysMetrics := u32Title.NewProc("GetSystemMetrics")
+	const (
+		winTargetW = 1280
+		winTargetH = 720
+		wmSetIcon  = 0x0080
+	)
+	var titleHWND atomic.Uintptr
+	centerWinPos := func(w, h int) (int, int) {
+		sw, _, _ := u32GetSysMetrics.Call(0) // SM_CXSCREEN
+		sh, _, _ := u32GetSysMetrics.Call(1) // SM_CYSCREEN
+		x := (int(sw) - w) / 2
+		y := (int(sh) - h) / 2
+		if x < 0 {
+			x = 0
+		}
+		if y < 0 {
+			y = 0
+		}
+		return x, y
+	}
+	brandTitleWindow := func(hwnd uintptr) {
+		if hwnd == 0 {
+			return
+		}
+		if titleHWND.CompareAndSwap(0, hwnd) {
+			if tp, err := syscall.UTF16PtrFromString("gta-vi-astral — GTA VI (Xbox Series)"); err == nil {
+				_, _, _ = u32SetWinTextW.Call(hwnd, uintptr(unsafe.Pointer(tp)))
+			}
+			bigIcon, smallIcon := gpu.WindowIcons()
+			if bigIcon != 0 {
+				_, _, _ = u32SendMsgW.Call(hwnd, wmSetIcon, 1, bigIcon)
+			}
+			if smallIcon != 0 {
+				_, _, _ = u32SendMsgW.Call(hwnd, wmSetIcon, 0, smallIcon)
+			}
+			slog.Info("Fenêtre Win32 unique du titre configurée (1280x720, focus natif)", "hwnd", fmt.Sprintf("0x%X", hwnd))
+		}
+	}
 	cbTitleCreateWinW := syscall.NewCallback(func(exStyle, cls, title, style, x, y, w, h, parent, menu, inst, param uintptr) uintptr {
-		r, _, _ := u32CreateWinW.Call(exStyle, cls, title, style&^wsVisible, x, y, w, h, parent, menu, inst, param)
+		if parent == 0 && (int32(w) > winTargetW || int32(h) > winTargetH) {
+			cx, cy := centerWinPos(winTargetW, winTargetH)
+			x, y, w, h = uintptr(cx), uintptr(cy), winTargetW, winTargetH
+		}
+		r, _, _ := u32CreateWinW.Call(exStyle, cls, title, style, x, y, w, h, parent, menu, inst, param)
+		if parent == 0 {
+			brandTitleWindow(r)
+		}
 		return r
 	})
 	cbTitleCreateWinA := syscall.NewCallback(func(exStyle, cls, title, style, x, y, w, h, parent, menu, inst, param uintptr) uintptr {
-		r, _, _ := u32CreateWinA.Call(exStyle, cls, title, style&^wsVisible, x, y, w, h, parent, menu, inst, param)
+		if parent == 0 && (int32(w) > winTargetW || int32(h) > winTargetH) {
+			cx, cy := centerWinPos(winTargetW, winTargetH)
+			x, y, w, h = uintptr(cx), uintptr(cy), winTargetW, winTargetH
+		}
+		r, _, _ := u32CreateWinA.Call(exStyle, cls, title, style, x, y, w, h, parent, menu, inst, param)
+		if parent == 0 {
+			brandTitleWindow(r)
+		}
 		return r
 	})
 	cbTitleShowWin := syscall.NewCallback(func(hwnd, cmdShow uintptr) uintptr {
-		return 1 // TRUE sans afficher la fenêtre fantôme du titre
+		brandTitleWindow(hwnd)
+		r, _, _ := u32ShowWin.Call(hwnd, cmdShow)
+		return r
 	})
 	cbTitleSetWinPos := syscall.NewCallback(func(hwnd, after, x, y, cx, cy, flags uintptr) uintptr {
-		r, _, _ := u32SetWinPos.Call(hwnd, after, x, y, cx, cy, flags&^swpShowWindow)
+		if int32(cx) > winTargetW || int32(cy) > winTargetH {
+			nx, ny := centerWinPos(winTargetW, winTargetH)
+			x, y, cx, cy = uintptr(nx), uintptr(ny), winTargetW, winTargetH
+		}
+		r, _, _ := u32SetWinPos.Call(hwnd, after, x, y, cx, cy, flags)
 		return r
 	})
 	for _, dll := range []string{
 		"user32.dll",
+		"ext-ms-win-rtcore-ntuser-window-l1-1-0.dll",
+		"ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll",
+		"ext-ms-win-rtcore-ntuser-window-ext-l1-1-0.dll",
 		"ext-ms-win-ntuser-window-l1-1-0.dll",
 		"ext-ms-win-ntuser-window-l1-1-1.dll",
 		"ext-ms-win-ntuser-window-l1-1-2.dll",
 		"ext-ms-win-ntuser-window-l1-1-3.dll",
 		"ext-ms-win-ntuser-window-l1-1-4.dll",
-		"ext-ms-win-rtcore-ntuser-window-ext-l1-1-0.dll",
 	} {
 		t.bind(dll, "CreateWindowExW", cbTitleCreateWinW)
 		t.bind(dll, "CreateWindowExA", cbTitleCreateWinA)
@@ -1713,7 +1774,10 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	d3d12DeviceObj := newD3D12XDevice()
 	cbCreateDeviceX := syscall.NewCallback(func(adapter, params, iidPtr, outPtr uintptr) uintptr {
 		slog.Info("d3d12_xs!D3D12XboxCreateDevice -> ID3D12DeviceX COM actif", "iid", FormatGUID(iidPtr))
-		hwnd := gpu.EnsureWindow("gta-vi-astral — GTA VI (Xbox Series)", 1280, 720)
+		hwnd := titleHWND.Load()
+		if hwnd == 0 {
+			hwnd = gpu.EnsureWindow("gta-vi-astral — GTA VI (Xbox Series)", 1280, 720)
+		}
 		if _, err := gpu.InitHostD3D12(hwnd, 1280, 720); err != nil {
 			slog.Warn("Host D3D12 non initialisé (mode logiciel/stub)", "err", err)
 		}
