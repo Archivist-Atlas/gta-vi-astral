@@ -8,24 +8,24 @@ Système modulaire en **Go** pour l'analyse, la recompilation de shaders et l'ex
 > **Projet expérimental en cours de développement — NON JOUABLE actuellement.**
 > Le moteur démarre, charge toutes ses archives (`.rpf` + TTDB + licences), connecte l'utilisateur hors-ligne (`XUser` + `XGameSave`) et tourne en boucle continue **780+ frames `PresentX` sur 45 s (0 crash, 0 `WARN`)** avec recompilation live de ses shaders RDNA2 sur GPU Windows, mais le rendu 3D complet et l'audio ne sont **pas encore fonctionnels**.
 
-## Avancement global : ~43 %
+## Avancement global : ~45 %
 
 ```text
-Progression globale : [█████████░░░░░░░░░░░] 43 %
+Progression globale : [█████████░░░░░░░░░░░] 45 %
 ```
 
 - **Boot natif continu + `XUser` + `XGameSave` + GPU Compute (780+ frames / 45 s, 0 crash)** : ✅ Terminé (`100 %`)
-- **Premiers vrais pixels / écrans d'intro** : 🔄 En cours (`~82 %`)
-- **Menus principaux navigables** : 🔄 En cours (`~55 %`)
-- **Monde ouvert 3D jouable (audio, contrôles, ray tracing)** : ⏳ À venir (`~35 %`)
+- **Premiers vrais pixels / écrans d'intro** : 🔄 En cours (`~85 %`)
+- **Menus principaux navigables** : 🔄 En cours (`~58 %`)
+- **Monde ouvert 3D jouable (audio, contrôles, ray tracing)** : ⏳ À venir (`~38 %`)
 
 | Sous-système | Avancement | État actuel | Reste à faire |
 | :--- | :---: | :--- | :--- |
 | **Chargeur PE / Mémoire / CPU x64** | `90 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, VEH + émulation `CLZERO`/`MONITORX`/`MWAITX`, pools physiques 64 KiB (`xmem` 6,2 Go sans aliasing). | Ajustements ponctuels sur de nouveaux chemins CPU en jeu. |
 | **Stockage & Streaming (`VirtualFS` / `DirectStorage`)** | `80 %` | 12 `.rpf`, `core_bvh4.rpf`, `core_licenses_data.rpf` et toutes les archives virtuelles TTDB `.ttpf` ouverts ; +9 500 requêtes `ReadAt` + `zlib` avec vtables COM partagées O(1). | Décompression matérielle **BCPack** (BC1–BC7) et `PAGE_DESTINATION` pour le streaming lourd du monde. |
 | **OS Console / HLE (`xgameruntime`, `GameInput`, Audio)** | `75 %` | `xasync`, **`xuser` (connexion hors-ligne `AstralPlayer`)**, **`xgamesave` (fournisseur hors-ligne 256 Mo)**, **`xaccessibility`**, `xnetworking` (hors-ligne), `AcpHal`/`xapu`/`chad`, et **`GameInput` réel XInput + Clavier Windows**. | Persistance disque `XGameSave` et décodage audio réel (`xapu` Opus / `chad` XDsp). |
-| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `30 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10, IR SSA, `ISG1`/`OSG1`, et recompilation live RDNA2 -> HLSL -> `ID3D12PipelineState` (~93 % de couverture sur les 3 PSOs actifs du boot). | Flux de contrôle structuré (branches + masque `EXEC`), descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), Compute (`CS`), compilation asynchrone. |
-| **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `38 %` | Fenêtre Win32 unique, vtables COM partagées O(1) (zéro limite de callbacks Go), `ID3D12Device` matériel + `SwapChain3`, `PresentX` à 30 fps (780+ frames + 119 `Dispatch` détectés), rejeu `DrawInstanced`, upload VB + déréférencement `CBV1`, `CreatePlacedSRV` (`SRV2`) + détuilage RDNA2 (`4KB`/`64KB` & `R8`/`RGBA`/`BC1–BC7`), `GetDeviceRemovedReason`. | Exécution Compute (`CS`), rendu multi-passes (G-Buffer/ombres/post-process), `ExecuteIndirect`, BVH4. |
+| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `35 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10, IR SSA, `ISG1`/`OSG1`, et recompilation live RDNA2 -> HLSL **VS/PS (`vs_5_0`/`ps_5_0`, ~93 % sur les 3 PSOs du boot) & Compute (`cs_5_0`, `numthreads`, `s_barrier`, `RWByteAddressBuffer`)**. | Flux de contrôle structuré (branches + masque `EXEC`), descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), compilation asynchrone. |
+| **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `42 %` | Fenêtre Win32 unique, vtables COM partagées O(1), `ID3D12Device` matériel + `SwapChain3`, `PresentX` à 30 fps (780+ frames), rejeu matériel `DrawInstanced` + **pipeline Compute (`CreateComputePipelineState` + `UAV` 1 Mo + `Dispatch`)**, upload VB + déréférencement `CBV1`, `CreatePlacedSRV` (`SRV2`) + détuilage RDNA2 (`4KB`/`64KB` & `R8`/`RGBA`/`BC1–BC7`), `GetDeviceRemovedReason`. | Rendu multi-passes (G-Buffer/ombres/post-process), `ExecuteIndirect`, BVH4. |
 
 ## Pourquoi ASTRAL ?
 

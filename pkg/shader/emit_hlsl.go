@@ -42,9 +42,13 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 	entry := "VSMain"
 	target := "vs_5_0"
 	isPS := prog.Stage == StagePS
+	isCS := prog.Stage == StageCS
 	if isPS {
 		entry = "PSMain"
 		target = "ps_5_0"
+	} else if isCS {
+		entry = "CSMain"
+		target = "cs_5_0"
 	}
 
 	b.WriteString("// Généré par gta-vi-astral (RDNA2/GFX10 -> HLSL SM 5.0)\n")
@@ -60,83 +64,110 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 	if isPS {
 		b.WriteString("Texture2D<float4> Tex0 : register(t0);\n")
 		b.WriteString("SamplerState Samp0 : register(s0);\n")
+	} else if isCS {
+		b.WriteString("RWByteAddressBuffer UAV0 : register(u0);\n")
 	}
 
-	// Déclaration des structures d'entrée/sortie depuis ISG1 / OSG1
-	b.WriteString("\nstruct StageIn {\n")
-	if len(inputs) == 0 {
-		if isPS {
-			b.WriteString("    float4 pos : SV_Position;\n")
-			b.WriteString("    float2 uv0 : TEXCOORD0;\n")
-		} else {
-			b.WriteString("    uint vid : SV_VertexID;\n")
+	if isCS {
+		tx, ty, tz := prog.ThreadGroup[0], prog.ThreadGroup[1], prog.ThreadGroup[2]
+		if tx == 0 {
+			tx = 64
 		}
+		if ty == 0 {
+			ty = 1
+		}
+		if tz == 0 {
+			tz = 1
+		}
+		if tx*ty*tz > 1024 {
+			tx, ty, tz = 64, 1, 1
+		}
+		b.WriteString(fmt.Sprintf("\n[numthreads(%d, %d, %d)]\n", tx, ty, tz))
+		b.WriteString("void CSMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint3 dtid : SV_DispatchThreadID) {\n")
+		b.WriteString("    uint s[64];\n")
+		b.WriteString("    uint v[64];\n")
+		b.WriteString("    [unroll] for (uint _i = 0; _i < 64; _i++) { s[_i] = 0u; v[_i] = 0u; }\n")
+		b.WriteString("    bool scc = false;\n")
+		b.WriteString("    bool vcc = false;\n")
+		b.WriteString("    s[0] = RootConst[0].x; s[1] = RootConst[0].y; s[2] = gid.x; s[3] = gid.y; s[4] = gid.z;\n")
+		b.WriteString("    v[0] = gtid.x; v[1] = gtid.y; v[2] = gtid.z;\n")
 	} else {
-		for idx, el := range inputs {
-			b.WriteString(fmt.Sprintf("    %s in%d : %s;\n", el.HLSLType(), idx, el.HLSLSemantic()))
-		}
-	}
-	b.WriteString("};\n\nstruct StageOut {\n")
-	if len(outputs) == 0 {
-		if isPS {
-			b.WriteString("    float4 mrt0 : SV_Target0;\n")
+		// Déclaration des structures d'entrée/sortie depuis ISG1 / OSG1
+		b.WriteString("\nstruct StageIn {\n")
+		if len(inputs) == 0 {
+			if isPS {
+				b.WriteString("    float4 pos : SV_Position;\n")
+				b.WriteString("    float2 uv0 : TEXCOORD0;\n")
+			} else {
+				b.WriteString("    uint vid : SV_VertexID;\n")
+			}
 		} else {
-			b.WriteString("    float4 pos : SV_Position;\n")
-		}
-	} else {
-		for idx, el := range outputs {
-			b.WriteString(fmt.Sprintf("    %s out%d : %s;\n", el.HLSLType(), idx, el.HLSLSemantic()))
-		}
-	}
-	b.WriteString("};\n\n")
-
-	b.WriteString(fmt.Sprintf("StageOut %s(StageIn inp) {\n", entry))
-	b.WriteString("    uint s[64];\n")
-	b.WriteString("    uint v[64];\n")
-	b.WriteString("    [unroll] for (uint _i = 0; _i < 64; _i++) { s[_i] = 0u; v[_i] = 0u; }\n")
-	b.WriteString("    bool scc = false;\n")
-	b.WriteString("    bool vcc = false;\n")
-	b.WriteString("    float4 exp_pos = float4(0.0, 0.0, 0.0, 1.0);\n")
-	b.WriteString("    float4 exp_param[8];\n")
-	b.WriteString("    float4 exp_mrt[4];\n")
-	b.WriteString("    [unroll] for (uint _p = 0; _p < 8; _p++) exp_param[_p] = float4(0,0,0,0);\n")
-	b.WriteString("    [unroll] for (uint _m = 0; _m < 4; _m++) exp_mrt[_m] = float4(0,0,0,1);\n")
-
-	// Injection des user SGPRs depuis RootConst
-	b.WriteString("    s[0] = RootConst[0].x; s[1] = RootConst[0].y; s[2] = RootConst[0].z; s[3] = RootConst[0].w;\n")
-
-	// Liaison des entrées ISG1 vers les VGPR initiaux
-	if !isPS {
-		vidBound := false
-		nextV := 0
-		for idx, el := range inputs {
-			up := strings.ToUpper(el.SemanticName)
-			if up == "SV_VERTEXID" {
-				b.WriteString(fmt.Sprintf("    v[0] = inp.in%d;\n", idx))
-				vidBound = true
-				if nextV < 1 {
-					nextV = 1
-				}
-			} else if up == "SV_INSTANCEID" {
-				b.WriteString(fmt.Sprintf("    v[1] = inp.in%d;\n", idx))
-				if nextV < 2 {
-					nextV = 2
-				}
-			} else if !strings.HasPrefix(up, "SV_") {
-				comps := el.ComponentCount()
-				chs := "xyzw"
-				for c := 0; c < comps && nextV < 64; c++ {
-					if comps == 1 {
-						b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d);\n", nextV, idx))
-					} else {
-						b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d.%c);\n", nextV, idx, chs[c]))
-					}
-					nextV++
-				}
+			for idx, el := range inputs {
+				b.WriteString(fmt.Sprintf("    %s in%d : %s;\n", el.HLSLType(), idx, el.HLSLSemantic()))
 			}
 		}
-		if !vidBound && len(inputs) == 0 {
-			b.WriteString("    v[0] = inp.vid;\n")
+		b.WriteString("};\n\nstruct StageOut {\n")
+		if len(outputs) == 0 {
+			if isPS {
+				b.WriteString("    float4 mrt0 : SV_Target0;\n")
+			} else {
+				b.WriteString("    float4 pos : SV_Position;\n")
+			}
+		} else {
+			for idx, el := range outputs {
+				b.WriteString(fmt.Sprintf("    %s out%d : %s;\n", el.HLSLType(), idx, el.HLSLSemantic()))
+			}
+		}
+		b.WriteString("};\n\n")
+
+		b.WriteString(fmt.Sprintf("StageOut %s(StageIn inp) {\n", entry))
+		b.WriteString("    uint s[64];\n")
+		b.WriteString("    uint v[64];\n")
+		b.WriteString("    [unroll] for (uint _i = 0; _i < 64; _i++) { s[_i] = 0u; v[_i] = 0u; }\n")
+		b.WriteString("    bool scc = false;\n")
+		b.WriteString("    bool vcc = false;\n")
+		b.WriteString("    float4 exp_pos = float4(0.0, 0.0, 0.0, 1.0);\n")
+		b.WriteString("    float4 exp_param[8];\n")
+		b.WriteString("    float4 exp_mrt[4];\n")
+		b.WriteString("    [unroll] for (uint _p = 0; _p < 8; _p++) exp_param[_p] = float4(0,0,0,0);\n")
+		b.WriteString("    [unroll] for (uint _m = 0; _m < 4; _m++) exp_mrt[_m] = float4(0,0,0,1);\n")
+
+		// Injection des user SGPRs depuis RootConst
+		b.WriteString("    s[0] = RootConst[0].x; s[1] = RootConst[0].y; s[2] = RootConst[0].z; s[3] = RootConst[0].w;\n")
+
+		// Liaison des entrées ISG1 vers les VGPR initiaux
+		if !isPS {
+			vidBound := false
+			nextV := 0
+			for idx, el := range inputs {
+				up := strings.ToUpper(el.SemanticName)
+				if up == "SV_VERTEXID" {
+					b.WriteString(fmt.Sprintf("    v[0] = inp.in%d;\n", idx))
+					vidBound = true
+					if nextV < 1 {
+						nextV = 1
+					}
+				} else if up == "SV_INSTANCEID" {
+					b.WriteString(fmt.Sprintf("    v[1] = inp.in%d;\n", idx))
+					if nextV < 2 {
+						nextV = 2
+					}
+				} else if !strings.HasPrefix(up, "SV_") {
+					comps := el.ComponentCount()
+					chs := "xyzw"
+					for c := 0; c < comps && nextV < 64; c++ {
+						if comps == 1 {
+							b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d);\n", nextV, idx))
+						} else {
+							b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d.%c);\n", nextV, idx, chs[c]))
+						}
+						nextV++
+					}
+				}
+			}
+			if !vidBound && len(inputs) == 0 {
+				b.WriteString("    v[0] = inp.vid;\n")
+			}
 		}
 	}
 
@@ -147,7 +178,7 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 		Target:     target,
 		TotalInsts: len(insts),
 	}
-	if !isPS {
+	if !isPS && !isCS {
 		for _, el := range inputs {
 			if !strings.HasPrefix(strings.ToUpper(el.SemanticName), "SV_") {
 				out.InputElements = append(out.InputElements, el)
@@ -164,11 +195,16 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 			out.LoweredInsts++
 			continue
 		}
+		if gi.Encoding == EncSOPP && ((gi.Word0>>16)&0x7F) == 0x0A && isCS { // s_barrier
+			b.WriteString("    GroupMemoryBarrierWithGroupSync();\n")
+			out.LoweredInsts++
+			continue
+		}
 		if gi.Encoding == EncVOP3 && ((gi.Word0>>16)&0x3FF) == 0x180 { // v_nop (metadata tag)
 			out.LoweredInsts++
 			continue
 		}
-		if stmt, ok := lowerGFX10ToHLSL(gi, isPS, inputs); ok {
+		if stmt, ok := lowerGFX10ToHLSL(gi, isPS, isCS, inputs); ok {
 			if stmt != "" {
 				b.WriteString("    " + stmt + "\n")
 			}
@@ -180,6 +216,12 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 			}
 			b.WriteString(fmt.Sprintf("    // unimpl %04x %s %08x %08x\n", gi.PC, gi.Encoding, gi.Word0, gi.Word1))
 		}
+	}
+
+	if isCS {
+		b.WriteString("}\n")
+		out.Source = b.String()
+		return out, nil
 	}
 
 	// Liaison des exports RDNA2 (exp_pos / exp_param / exp_mrt) vers StageOut
@@ -281,7 +323,7 @@ func gfx10SrcF32(src uint32, lit uint32, hasLit bool) string {
 	return fmt.Sprintf("asfloat(%s)", gfx10SrcU32(src, lit, hasLit))
 }
 
-func lowerGFX10ToHLSL(gi GFX10Inst, isPS bool, inputs []SigElement) (string, bool) {
+func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (string, bool) {
 	w0, w1 := gi.Word0, gi.Word1
 	switch gi.Encoding {
 	case EncVOP1:
@@ -531,6 +573,9 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS bool, inputs []SigElement) (string, boo
 				parts = append(parts, fmt.Sprintf("v[%d] = _readCB(%du);", vdata+i, off+i*4))
 			}
 			return strings.Join(parts, " "), true
+		}
+		if isCS && (op >= 0x18 && op <= 0x1B) && vdata < 64 { // buffer_store_dword*
+			return fmt.Sprintf("UAV0.Store((dtid.x * 4u + %du) & 0xFFFFCu, v[%d]);", off, vdata), true
 		}
 
 	case EncVINTRP:

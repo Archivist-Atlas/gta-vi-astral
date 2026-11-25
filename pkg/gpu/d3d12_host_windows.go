@@ -97,11 +97,14 @@ type HostD3D12 struct {
 	UploadCB      uintptr
 	UploadCBPtr   uintptr
 	UploadCBGPU   uint64
-	UploadTex     uintptr
-	UploadTexPtr  uintptr
-	ReplayRootSig uintptr
-	ReplayPSO     uintptr
-	SRVHeap       uintptr
+	UploadTex      uintptr
+	UploadTexPtr   uintptr
+	ReplayRootSig  uintptr
+	ReplayPSO      uintptr
+	ComputeRootSig uintptr
+	ComputeUAVBuf  uintptr
+	ComputeUAVGPU  uint64
+	SRVHeap        uintptr
 	SRVCPUStart   uintptr
 	SRVGPUStart   uintptr
 	SRVStride     uintptr
@@ -387,8 +390,8 @@ func (h *HostD3D12) waitGPU() {
 }
 
 // PresentClear présente la trame courante en effaçant le backbuffer avec clearColor (RGBA),
-// en rejouant les appels DrawInstanced hôtes (si présents) ou en copiant srcRGBA, puis en appelant Present.
-func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32, draws ...HostDrawPass) {
+// en rejouant les Compute Dispatches + DrawInstanced hôtes (si présents), puis en appelant Present.
+func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32, dispatches []HostDispatchPass, draws ...HostDrawPass) {
 	if h == nil || h.SwapChain == 0 {
 		return
 	}
@@ -448,6 +451,38 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 
 			// ID3D12GraphicsCommandList::ClearRenderTargetView (slot 48)
 			_ = comCall(h.CmdList, 48, rtv, uintptr(unsafe.Pointer(&clearColor[0])), 0, 0)
+
+			// Rejeu matériel des Compute Shaders (Dispatch) sur le GPU Windows hôte
+			if len(dispatches) > 0 && h.ComputeRootSig != 0 && h.ComputeUAVGPU != 0 {
+				_ = comCall(h.CmdList, 29, h.ComputeRootSig) // SetComputeRootSignature
+				_ = comCall(h.CmdList, 41, 1, uintptr(h.ComputeUAVGPU)) // SetComputeRootUnorderedAccessView(param=1, u0)
+				for idxCS, cs := range dispatches {
+					if cs.HostPSO == 0 || cs.X == 0 || cs.Y == 0 || cs.Z == 0 {
+						continue
+					}
+					if h.UploadCBPtr != 0 && h.UploadCBGPU != 0 {
+						cbSlot := uint64((idxCS+32)%64) * 1024
+						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 64<<10)[cbSlot : cbSlot+1024]
+						clear(dstCB)
+						if len(cs.CBData) > 0 {
+							copy(dstCB, cs.CBData)
+						}
+						_ = comCall(h.CmdList, 37, 0, uintptr(h.UploadCBGPU+cbSlot)) // SetComputeRootConstantBufferView(param=0, b0)
+					}
+					_ = comCall(h.CmdList, 25, cs.HostPSO) // SetPipelineState
+					gx, gy, gz := cs.X, cs.Y, cs.Z
+					if gx > 1024 {
+						gx = 1024
+					}
+					if gy > 1024 {
+						gy = 1024
+					}
+					if gz > 64 {
+						gz = 64
+					}
+					_ = comCall(h.CmdList, 14, uintptr(gx), uintptr(gy), uintptr(gz)) // Dispatch
+				}
+			}
 
 			// Rejeu matériel des appels DrawInstanced sur le GPU Windows hôte
 			if len(draws) > 0 && h.ReplayRootSig != 0 && h.ReplayPSO != 0 {
@@ -536,7 +571,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 
 // Present présente la trame courante sur la SwapChain DXGI hôte.
 func (h *HostD3D12) Present(syncInterval uint32) {
-	h.PresentClear(syncInterval, [4]float32{0.04, 0.05, 0.09, 1.0}, nil, 0, 0, 0)
+	h.PresentClear(syncInterval, [4]float32{0.04, 0.05, 0.09, 1.0}, nil, 0, 0, 0, nil)
 }
 
 // PresentHost présente la trame courante sur l'instance globale HostD3D12 si active.
@@ -549,12 +584,12 @@ func PresentHost(syncInterval uint32) {
 	}
 }
 
-// PresentHostFrame présente une trame avec couleur de clear, framebuffer optionnel et passes DrawInstanced.
-func PresentHostFrame(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32, draws ...HostDrawPass) {
+// PresentHostFrame présente une trame avec couleur de clear, framebuffer optionnel, Dispatches Compute et DrawInstanced.
+func PresentHostFrame(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32, dispatches []HostDispatchPass, draws ...HostDrawPass) {
 	hostMu.Lock()
 	h := hostInstance
 	hostMu.Unlock()
 	if h != nil {
-		h.PresentClear(syncInterval, clearColor, srcRGBA, srcW, srcH, srcPitch, draws...)
+		h.PresentClear(syncInterval, clearColor, srcRGBA, srcW, srcH, srcPitch, dispatches, draws...)
 	}
 }

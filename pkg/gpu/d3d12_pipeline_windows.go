@@ -383,6 +383,58 @@ func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []Ho
 	return pso, nil
 }
 
+type d3d12ComputePSODesc struct {
+	RootSignature uintptr
+	CS            d3d12ShaderBytecode
+	NodeMask      uint32
+	_pad0         uint32
+	CachedPSO     d3d12ShaderBytecode
+	Flags         uint32
+	_pad1         uint32
+}
+
+// HostDispatchPass décrit un appel Dispatch Compute rejoué sur le GPU Windows hôte.
+type HostDispatchPass struct {
+	X       uint32
+	Y       uint32
+	Z       uint32
+	HostPSO uintptr
+	CBData  []byte
+}
+
+// CompileComputePSO compile un shader HLSL Compute (cs_5_0) en ID3D12PipelineState matériel sur h.Device.
+func (h *HostD3D12) CompileComputePSO(csHLSL, csEntry string) (uintptr, error) {
+	if h == nil || h.Device == 0 || h.ComputeRootSig == 0 {
+		return 0, fmt.Errorf("HostD3D12 Compute non initialisé")
+	}
+	csBC, err := CompileHLSL(csHLSL, csEntry, "cs_5_0")
+	if err != nil {
+		return 0, err
+	}
+	desc := d3d12ComputePSODesc{
+		RootSignature: h.ComputeRootSig,
+		CS:            d3d12ShaderBytecode{Ptr: uintptr(unsafe.Pointer(&csBC[0])), Len: uintptr(len(csBC))},
+	}
+	var pso uintptr
+	// ID3D12Device::CreateComputePipelineState = slot 11
+	hr := comCall(h.Device, 11, uintptr(unsafe.Pointer(&desc)), uintptr(unsafe.Pointer(&guidID3D12PipelineState[0])), uintptr(unsafe.Pointer(&pso)))
+	if int32(hr) < 0 || pso == 0 {
+		return 0, fmt.Errorf("CreateComputePipelineState échoué (0x%08X)", uint32(hr))
+	}
+	return pso, nil
+}
+
+// CompileHostComputePSO compile un Compute Shader HLSL (cs_5_0) sur l'instance HostD3D12 globale.
+func CompileHostComputePSO(csHLSL, csEntry string) (uintptr, error) {
+	hostMu.Lock()
+	h := hostInstance
+	hostMu.Unlock()
+	if h == nil {
+		return 0, fmt.Errorf("HostD3D12 inactif")
+	}
+	return h.CompileComputePSO(csHLSL, csEntry)
+}
+
 // CompileHostPSO compile une paire HLSL (VS+PS) en ID3D12PipelineState sur l'instance HostD3D12 globale.
 func CompileHostPSO(vsHLSL, vsEntry, psHLSL, psEntry string, inputElems []HostInputElement) (uintptr, error) {
 	hostMu.Lock()
@@ -525,8 +577,61 @@ float4 PSMain(VSOut i) : SV_Target {
 	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(256 << 10)
 	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(64 << 10)
 	h.UploadTex, h.UploadTexPtr, _ = h.createUploadBuffer(16 << 20)
-	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS DXBC, RootCBV b0 + SRV t0x64 + VB)",
+	h.initComputePipeline()
+	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS+CS DXBC, RootCBV b0 + SRV t0x64 + UAV u0 + VB)",
 		"rootSig", fmt.Sprintf("0x%X", rootSig), "pso", fmt.Sprintf("0x%X", pso))
+}
+
+func (h *HostD3D12) initComputePipeline() {
+	if h.Device == 0 || procD3D12SerializeRootSig.Find() != nil {
+		return
+	}
+	// Compute RootSignature : Param 0 = Root CBV (b0), Param 1 = Root UAV (u0)
+	params := [2]d3d12RootParameter{
+		{ParameterType: 2 /* CBV */, Union0: 0, ShaderVisibility: 0},
+		{ParameterType: 4 /* UAV */, Union0: 0, ShaderVisibility: 0},
+	}
+	rsDesc := d3d12RootSignatureDesc{
+		NumParameters: 2,
+		Parameters:    uintptr(unsafe.Pointer(&params[0])),
+	}
+	var rsBlob, errBlob uintptr
+	hr, _, _ := procD3D12SerializeRootSig.Call(uintptr(unsafe.Pointer(&rsDesc)), 1, uintptr(unsafe.Pointer(&rsBlob)), uintptr(unsafe.Pointer(&errBlob)))
+	if errBlob != 0 {
+		_ = comCall(errBlob, 2)
+	}
+	if int32(hr) < 0 || rsBlob == 0 {
+		return
+	}
+	defer comCall(rsBlob, 2)
+	var csRS uintptr
+	if int32(comCall(h.Device, 16, 0, comCall(rsBlob, 3), comCall(rsBlob, 4), uintptr(unsafe.Pointer(&guidID3D12RootSignature[0])), uintptr(unsafe.Pointer(&csRS)))) >= 0 && csRS != 0 {
+		h.ComputeRootSig = csRS
+	}
+	// Buffer UAV 1 MiB persistant en heap DEFAULT (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS = 0x4)
+	heapProps := d3d12HeapProperties{Type: 1 /* DEFAULT */, CreationNodeMask: 1, VisibleNodeMask: 1}
+	bufDesc := d3d12ResourceDesc{
+		Dimension:        1, // BUFFER
+		Width:            1 << 20,
+		Height:           1,
+		DepthOrArraySize: 1,
+		MipLevels:        1,
+		SampleCount:      1,
+		Layout:           1, // ROW_MAJOR
+		Flags:            0x4,
+	}
+	var uavRes uintptr
+	if int32(comCall(h.Device, 27,
+		uintptr(unsafe.Pointer(&heapProps)), 0,
+		uintptr(unsafe.Pointer(&bufDesc)),
+		0x8, // D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+		0,
+		uintptr(unsafe.Pointer(&guidID3D12Resource[0])),
+		uintptr(unsafe.Pointer(&uavRes)),
+	)) >= 0 && uavRes != 0 {
+		h.ComputeUAVBuf = uavRes
+		h.ComputeUAVGPU = uint64(comCall(uavRes, 11)) // GetGPUVirtualAddress
+	}
 }
 
 // ensureHostTexture crée (ou retrouve) une Texture2D hôte + son SRV et planifie son upload si besoin.

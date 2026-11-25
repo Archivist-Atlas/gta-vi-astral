@@ -42,3 +42,31 @@ func TestEmitHLSLVertexAndPixel(t *testing.T) {
 		t.Fatalf("export pos0 manquant dans HLSL généré :\n%s", out.Source)
 	}
 }
+
+func TestEmitHLSLComputeShader(t *testing.T) {
+	code := make([]byte, 0, 12)
+	w := func(u uint32) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], u)
+		code = append(code, b[:]...)
+	}
+	// s_barrier (SOPP op=0x0A)
+	w((0b101111111 << 23) | (0x0A << 16))
+	// s_endpgm
+	w((0b101111111 << 23) | (0x01 << 16))
+
+	out, err := EmitHLSL(nil, NativeProgram{
+		Stage:       StageCS,
+		ThreadGroup: [3]uint32{8, 8, 1},
+		Code:        code,
+	})
+	if err != nil {
+		t.Fatalf("EmitHLSL CS échoué : %v", err)
+	}
+	if out.Target != "cs_5_0" || out.EntryPoint != "CSMain" {
+		t.Fatalf("target/entry CS inattendus : %s/%s", out.Target, out.EntryPoint)
+	}
+	if !strings.Contains(out.Source, "[numthreads(8, 8, 1)]") || !strings.Contains(out.Source, "GroupMemoryBarrierWithGroupSync();") {
+		t.Fatalf("HLSL CS malformé :\n%s", out.Source)
+	}
+}

@@ -19,8 +19,10 @@ import (
 type guestPSO struct {
 	vsHash   [16]byte
 	psHash   [16]byte
+	csHash   [16]byte
 	hasVS    bool
 	hasPS    bool
+	hasCS    bool
 	hostPSO  uintptr
 	compiled atomic.Bool
 }
@@ -46,11 +48,13 @@ type d3d12xState struct {
 	psos            map[uintptr]*guestPSO
 	dxbcBlobs       map[[16]byte][]byte
 	activeHostPSO   uintptr
+	activeHostCSPSO uintptr
 	activeVBVA      uintptr
 	activeVBSize    uint32
 	activeVBStride  uint32
 	activeRootVA    uintptr
 	activeSRVTex    *gpu.HostTextureUpload
+	frameDispatches []gpu.HostDispatchPass
 	frameDraws      []gpu.HostDrawPass
 	lastClearColor  [4]float32
 	hasClearColor   bool
@@ -262,6 +266,8 @@ func newD3D12XDevice() uintptr {
 		clr := st.lastClearColor
 		draws := st.frameDraws
 		st.frameDraws = nil
+		dispatches := st.frameDispatches
+		st.frameDispatches = nil
 		if resObj != 0 {
 			if d, ok := st.resDescs[resObj]; ok {
 				resW, resH, resFmt = uint32(d.Width), d.Height, d.Format
@@ -293,7 +299,7 @@ func newD3D12XDevice() uintptr {
 				slog.Info("GPU_TRACE CommandListX slots @ frame 60", "slots", summary, "psos", st.psoCreated.Load(), "heaps", st.heapsCreated.Load(), "res", st.resCreated.Load())
 			}
 		}
-		gpu.PresentHostFrame(0, clr, nil, 0, 0, 0, draws...)
+		gpu.PresentHostFrame(0, clr, nil, 0, 0, 0, dispatches, draws...)
 		return hresultOK
 	})
 	// Vtables partagées O(1) pour Queue, Allocator, DescriptorHeap, Resource, PSO et enfants génériques
@@ -447,9 +453,24 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
-	cbListDispatch := syscall.NewCallback(func() uintptr {
+	cbListDispatch := syscall.NewCallback(func(this, x, y, z uintptr) uintptr {
 		listSlotHits[14].Add(1)
 		st.dispatchCalls.Add(1)
+		st.mu.Lock()
+		if len(st.frameDispatches) < 32 && st.activeHostCSPSO != 0 {
+			dp := gpu.HostDispatchPass{
+				X:       uint32(x),
+				Y:       uint32(y),
+				Z:       uint32(z),
+				HostPSO: st.activeHostCSPSO,
+			}
+			if st.activeRootVA >= 0x10000 {
+				dp.CBData = make([]byte, 256)
+				copy(dp.CBData, unsafe.Slice((*byte)(osPtr(st.activeRootVA)), 256))
+			}
+			st.frameDispatches = append(st.frameDispatches, dp)
+		}
+		st.mu.Unlock()
 		return 0
 	})
 	cbListClearRTV := syscall.NewCallback(func(this, rtvHandle, colorPtr, numRects, rects uintptr) uintptr {
@@ -491,6 +512,40 @@ func newD3D12XDevice() uintptr {
 		return fmt.Sprintf("len=%d parts=[%s] native=[%s]", len(data), parts, nat)
 	}
 	compileGuestPSO := func(psoObj uintptr, gp *guestPSO) {
+		if gp.hasCS && !gp.hasVS {
+			st.mu.Lock()
+			csData := st.dxbcBlobs[gp.csHash]
+			st.mu.Unlock()
+			if len(csData) < 32 {
+				return
+			}
+			csC, err := shader.ParseDXBC(csData)
+			if err != nil {
+				return
+			}
+			csProgs, err := shader.ExtractNativePrograms(csC)
+			if err != nil || len(csProgs) == 0 {
+				return
+			}
+			csOut, err := shader.EmitHLSL(csC, csProgs[0])
+			if err != nil {
+				return
+			}
+			hPSO, cerr := gpu.CompileHostComputePSO(csOut.Source, csOut.EntryPoint)
+			if cerr != nil {
+				slog.Warn("Recompilation Compute PSO RDNA2->HLSL->D3D12 échouée", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
+				return
+			}
+			st.mu.Lock()
+			gp.hostPSO = hPSO
+			st.mu.Unlock()
+			slog.Info("Compute PSO RDNA2 recompilé en ID3D12PipelineState matériel",
+				"guestPSO", fmt.Sprintf("0x%X", psoObj),
+				"hostPSO", fmt.Sprintf("0x%X", hPSO),
+				"cs", fmt.Sprintf("%d/%d ins", csOut.LoweredInsts, csOut.TotalInsts),
+			)
+			return
+		}
 		if !gp.hasVS || !gp.hasPS {
 			return
 		}
@@ -571,7 +626,11 @@ func newD3D12XDevice() uintptr {
 					compileGuestPSO(pso, gp)
 				}
 				st.mu.Lock()
-				st.activeHostPSO = gp.hostPSO
+				if gp.hasCS && !gp.hasVS {
+					st.activeHostCSPSO = gp.hostPSO
+				} else {
+					st.activeHostPSO = gp.hostPSO
+				}
 				st.mu.Unlock()
 			}
 		}
@@ -981,10 +1040,10 @@ func newD3D12XDevice() uintptr {
 				q := unsafe.Slice((*uint64)(osPtr(sub)), sz/8)
 				gp := &guestPSO{}
 				// Un subobject shader dans D3D12_PIPELINE_STATE_STREAM_DESC est précédé de son tag u32
-				// (1=VS, 2=PS) aligné sur 8 octets, suivi de { pShaderBytecode u64, BytecodeLength u64 }.
+				// (1=VS, 2=PS, 6=CS) aligné sur 8 octets, suivi de { pShaderBytecode u64, BytecodeLength u64 }.
 				for i := 1; i+1 < len(q) && i < 32; i++ {
 					tag := uint32(q[i-1])
-					if tag != 1 && tag != 2 {
+					if tag != 1 && tag != 2 && tag != 6 {
 						continue
 					}
 					ptrVal := q[i]
@@ -995,11 +1054,13 @@ func newD3D12XDevice() uintptr {
 								gp.vsHash, gp.hasVS = h, true
 							} else if tag == 2 && !gp.hasPS {
 								gp.psHash, gp.hasPS = h, true
+							} else if tag == 6 && !gp.hasCS {
+								gp.csHash, gp.hasCS = h, true
 							}
 						}
 					}
 				}
-				if gp.hasVS || gp.hasPS {
+				if gp.hasVS || gp.hasPS || gp.hasCS {
 					st.mu.Lock()
 					st.psos[psoObj] = gp
 					st.mu.Unlock()
@@ -1601,17 +1662,17 @@ func newD3D12XDevice() uintptr {
 		38:  cbCopyableFootprints,
 		39:  cbCreateQueryHeap,
 		41:  cbCreateCmdSig,
-		48:  cbCreateQueue,       // CreateCommandQueueX
-		52:  cbOK,                // SetDebugFlagsX
-		55:  cbCreateDerivedPSOX, // CreateDerivedPipelineStateX (6 args)
-		56:  cbSerializePSOX,     // SerializeGraphicsPipelineStateX
-		57:  cbDeserializePSOX,   // DeserializeGraphicsPipelineStateX
+		48:  cbCreateQueue,        // CreateCommandQueueX
+		52:  cbOK,                 // SetDebugFlagsX
+		55:  cbCreateDerivedPSOX,  // CreateDerivedPipelineStateX (6 args)
+		56:  cbSerializePSOX,      // SerializeGraphicsPipelineStateX
+		57:  cbDeserializePSOX,    // DeserializeGraphicsPipelineStateX
 		60:  cbCreateGraphicsPSOX, // CreateGraphicsPipelineStateX (6 args)
 		61:  logOK("CreateSampler2"),
 		62:  cbCreateComputePSOX, // CreateComputePipelineStateX (6 args)
 		66:  cbSerializePSOX,     // SerializeComputePipelineStateX
 		67:  cbDeserializePSOX,   // DeserializeComputePipelineStateX
-		69:  cbOK,          // Debug filter
+		69:  cbOK,                // Debug filter
 		70:  cbCreatePlacedSRV,
 		71:  logOK("CreatePlacedUAV"),
 		73:  cbCreateListX, // CreateCommandListX
