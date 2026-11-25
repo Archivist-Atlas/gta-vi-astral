@@ -569,6 +569,38 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	const offlineUserHandle uintptr = 0x0000A57A00000001
 	const offlineUserXUID uint64 = 0x0009000001234567
 
+	cbUserGetGamertag := syscall.NewCallback(func(this, user, comp, size, bufPtr, usedPtr uintptr) uintptr {
+		if uint32(comp) == 2 { // XUserGamertagComponent::ModernSuffix -> vide
+			return putStr("", size, bufPtr, usedPtr)
+		}
+		return putStr("AstralPlayer", size, bufPtr, usedPtr)
+	})
+	cbCompleteAsync4 := syscall.NewCallback(func(this, a1, a2, asyncBlock uintptr) uintptr {
+		if asyncBlock >= 0x10000 {
+			cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
+			if cb >= 0x10000 && cb < 0x800000000000 {
+				_, _, _ = syscall.SyscallN(cb, asyncBlock)
+			}
+		}
+		return hresultOK
+	})
+	cbCompleteAsync5 := syscall.NewCallback(func(this, a1, a2, a3, asyncBlock uintptr) uintptr {
+		if asyncBlock >= 0x10000 {
+			cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
+			if cb >= 0x10000 && cb < 0x800000000000 {
+				_, _, _ = syscall.SyscallN(cb, asyncBlock)
+			}
+		}
+		return hresultOK
+	})
+
+	gdkIIDOverrides := map[string]uintptr{
+		// XUSER_GAMERTAG_IID : vtable dédiée où slot 3 (0x18) = XUserGetGamertag
+		"{CEF4FAC0-7676-4A94-A119-4C43F9EB5B74}": NewCOMObject("xuser_gamertag", 8, map[int]uintptr{
+			3: cbUserGetGamertag,
+		}),
+	}
+
 	gdkProviders := map[string]uintptr{
 		"{073B7DCB-1FCF-4030-94BE-E3C9EB623428}": NewCOMObject("xasync", 64, map[int]uintptr{
 			3:  cbGISuccess,       // 0x18 XAsyncGetStatus -> S_OK
@@ -579,6 +611,7 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				return hresultOK
 			}),
 			5:  cbGISuccess,       // 0x28 XAsyncCancel
+			6:  cbGISuccess,       // 0x30 XAsyncWait / XAsyncBegin (déjà complété)
 			12: cbTaskQueueCreate, // 0x60 XTaskQueueCreate
 			13: cbTaskQueueCreate, // 0x68 XTaskQueueCreateComposite
 			14: syscall.NewCallback(func(this, q, outPtr uintptr) uintptr { // 0x70 XTaskQueueDuplicateHandle
@@ -688,9 +721,7 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				}
 				return hresultOK
 			}),
-			15: syscall.NewCallback(func(this, user, comp, size, bufPtr, usedPtr uintptr) uintptr { // XUserGetGamertag
-				return putStr("AstralPlayer", size, bufPtr, usedPtr)
-			}),
+			15: cbUserGetGamertag, // XUserGetGamertag
 			19: syscall.NewCallback(func(this, user, outAge uintptr) uintptr { // XUserGetAgeGroup
 				if outAge >= 0x10000 {
 					*(*uint32)(osPtr(outAge)) = 3 // Adult
@@ -706,8 +737,23 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				}
 				return hresultOK
 			}),
+			21: cbCompleteAsync5, // XUserResolvePrivilegeWithUiAsync
+			22: cbGISuccess,      // XUserResolvePrivilegeWithUiResult
+			29: cbCompleteAsync4, // XUserResolveIssueWithUiAsync
+			30: cbGISuccess,      // XUserResolveIssueWithUiResult
 			33: cbRegisterToken5, // 0x108 XUserRegisterForChangeEvent
 			34: cbReturnTrue,     // 0x110 XUserUnregisterForChangeEvent
+		}),
+		// XUSER_DEVICE : associe toutes les manettes (DualSense/Xbox/HID) à AstralPlayer
+		"{7D824997-10DC-45AB-86B7-2737767C0BF1}": NewCOMObject("xuser_device", 12, map[int]uintptr{
+			3: syscall.NewCallback(func(this, devIdPtr, outUser uintptr) uintptr { // 0x18 XUserFindForDevice
+				if outUser >= 0x10000 {
+					*(*uintptr)(osPtr(outUser)) = offlineUserHandle
+				}
+				return hresultOK
+			}),
+			4: cbRegisterToken5, // 0x20 XUserRegisterForDeviceAssociationChanged
+			5: cbReturnTrue,     // 0x28 XUserUnregisterForDeviceAssociationChanged
 		}),
 		"{704C3F58-E629-4CC2-B197-30511B996FE2}": newXGameSaveProvider(vfs),
 		"{973A344E-24BF-4D0F-8457-56C534892B29}": NewCOMObject("xgame", 64, map[int]uintptr{
@@ -991,6 +1037,13 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	cbQueryApiImpl := syscall.NewCallback(func(provider, iid, outPtr uintptr) uintptr {
 		provGUID := FormatGUID(provider)
 		iidGUID := FormatGUID(iid)
+		if obj, ok := gdkIIDOverrides[iidGUID]; ok && obj != 0 {
+			slog.Debug("xgameruntime!QueryApiImpl résolu (IID)", "provider", provGUID, "iid", iidGUID)
+			if outPtr != 0 {
+				*(*uintptr)(osPtr(outPtr)) = obj
+			}
+			return hresultOK
+		}
 		if obj, ok := gdkProviders[provGUID]; ok && obj != 0 {
 			slog.Debug("xgameruntime!QueryApiImpl résolu", "provider", provGUID, "iid", iidGUID)
 			if outPtr != 0 {

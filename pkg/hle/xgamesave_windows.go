@@ -74,48 +74,56 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 		}
 	}
 
-	return NewCOMObject("xgamesave", 40, map[int]uintptr{
-		3: syscall.NewCallback(func(this, user, scid, syncOnDemand, outProv uintptr) uintptr { // XGameSaveInitializeProvider
+	return NewCOMObject("xgamesave", 32, map[int]uintptr{
+		3: syscall.NewCallback(func(this, user, scid, syncOnDemand, outProv uintptr) uintptr { // 0x18 XGameSaveInitializeProvider
 			slog.Info("xgamesave!XGameSaveInitializeProvider -> stockage disque hors-ligne", "dir", gs.rootDir)
+			gpu.ReportBootProgress(0.90)
 			if outProv >= 0x10000 {
 				*(*uintptr)(osPtr(outProv)) = uintptr(gs.nextHandle.Add(1))
 			}
 			return hresultOK
 		}),
-		4: syscall.NewCallback(func(this, user, scid, syncOnDemand, asyncBlock uintptr) uintptr { // XGameSaveInitializeProviderAsync
+		4: syscall.NewCallback(func(this, user, scid, syncOnDemand, asyncBlock uintptr) uintptr { // 0x20 XGameSaveInitializeProviderAsync
 			slog.Info("xgamesave!XGameSaveInitializeProviderAsync -> stockage disque hors-ligne", "dir", gs.rootDir)
 			gpu.ReportBootProgress(0.90)
 			completeAsync(asyncBlock)
 			return hresultOK
 		}),
-		5: syscall.NewCallback(func(this, asyncBlock, outProv uintptr) uintptr { // XGameSaveInitializeProviderResult
+		5: syscall.NewCallback(func(this, asyncBlock, outProv uintptr) uintptr { // 0x28 XGameSaveInitializeProviderResult
 			if outProv >= 0x10000 {
 				*(*uintptr)(osPtr(outProv)) = uintptr(gs.nextHandle.Add(1))
 			}
 			return hresultOK
 		}),
-		6: cbOK, // XGameSaveCloseProvider
-		7: syscall.NewCallback(func(this, prov, outQuota uintptr) uintptr { // XGameSaveGetRemainingQuota
+		6: cbOK, // 0x30 XGameSaveCloseProvider
+		7: syscall.NewCallback(func(this, prov, outQuota uintptr) uintptr { // 0x38 XGameSaveGetRemainingQuota
 			if outQuota >= 0x10000 {
 				*(*int64)(osPtr(outQuota)) = 256 << 20 // 256 MiB
 			}
 			return hresultOK
 		}),
-		8: syscall.NewCallback(func(this, prov, asyncBlock uintptr) uintptr { // XGameSaveGetRemainingQuotaAsync
+		8: syscall.NewCallback(func(this, prov, asyncBlock uintptr) uintptr { // 0x40 XGameSaveGetRemainingQuotaAsync
 			completeAsync(asyncBlock)
 			return hresultOK
 		}),
-		9: syscall.NewCallback(func(this, asyncBlock, outQuota uintptr) uintptr { // XGameSaveGetRemainingQuotaResult
+		9: syscall.NewCallback(func(this, asyncBlock, outQuota uintptr) uintptr { // 0x48 XGameSaveGetRemainingQuotaResult
 			if outQuota >= 0x10000 {
 				*(*int64)(osPtr(outQuota)) = 256 << 20
 			}
 			return hresultOK
 		}),
-		10: cbOK, // XGameSaveEnumerateContainerInfo
-		11: cbOK, // XGameSaveEnumerateContainerInfoByName
-		12: cbOK, // XGameSaveGetContainerInfo
-		13: cbOK, // XGameSaveDeleteContainer
-		14: syscall.NewCallback(func(this, prov, namePtr, outCont uintptr) uintptr { // XGameSaveCreateContainer
+		10: cbOK, // 0x50 XGameSaveDeleteContainer
+		11: syscall.NewCallback(func(this, prov, namePtr, asyncBlock uintptr) uintptr { // 0x58 XGameSaveDeleteContainerAsync
+			completeAsync(asyncBlock)
+			return hresultOK
+		}),
+		12: cbOK, // 0x60 XGameSaveDeleteContainerResult
+		13: syscall.NewCallback(func(this, prov, namePtr, ctx, cb uintptr) uintptr { // 0x68 XGameSaveGetContainerInfo
+			return 0x80830008 // E_GS_BLOB_NOT_FOUND / container non encore créé
+		}),
+		14: cbOK, // 0x70 XGameSaveEnumerateContainerInfo
+		15: cbOK, // 0x78 XGameSaveEnumerateContainerInfoByName
+		16: syscall.NewCallback(func(this, prov, namePtr, outCont uintptr) uintptr { // 0x80 XGameSaveCreateContainer
 			name := sanitizeSaveName(readSaveCStr(namePtr))
 			dir := filepath.Join(gs.rootDir, name)
 			_ = os.MkdirAll(dir, 0o755)
@@ -128,16 +136,26 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 			}
 			return hresultOK
 		}),
-		15: syscall.NewCallback(func(this, cont uintptr) uintptr { // XGameSaveCloseContainer
+		17: syscall.NewCallback(func(this, cont uintptr) uintptr { // 0x88 XGameSaveCloseContainer
 			gs.mu.Lock()
 			delete(gs.containers, cont)
 			gs.mu.Unlock()
 			return hresultOK
 		}),
-		16: cbOK, // XGameSaveEnumerateBlobInfo
-		17: cbOK, // XGameSaveEnumerateBlobInfoByName
-		18: cbOK, // XGameSaveReadBlobData
-		19: syscall.NewCallback(func(this, cont, displayNamePtr, outUpd uintptr) uintptr { // XGameSaveCreateUpdate
+		18: cbOK, // 0x90 XGameSaveEnumerateBlobInfo
+		19: cbOK, // 0x98 XGameSaveEnumerateBlobInfoByName
+		20: cbOK, // 0xA0 XGameSaveReadBlobData
+		21: syscall.NewCallback(func(this, cont, blobNames, count, asyncBlock uintptr) uintptr { // 0xA8 XGameSaveReadBlobDataAsync
+			completeAsync(asyncBlock)
+			return hresultOK
+		}),
+		22: syscall.NewCallback(func(this, asyncBlock, blobsSize, blobsBuf, outCount uintptr) uintptr { // 0xB0 XGameSaveReadBlobDataResult
+			if outCount >= 0x10000 {
+				*(*uint32)(osPtr(outCount)) = 0
+			}
+			return hresultOK
+		}),
+		23: syscall.NewCallback(func(this, cont, displayNamePtr, outUpd uintptr) uintptr { // 0xB8 XGameSaveCreateUpdate
 			gs.mu.Lock()
 			dir := gs.containers[cont]
 			if dir == "" {
@@ -152,13 +170,13 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 			}
 			return hresultOK
 		}),
-		20: syscall.NewCallback(func(this, upd uintptr) uintptr { // XGameSaveCloseUpdate
+		24: syscall.NewCallback(func(this, upd uintptr) uintptr { // 0xC0 XGameSaveCloseUpdate
 			gs.mu.Lock()
 			delete(gs.updates, upd)
 			gs.mu.Unlock()
 			return hresultOK
 		}),
-		21: syscall.NewCallback(func(this, upd, blobNamePtr, dataPtr, byteCount uintptr) uintptr { // XGameSaveSubmitBlobWrite
+		25: syscall.NewCallback(func(this, upd, blobNamePtr, dataPtr, byteCount uintptr) uintptr { // 0xC8 XGameSaveSubmitBlobWrite
 			gs.mu.Lock()
 			dir := gs.updates[upd]
 			gs.mu.Unlock()
@@ -169,12 +187,12 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 			}
 			return hresultOK
 		}),
-		22: cbOK, // XGameSaveSubmitBlobDelete
-		23: cbOK, // XGameSaveSubmitUpdate
-		24: syscall.NewCallback(func(this, upd, asyncBlock uintptr) uintptr { // XGameSaveSubmitUpdateAsync
+		26: cbOK, // 0xD0 XGameSaveSubmitBlobDelete
+		27: cbOK, // 0xD8 XGameSaveSubmitUpdate
+		28: syscall.NewCallback(func(this, upd, asyncBlock uintptr) uintptr { // 0xE0 XGameSaveSubmitUpdateAsync
 			completeAsync(asyncBlock)
 			return hresultOK
 		}),
-		25: cbOK, // XGameSaveSubmitUpdateResult
+		29: cbOK, // 0xE8 XGameSaveSubmitUpdateResult
 	})
 }
