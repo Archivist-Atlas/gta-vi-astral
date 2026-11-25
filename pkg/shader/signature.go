@@ -48,6 +48,60 @@ func (e SigElement) HLSLSemantic() string {
 	return fmt.Sprintf("%s%d", e.SemanticName, e.SemanticIndex)
 }
 
+// ComponentCount retourne le nombre de composantes (1..4) actives dans Mask.
+func (e SigElement) ComponentCount() int {
+	n := 0
+	for b := uint8(0); b < 4; b++ {
+		if e.Mask&(1<<b) != 0 {
+			n++
+		}
+	}
+	if n == 0 {
+		return 1
+	}
+	return n
+}
+
+// DXGIFormat retourne le DXGI_FORMAT correspondant à ComponentType et Mask.
+func (e SigElement) DXGIFormat() uint32 {
+	n := e.ComponentCount()
+	switch e.ComponentType {
+	case 1: // UINT
+		switch n {
+		case 1:
+			return 42 // R32_UINT
+		case 2:
+			return 17 // R32G32_UINT
+		case 3:
+			return 7 // R32G32B32_UINT
+		default:
+			return 3 // R32G32B32A32_UINT
+		}
+	case 2: // SINT
+		switch n {
+		case 1:
+			return 43 // R32_SINT
+		case 2:
+			return 18 // R32G32_SINT
+		case 3:
+			return 8 // R32G32B32_SINT
+		default:
+			return 4 // R32G32B32A32_SINT
+		}
+	default: // FLOAT
+		switch n {
+		case 1:
+			return 41 // R32_FLOAT
+		case 2:
+			return 16 // R32G32_FLOAT
+		case 3:
+			return 6 // R32G32B32_FLOAT
+		default:
+			return 2 // R32G32B32A32_FLOAT
+		}
+	}
+}
+
 // ParseSignature décode un bloc DXBC ISG1, OSG1 ou PSG1 (entrées de 32 octets).
 func ParseSignature(data []byte) ([]SigElement, error) {
 	if len(data) < 8 {

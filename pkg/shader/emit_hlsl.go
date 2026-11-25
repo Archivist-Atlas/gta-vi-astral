@@ -108,13 +108,31 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 	// Liaison des entrées ISG1 vers les VGPR initiaux
 	if !isPS {
 		vidBound := false
+		nextV := 0
 		for idx, el := range inputs {
 			up := strings.ToUpper(el.SemanticName)
 			if up == "SV_VERTEXID" {
 				b.WriteString(fmt.Sprintf("    v[0] = inp.in%d;\n", idx))
 				vidBound = true
+				if nextV < 1 {
+					nextV = 1
+				}
 			} else if up == "SV_INSTANCEID" {
 				b.WriteString(fmt.Sprintf("    v[1] = inp.in%d;\n", idx))
+				if nextV < 2 {
+					nextV = 2
+				}
+			} else if !strings.HasPrefix(up, "SV_") {
+				comps := el.ComponentCount()
+				chs := "xyzw"
+				for c := 0; c < comps && nextV < 64; c++ {
+					if comps == 1 {
+						b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d);\n", nextV, idx))
+					} else {
+						b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d.%c);\n", nextV, idx, chs[c]))
+					}
+					nextV++
+				}
 			}
 		}
 		if !vidBound && len(inputs) == 0 {

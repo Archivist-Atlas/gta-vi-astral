@@ -97,10 +97,16 @@ type HostD3D12 struct {
 	UploadCB      uintptr
 	UploadCBPtr   uintptr
 	UploadCBGPU   uint64
+	UploadTex     uintptr
+	UploadTexPtr  uintptr
 	ReplayRootSig uintptr
 	ReplayPSO     uintptr
 	SRVHeap       uintptr
+	SRVCPUStart   uintptr
 	SRVGPUStart   uintptr
+	SRVStride     uintptr
+	NextSRVSlot   uint32
+	TexCache      map[uint64]*hostTexEntry
 	Ready         bool
 }
 
@@ -468,6 +474,14 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 					pso := d.HostPSO
 					if pso == 0 {
 						pso = h.ReplayPSO
+					}
+					if d.SRVTex != nil {
+						srvGPU := h.ensureHostTexture(d.SRVTex)
+						if srvGPU != 0 {
+							_ = comCall(h.CmdList, 32, 1, srvGPU) // SetGraphicsRootDescriptorTable(param=1, t0)
+						}
+					} else if h.SRVGPUStart != 0 {
+						_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart)
 					}
 					_ = comCall(h.CmdList, 25, pso) // SetPipelineState
 					// Upload Constant Buffer (1024 octets alignés sur 256 octets, slot = idxPass % 64)

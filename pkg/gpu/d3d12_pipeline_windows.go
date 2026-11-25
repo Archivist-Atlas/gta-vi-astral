@@ -26,6 +26,15 @@ var (
 	}
 )
 
+// HostTextureUpload décrit une texture 2D invitée à uploader dans un SRV t0 hôte.
+type HostTextureUpload struct {
+	GuestVA uint64
+	Width   uint32
+	Height  uint32
+	Format  uint32 // DXGI_FORMAT
+	Pixels  []byte
+}
+
 // HostDrawPass décrit un appel DrawInstanced rejoué sur le ID3D12Device matériel hôte.
 type HostDrawPass struct {
 	VertexCount   uint32
@@ -38,6 +47,16 @@ type HostDrawPass struct {
 	VBData        []byte
 	VBStride      uint32
 	CBData        []byte
+	SRVTex        *HostTextureUpload
+}
+
+type hostTexEntry struct {
+	res      uintptr
+	width    uint32
+	height   uint32
+	format   uint32
+	srvGPU   uintptr
+	uploaded bool
 }
 
 type d3d12VertexBufferView struct {
@@ -452,13 +471,17 @@ func (h *HostD3D12) initReplayPipeline() {
 	}
 	h.ReplayRootSig = rootSig
 
-	// Heap SRV shader-visible (1 descripteur Texture2D null-descriptor valide pour t0)
-	srvHeapDesc := d3d12DescriptorHeapDesc{Type: 0 /* CBV_SRV_UAV */, NumDescriptors: 1, Flags: 1 /* SHADER_VISIBLE */}
+	// Heap SRV shader-visible (64 descripteurs : slot 0 = null-descriptor par défaut, slots 1..63 = textures 2D hôtes)
+	srvHeapDesc := d3d12DescriptorHeapDesc{Type: 0 /* CBV_SRV_UAV */, NumDescriptors: 64, Flags: 1 /* SHADER_VISIBLE */}
 	if int32(comCall(h.Device, 14, uintptr(unsafe.Pointer(&srvHeapDesc)), uintptr(unsafe.Pointer(&guidID3D12DescriptorHeap[0])), uintptr(unsafe.Pointer(&h.SRVHeap)))) >= 0 && h.SRVHeap != 0 {
 		var cpuStart, gpuStart uintptr
 		_ = comCall(h.SRVHeap, 9, uintptr(unsafe.Pointer(&cpuStart)))  // GetCPUDescriptorHandleForHeapStart
 		_ = comCall(h.SRVHeap, 10, uintptr(unsafe.Pointer(&gpuStart))) // GetGPUDescriptorHandleForHeapStart
+		h.SRVCPUStart = cpuStart
 		h.SRVGPUStart = gpuStart
+		h.SRVStride = comCall(h.Device, 15, 0 /* CBV_SRV_UAV */)
+		h.NextSRVSlot = 1
+		h.TexCache = make(map[uint64]*hostTexEntry)
 		srvDesc := d3d12SRVDesc{
 			Format:                  28,     // R8G8B8A8_UNORM
 			ViewDimension:           4,      // TEXTURE2D
@@ -497,11 +520,105 @@ float4 PSMain(VSOut i) : SV_Target {
 		return
 	}
 	h.ReplayPSO = pso
-	// Buffers dynamiques persistants UPLOAD pour VB (256 KiB) et CB (64 KiB = 64 slots x 1024 B)
+	// Buffers dynamiques persistants UPLOAD pour VB (256 KiB), CB (64 KiB) et Staging Texture (16 MiB)
 	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(256 << 10)
 	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(64 << 10)
-	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS DXBC, RootCBV b0 + SRV t0 + VB)",
+	h.UploadTex, h.UploadTexPtr, _ = h.createUploadBuffer(16 << 20)
+	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS DXBC, RootCBV b0 + SRV t0x64 + VB)",
 		"rootSig", fmt.Sprintf("0x%X", rootSig), "pso", fmt.Sprintf("0x%X", pso))
+}
+
+// ensureHostTexture crée (ou retrouve) une Texture2D hôte + son SRV et planifie son upload si besoin.
+func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
+	if tx == nil || tx.GuestVA == 0 || tx.Width == 0 || tx.Height == 0 || tx.Width > 4096 || tx.Height > 4096 || h.SRVHeap == 0 || h.UploadTex == 0 || h.UploadTexPtr == 0 {
+		return h.SRVGPUStart
+	}
+	if e, ok := h.TexCache[tx.GuestVA]; ok && e.width == tx.Width && e.height == tx.Height {
+		return e.srvGPU
+	}
+	if h.NextSRVSlot >= 64 {
+		return h.SRVGPUStart
+	}
+	// Format RGBA8 par défaut si typeless/non standard
+	fmtID := tx.Format
+	if fmtID != 28 && fmtID != 29 && fmtID != 87 && fmtID != 91 {
+		fmtID = 28 // DXGI_FORMAT_R8G8B8A8_UNORM
+	}
+	rowPitch := ((tx.Width * 4) + 255) &^ 255
+	needBytes := uint64(rowPitch) * uint64(tx.Height)
+	if needBytes > (16 << 20) {
+		return h.SRVGPUStart
+	}
+	heapProps := d3d12HeapProperties{Type: 1 /* DEFAULT */, CreationNodeMask: 1, VisibleNodeMask: 1}
+	texDesc := d3d12ResourceDesc{
+		Dimension:        3, // TEXTURE2D
+		Width:            uint64(tx.Width),
+		Height:           tx.Height,
+		DepthOrArraySize: 1,
+		MipLevels:        1,
+		Format:           fmtID,
+		SampleCount:      1,
+		Layout:           0, // UNKNOWN
+	}
+	var res uintptr
+	if int32(comCall(h.Device, 27,
+		uintptr(unsafe.Pointer(&heapProps)), 0,
+		uintptr(unsafe.Pointer(&texDesc)),
+		0x400, // D3D12_RESOURCE_STATE_COPY_DEST
+		0,
+		uintptr(unsafe.Pointer(&guidID3D12Resource[0])),
+		uintptr(unsafe.Pointer(&res)),
+	)) < 0 || res == 0 {
+		return h.SRVGPUStart
+	}
+
+	// Copie des pixels dans le buffer d'upload staging puis CopyTextureRegion -> PIXEL_SHADER_RESOURCE
+	if len(tx.Pixels) > 0 {
+		dstSlice := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadTexPtr))), 16<<20)
+		srcRow := tx.Width * 4
+		for y := uint32(0); y < tx.Height; y++ {
+			sOff := uintptr(y) * uintptr(srcRow)
+			dOff := uintptr(y) * uintptr(rowPitch)
+			if sOff+uintptr(srcRow) <= uintptr(len(tx.Pixels)) && dOff+uintptr(srcRow) <= uintptr(len(dstSlice)) {
+				copy(dstSlice[dOff:dOff+uintptr(srcRow)], tx.Pixels[sOff:sOff+uintptr(srcRow)])
+			}
+		}
+		dstLoc := d3d12TextureCopyLocation{Resource: res, Type: 0 /* SUBRESOURCE_INDEX */}
+		srcLoc := d3d12TextureCopyLocation{
+			Resource: h.UploadTex,
+			Type:     1, // PLACED_FOOTPRINT
+			Format:   fmtID,
+			Width:    tx.Width,
+			Height:   tx.Height,
+			Depth:    1,
+			RowPitch: rowPitch,
+		}
+		_ = comCall(h.CmdList, 16, uintptr(unsafe.Pointer(&dstLoc)), 0, 0, 0, uintptr(unsafe.Pointer(&srcLoc)), 0)
+	}
+	b := d3d12ResourceBarrier{Resource: res, Subresource: 0xFFFFFFFF, StateBefore: 0x400 /* COPY_DEST */, StateAfter: 0x80 /* PIXEL_SHADER_RESOURCE */}
+	_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b)))
+
+	slot := h.NextSRVSlot
+	h.NextSRVSlot++
+	cpuHandle := h.SRVCPUStart + uintptr(slot)*h.SRVStride
+	gpuHandle := h.SRVGPUStart + uintptr(slot)*h.SRVStride
+	srvDesc := d3d12SRVDesc{
+		Format:                  fmtID,
+		ViewDimension:           4,      // TEXTURE2D
+		Shader4ComponentMapping: 0x1688, // DEFAULT
+		MipLevels:               1,
+	}
+	_ = comCall(h.Device, 18, res, uintptr(unsafe.Pointer(&srvDesc)), cpuHandle)
+	h.TexCache[tx.GuestVA] = &hostTexEntry{
+		res:      res,
+		width:    tx.Width,
+		height:   tx.Height,
+		format:   fmtID,
+		srvGPU:   gpuHandle,
+		uploaded: true,
+	}
+	slog.Info("Host D3D12 Texture2D SRV créée et uploadée", "va", fmt.Sprintf("0x%X", tx.GuestVA), "w", tx.Width, "h", tx.Height, "fmt", fmtID, "slot", slot)
+	return gpuHandle
 }
 
 func (h *HostD3D12) createUploadBuffer(size uint64) (res uintptr, cpuPtr uintptr, gpuVA uint64) {

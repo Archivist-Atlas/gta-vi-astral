@@ -50,6 +50,7 @@ type d3d12xState struct {
 	activeVBSize    uint32
 	activeVBStride  uint32
 	activeRootVA    uintptr
+	activeSRVRes    uintptr
 	frameDraws      []gpu.HostDrawPass
 	lastClearColor  [4]float32
 	hasClearColor   bool
@@ -391,6 +392,24 @@ func newD3D12XDevice() uintptr {
 				pass.CBData = make([]byte, 256)
 				copy(pass.CBData, unsafe.Slice((*byte)(osPtr(st.activeRootVA)), 256))
 			}
+			if st.activeSRVRes != 0 {
+				if d, ok := st.resDescs[st.activeSRVRes]; ok && d.Dimension == 3 && d.Width > 0 && d.Height > 0 && d.Width <= 4096 && d.Height <= 4096 {
+					if va := st.resGPUAddrs[st.activeSRVRes]; va >= 0x10000 {
+						sz := d.Width * uint64(d.Height) * 4
+						if sz > 0 && sz <= (16<<20) {
+							pix := make([]byte, sz)
+							copy(pix, unsafe.Slice((*byte)(osPtr(uintptr(va))), sz))
+							pass.SRVTex = &gpu.HostTextureUpload{
+								GuestVA: va,
+								Width:   uint32(d.Width),
+								Height:  d.Height,
+								Format:  d.Format,
+								Pixels:  pix,
+							}
+						}
+					}
+				}
+			}
 			st.frameDraws = append(st.frameDraws, pass)
 		}
 		st.mu.Unlock()
@@ -507,7 +526,7 @@ func newD3D12XDevice() uintptr {
 			inElems = append(inElems, gpu.HostInputElement{
 				SemanticName:  el.SemanticName,
 				SemanticIndex: el.SemanticIndex,
-				Format:        2, // DXGI_FORMAT_R32G32B32A32_FLOAT
+				Format:        el.DXGIFormat(),
 			})
 		}
 		hPSO, cerr := gpu.CompileHostPSO(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems)
@@ -550,6 +569,9 @@ func newD3D12XDevice() uintptr {
 		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
 			st.mu.Lock()
 			st.activeRootVA = baseDesc
+			if *(*uint32)(osPtr(baseDesc)) == 0x53525631 { // "SRV1" créé par CreateSRV
+				st.activeSRVRes = *(*uintptr)(osPtr(baseDesc + 8))
+			}
 			st.mu.Unlock()
 		}
 		if gpuTrace && c <= 8 {
