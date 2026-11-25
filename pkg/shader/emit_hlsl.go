@@ -53,10 +53,10 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 
 	b.WriteString("// Généré par gta-vi-astral (RDNA2/GFX10 -> HLSL SM 5.0)\n")
 	b.WriteString("cbuffer RootData : register(b0) {\n")
-	b.WriteString("    uint4 RootConst[64];\n")
+	b.WriteString("    uint4 RootConst[1024];\n")
 	b.WriteString("};\n")
 	b.WriteString("uint _readCB(uint byteOff) {\n")
-	b.WriteString("    uint idx = (byteOff >> 4) & 63u;\n")
+	b.WriteString("    uint idx = (byteOff >> 4) & 1023u;\n")
 	b.WriteString("    uint comp = (byteOff >> 2) & 3u;\n")
 	b.WriteString("    uint4 v4 = RootConst[idx];\n")
 	b.WriteString("    return (comp == 0u) ? v4.x : (comp == 1u) ? v4.y : (comp == 2u) ? v4.z : v4.w;\n")
@@ -530,9 +530,9 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 		if vdst >= 64 {
 			return "", false
 		}
-		s0u := gfx10SrcU32(src0, 0, false)
-		s1u := gfx10SrcU32(src1, 0, false)
-		s2u := gfx10SrcU32(src2, 0, false)
+		s0u := gfx10SrcU32(src0, gi.Literal, gi.HasLit)
+		s1u := gfx10SrcU32(src1, gi.Literal, gi.HasLit)
+		s2u := gfx10SrcU32(src2, gi.Literal, gi.HasLit)
 		s0f := fmt.Sprintf("asfloat(%s)", s0u)
 		s1f := fmt.Sprintf("asfloat(%s)", s1u)
 		s2f := fmt.Sprintf("asfloat(%s)", s2u)
@@ -541,8 +541,12 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 			return fmt.Sprintf("v[%d] = asuint(%s * %s + %s);", vdst, s0f, s1f, s2f), true
 		case 0x169: // v_mul_lo_u32
 			return fmt.Sprintf("v[%d] = (%s * %s);", vdst, s0u, s1u), true
-		case 0x151: // v_med3_f32
+		case 0x157: // v_med3_f32 (GFX10)
 			return fmt.Sprintf("v[%d] = asuint(clamp(%s, min(%s, %s), max(%s, %s)));", vdst, s0f, s1f, s2f, s1f, s2f), true
+		case 0x150, 0x151: // v_min3_f32 (GFX9/GFX10)
+			return fmt.Sprintf("v[%d] = asuint(min(min(%s, %s), %s));", vdst, s0f, s1f, s2f), true
+		case 0x153, 0x154: // v_max3_f32 (GFX9/GFX10)
+			return fmt.Sprintf("v[%d] = asuint(max(max(%s, %s), %s));", vdst, s0f, s1f, s2f), true
 		case 0x148: // v_bfe_u32
 			return fmt.Sprintf("v[%d] = ((%s >> (%s & 31u)) & ((1u << (%s & 31u)) - 1u));", vdst, s0u, s1u, s2u), true
 		case 0x14A: // v_bfi_b32
@@ -573,10 +577,6 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 			return fmt.Sprintf("v[%d] = (%s + %s);", vdst, s0u, s1u), true
 		case 0x126, 0x210: // v_sub_nc_u32 / v_sub_co_u32
 			return fmt.Sprintf("v[%d] = (%s - %s);", vdst, s0u, s1u), true
-		case 0x150: // v_min3_f32
-			return fmt.Sprintf("v[%d] = asuint(min(min(%s, %s), %s));", vdst, s0f, s1f, s2f), true
-		case 0x153: // v_max3_f32
-			return fmt.Sprintf("v[%d] = asuint(max(max(%s, %s), %s));", vdst, s0f, s1f, s2f), true
 		case 0x156: // v_alignbit_b32
 			return fmt.Sprintf("v[%d] = ((%s << (32u - (%s & 31u))) | (%s >> (%s & 31u)));", vdst, s0u, s2u, s1u, s2u), true
 		case 0x36D: // v_add3_u32
@@ -746,6 +746,9 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 	case EncMUBUF:
 		op := (w0 >> 18) & 0x7F
 		off := w0 & 0xFFF
+		offen := (w0 >> 12) & 1
+		idxen := (w0 >> 13) & 1
+		vaddr := w1 & 0xFF
 		vdata := (w1 >> 8) & 0xFF
 		count := uint32(0)
 		switch op {
@@ -759,10 +762,23 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 			count = 4
 		}
 		if count > 0 && vdata+count <= 64 {
-			var parts []string
-			for i := uint32(0); i < count; i++ {
-				parts = append(parts, fmt.Sprintf("v[%d] = _readCB(%du);", vdata+i, off+i*4))
+			var addrExpr string
+			switch {
+			case idxen != 0 && offen == 0 && vaddr < 64:
+				addrExpr = fmt.Sprintf("(v[%d] * 16u + %du)", vaddr, off)
+			case offen != 0 && idxen == 0 && vaddr < 64:
+				addrExpr = fmt.Sprintf("(v[%d] + %du)", vaddr, off)
+			case idxen != 0 && offen != 0 && vaddr+1 < 64:
+				addrExpr = fmt.Sprintf("(v[%d] * 16u + v[%d] + %du)", vaddr, vaddr+1, off)
+			default:
+				addrExpr = fmt.Sprintf("%du", off)
 			}
+			var parts []string
+			parts = append(parts, fmt.Sprintf("{ uint _mOff = %s;", addrExpr))
+			for i := uint32(0); i < count; i++ {
+				parts = append(parts, fmt.Sprintf("v[%d] = _readCB(_mOff + %du);", vdata+i, i*4))
+			}
+			parts = append(parts, "}")
 			return strings.Join(parts, " "), true
 		}
 		if isCS && (op >= 0x18 && op <= 0x1B) && vdata < 64 { // buffer_store_dword*

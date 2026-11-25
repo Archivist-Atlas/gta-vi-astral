@@ -585,10 +585,10 @@ float4 PSMain(VSOut i) : SV_Target {
 		return
 	}
 	h.ReplayPSO = pso
-	// Buffers dynamiques persistants UPLOAD pour VB (256 KiB), IB (256 KiB), CB (64 KiB) et Staging Texture (16 MiB)
-	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(256 << 10)
-	h.UploadIB, h.UploadIBPtr, h.UploadIBGPU = h.createUploadBuffer(256 << 10)
-	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(64 << 10)
+	// Buffers dynamiques persistants UPLOAD pour VB (4 MiB), IB (4 MiB), CB (1 MiB = 64x16 KiB) et Staging Texture (16 MiB)
+	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(4 << 20)
+	h.UploadIB, h.UploadIBPtr, h.UploadIBGPU = h.createUploadBuffer(4 << 20)
+	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(1 << 20)
 	h.UploadTex, h.UploadTexPtr, _ = h.createUploadBuffer(16 << 20)
 	h.initComputePipeline()
 	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS+CS DXBC, RootCBV b0 + SRV t0x64 + UAV u0 + VB/IB)",

@@ -4,7 +4,10 @@ package gpu
 
 import (
 	"fmt"
+	"image"
+	"image/png"
 	"log/slog"
+	"os"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -110,10 +113,14 @@ type HostD3D12 struct {
 	SRVHeap        uintptr
 	SRVCPUStart   uintptr
 	SRVGPUStart   uintptr
-	SRVStride     uintptr
-	NextSRVSlot   uint32
-	TexCache      map[uint64]*hostTexEntry
-	Ready         bool
+	SRVStride       uintptr
+	NextSRVSlot     uint32
+	TexCache        map[uint64]*hostTexEntry
+	ReadbackBuf     uintptr
+	ReadbackPtr     uintptr
+	ReadbackPitch   uint32
+	introFrameCount uint32
+	Ready           bool
 }
 
 var (
@@ -363,6 +370,27 @@ func (h *HostD3D12) initPresentPipeline() {
 		}
 	}
 
+	// 5. Buffer READBACK optionnel pour capture d'écran (ASTRAL_SCREENSHOT=1)
+	if os.Getenv("ASTRAL_SCREENSHOT") == "1" {
+		rbHeap := d3d12HeapProperties{Type: 3 /* READBACK */, CreationNodeMask: 1, VisibleNodeMask: 1}
+		var rbBuf uintptr
+		if int32(comCall(h.Device, 27,
+			uintptr(unsafe.Pointer(&rbHeap)), 0,
+			uintptr(unsafe.Pointer(&bufDesc)),
+			0x400, // D3D12_RESOURCE_STATE_COPY_DEST
+			0,
+			uintptr(unsafe.Pointer(&guidID3D12Resource[0])),
+			uintptr(unsafe.Pointer(&rbBuf)),
+		)) >= 0 && rbBuf != 0 {
+			var rbMapped uintptr
+			if int32(comCall(rbBuf, 8, 0, 0, uintptr(unsafe.Pointer(&rbMapped)))) >= 0 && rbMapped != 0 {
+				h.ReadbackBuf = rbBuf
+				h.ReadbackPtr = rbMapped
+				h.ReadbackPitch = pitch
+			}
+		}
+	}
+
 	h.initReplayPipeline()
 	h.Ready = true
 }
@@ -464,8 +492,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 						continue
 					}
 					if h.UploadCBPtr != 0 && h.UploadCBGPU != 0 {
-						cbSlot := uint64((idxCS+32)%64) * 1024
-						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 64<<10)[cbSlot : cbSlot+1024]
+						cbSlot := uint64((idxCS+32)%64) * 16384
+						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 1<<20)[cbSlot : cbSlot+16384]
 						clear(dstCB)
 						if len(cs.CBData) > 0 {
 							copy(dstCB, cs.CBData)
@@ -504,6 +532,13 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 					_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart) // SetGraphicsRootDescriptorTable(param=1, t0)
 				}
 				total := uint32(len(draws))
+				hasRealPSO := false
+				for _, d := range draws {
+					if d.HostPSO != 0 {
+						hasRealPSO = true
+						break
+					}
+				}
 				vbOff := uint64(0)
 				ibOff := uint64(0)
 				for idxPass, d := range draws {
@@ -512,6 +547,9 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 					}
 					pso := d.HostPSO
 					if pso == 0 {
+						if hasRealPSO {
+							continue
+						}
 						pso = h.ReplayPSO
 					}
 					if d.SRVTex != nil {
@@ -529,10 +567,10 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 					}
 					_ = comCall(h.CmdList, 20, uintptr(topo)) // IASetPrimitiveTopology
 					_ = comCall(h.CmdList, 25, pso)           // SetPipelineState
-					// Upload Constant Buffer (1024 octets alignés sur 256 octets, slot = idxPass % 64)
+					// Upload Constant Buffer (16 KiB alignés sur 256 octets, slot = idxPass % 64)
 					if h.UploadCBPtr != 0 && h.UploadCBGPU != 0 {
-						cbSlot := uint64(idxPass%64) * 1024
-						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 64<<10)[cbSlot : cbSlot+1024]
+						cbSlot := uint64(idxPass%64) * 16384
+						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 1<<20)[cbSlot : cbSlot+16384]
 						clear(dstCB)
 						if len(d.CBData) > 0 {
 							copy(dstCB, d.CBData)
@@ -579,8 +617,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 					// Upload Vertex Buffer si fourni par le titre
 					if len(drawVB) > 0 && d.VBStride > 0 && h.UploadVBPtr != 0 && h.UploadVBGPU != 0 {
 						nBytes := uint64(len(drawVB))
-						if vbOff+nBytes <= (256 << 10) {
-							dstVB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadVBPtr))), 256<<10)[vbOff : vbOff+nBytes]
+						if vbOff+nBytes <= (4 << 20) {
+							dstVB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadVBPtr))), 4<<20)[vbOff : vbOff+nBytes]
 							copy(dstVB, drawVB)
 							vbv := d3d12VertexBufferView{
 								BufferLocation: h.UploadVBGPU + vbOff,
@@ -594,8 +632,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 					}
 					if d.Indexed && len(d.IBData) > 0 && h.UploadIBPtr != 0 && h.UploadIBGPU != 0 {
 						nBytes := uint64(len(d.IBData))
-						if ibOff+nBytes <= (256 << 10) {
-							dstIB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadIBPtr))), 256<<10)[ibOff : ibOff+nBytes]
+						if ibOff+nBytes <= (4 << 20) {
+							dstIB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadIBPtr))), 4<<20)[ibOff : ibOff+nBytes]
 							copy(dstIB, d.IBData)
 							ibFmt := d.IBFormat
 							if ibFmt != 57 && ibFmt != 42 {
@@ -618,8 +656,32 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 				}
 			}
 
-			b2 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x4 /* RENDER_TARGET */, StateAfter: 0 /* PRESENT */}
-			_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b2)))
+			wantSnap := false
+			if h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && len(draws) >= 8 {
+				h.introFrameCount++
+				if h.introFrameCount == 1 || h.introFrameCount == 45 {
+					wantSnap = true
+					bSnap1 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x4 /* RENDER_TARGET */, StateAfter: 0x800 /* COPY_SOURCE */}
+					_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&bSnap1)))
+					dstLoc := d3d12TextureCopyLocation{
+						Resource: h.ReadbackBuf,
+						Type:     1, // PLACED_FOOTPRINT
+						Format:   28,
+						Width:    h.Width,
+						Height:   h.Height,
+						Depth:    1,
+						RowPitch: h.ReadbackPitch,
+					}
+					srcLoc := d3d12TextureCopyLocation{Resource: bb, Type: 0 /* SUBRESOURCE_INDEX */}
+					_ = comCall(h.CmdList, 16, uintptr(unsafe.Pointer(&dstLoc)), 0, 0, 0, uintptr(unsafe.Pointer(&srcLoc)), 0)
+					bSnap2 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x800 /* COPY_SOURCE */, StateAfter: 0 /* PRESENT */}
+					_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&bSnap2)))
+				}
+			}
+			if !wantSnap {
+				b2 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x4 /* RENDER_TARGET */, StateAfter: 0 /* PRESENT */}
+				_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b2)))
+			}
 		}
 
 		_ = comCall(h.CmdList, 9) // Close
@@ -627,10 +689,72 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 		_ = comCall(h.Queue, 10, 1, uintptr(unsafe.Pointer(&lists[0]))) // ExecuteCommandLists
 		_ = comCall(h.SwapChain, 8, uintptr(syncInterval), 0)           // Present
 		h.waitGPU()
+		if h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && (h.introFrameCount == 1 || h.introFrameCount == 45) && len(draws) >= 8 {
+			h.saveReadbackPNG(fmt.Sprintf("%s\\astral_intro_%d.png", os.TempDir(), h.introFrameCount))
+		}
 		return
 	}
 
 	_ = comCall(h.SwapChain, 8, uintptr(syncInterval), 0)
+}
+
+func (h *HostD3D12) saveReadbackPNG(path string) {
+	if h.ReadbackPtr == 0 || h.Width == 0 || h.Height == 0 || h.ReadbackPitch == 0 {
+		return
+	}
+	w, ht := int(h.Width), int(h.Height)
+	pitch := int(h.ReadbackPitch)
+	src := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.ReadbackPtr))), pitch*ht)
+	img := image.NewRGBA(image.Rect(0, 0, w, ht))
+	nonBlack := 0
+	nonBlue := 0
+	var minR, maxR, minG, maxG, minB, maxB byte = 255, 0, 255, 0, 255, 0
+	for y := 0; y < ht; y++ {
+		sRow := src[y*pitch : y*pitch+w*4]
+		dRow := img.Pix[y*img.Stride : y*img.Stride+w*4]
+		copy(dRow, sRow)
+		for x := 0; x < w*4; x += 4 {
+			r, g, b := sRow[x], sRow[x+1], sRow[x+2]
+			dRow[x+3] = 255
+			if r > 4 || g > 4 || b > 4 {
+				nonBlack++
+			}
+			if r > 40 || g > 40 || b > 60 {
+				nonBlue++
+			}
+			if r < minR {
+				minR = r
+			}
+			if r > maxR {
+				maxR = r
+			}
+			if g < minG {
+				minG = g
+			}
+			if g > maxG {
+				maxG = g
+			}
+			if b < minB {
+				minB = b
+			}
+			if b > maxB {
+				maxB = b
+			}
+		}
+	}
+	f, err := os.Create(path)
+	if err == nil {
+		_ = png.Encode(f, img)
+		_ = f.Close()
+	}
+	slog.Info("ASTRAL_SCREENSHOT sauvegardée",
+		"path", path,
+		"w", w, "h", ht,
+		"nonBlack", nonBlack,
+		"bright", nonBlue,
+		"rgbMin", fmt.Sprintf("%d,%d,%d", minR, minG, minB),
+		"rgbMax", fmt.Sprintf("%d,%d,%d", maxR, maxG, maxB),
+	)
 }
 
 // Present présente la trame courante sur la SwapChain DXGI hôte.
