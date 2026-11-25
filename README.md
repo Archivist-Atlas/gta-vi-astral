@@ -27,6 +27,16 @@ Progression globale : [████████████░░░░░░░
 | **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `58 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10 (**littéraux 32-bit `VOP2`/`VOP3` 12 octets**), IR SSA, `ISG1`/`OSG1`, recompilation live RDNA2 -> HLSL **VS/PS (100 % de couverture sur les PSOs UI Scaleform : `31/31`, `37/37`, `45/45` ins) & Compute (`cs_5_0`)** avec **`MUBUF` indexé dynamique (`idxen`/`offen`), `v_med3_f32` (`0x157`), `RootConst[1024]` (16 KiB)** et CFG `SOPP`. | Masque `EXEC` par lane, descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), compilation asynchrone. |
 | **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `58 %` | Fenêtre Win32 unique, vtables COM partagées O(1), `ID3D12Device` matériel + `SwapChain3`, `PresentX` à 30 fps (1 080+ frames, 8 900+ draws, 830+ `Dispatch`), **premiers vrais pixels d'intro GTA VI affichés et vérifiés par readback PNG (`ASTRAL_SCREENSHOT=1`)**, buffers **VB/IB 4 MiB + CB 1 MiB (64×16 KiB)**, alpha blending, expansion **`RECTLIST`**, pipeline Compute (`UAV` 1 Mo), `CreatePlacedSRV` (`SRV2`) + détuilage RDNA2. | Render targets intermédiaires (G-Buffer/ombres/post-process), `ExecuteIndirect`, BVH4. |
 
+## Captures d'avancement
+
+Les captures d'écran illustrant les jalons techniques sont stockées dans [`docs/screenshots/`](docs/screenshots/).
+
+### Premiers vrais pixels d'intro (UI Scaleform recompilée RDNA2 -> HLSL -> D3D12)
+
+![Premiers vrais pixels d'intro — Sélecteur de profil](docs/screenshots/01-premiers-pixels-intro.png)
+
+*Premier rendu visuel natif dans la fenêtre `gta-vi-astral` : interface Scaleform (`SÉLECTEUR DE PROFIL (Y)`) recompilée à 100 % depuis les shaders RDNA2 en HLSL SM 5.0 et exécutée sur GPU Windows D3D12.*
+
 ## Pourquoi ASTRAL ?
 
 **gta-vi-astral** synthétise en Go les meilleures idées architecturales de deux projets de référence :
