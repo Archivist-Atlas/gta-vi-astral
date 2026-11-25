@@ -296,39 +296,52 @@ func newD3D12XDevice() uintptr {
 		gpu.PresentHostFrame(0, clr, nil, 0, 0, 0, draws...)
 		return hresultOK
 	})
+	// Vtables partagées O(1) pour Queue, Allocator, DescriptorHeap, Resource, PSO et enfants génériques
+	// (évite la limite de 2000 syscall.NewCallback du runtime Go lorsque le jeu crée des milliers de ressources).
+	queueProto := NewCOMObjectWithHeader("ID3D12CommandQueueX", 48, 0x40, map[int]uintptr{
+		3:  cbOK, // GetPrivateData
+		4:  cbOK, // SetPrivateData
+		5:  cbOK, // SetPrivateDataInterface
+		6:  cbOK, // SetName
+		7:  cbGetDevice,
+		10: cbQueueExecuteLists,  // ExecuteCommandLists
+		14: cbQueueSignal,        // Signal (2020)
+		15: cbOK,                 // Wait (2020)
+		16: cbQueueSignal,        // Signal (2026, 0x80)
+		17: cbOK,                 // Wait (2026, 0x88)
+		18: cbQueueTimestampFreq, // GetTimestampFrequency (2026, 0x90)
+		23: cbOK,                 // SuspendX (0xB8)
+		24: cbOK,                 // ResumeX (0xC0)
+		29: cbOK,                 // CopyPageMappingsBatchX (2020)
+		30: cbQueuePresentX,      // PresentX (2020, 0xF0)
+		31: cbOK,                 // CopyPageMappingsBatchX (2026, 0xF8)
+		32: cbQueuePresentX,      // PresentX (2026, 0x100)
+		33: cbQueueExecuteLists,  // ExecuteCommandListsX (2020)
+		34: cbQueueSignal,        // Signal2X (2026, 0x110)
+		35: cbQueueExecuteLists,  // ExecuteCommandListsX (2026, 0x118)
+	})
+	queueVtable := *(*uintptr)(osPtr(queueProto))
 	newQueue := func() uintptr {
 		st.queuesCreated.Add(1)
-		// Layout ID3D12CommandQueueX 2026 (GTA VI) : slots >= 14 décalés de +2 (VIctory queue.rs)
-		return NewCOMObjectWithHeader("ID3D12CommandQueueX", 48, 0x40, map[int]uintptr{
-			3:  cbOK, // GetPrivateData
-			4:  cbOK, // SetPrivateData
-			5:  cbOK, // SetPrivateDataInterface
-			6:  cbOK, // SetName
-			7:  cbGetDevice,
-			10: cbQueueExecuteLists,  // ExecuteCommandLists
-			14: cbQueueSignal,        // Signal (2020)
-			15: cbOK,                 // Wait (2020)
-			16: cbQueueSignal,        // Signal (2026, 0x80)
-			17: cbOK,                 // Wait (2026, 0x88)
-			18: cbQueueTimestampFreq, // GetTimestampFrequency (2026, 0x90)
-			23: cbOK,                 // SuspendX (0xB8)
-			24: cbOK,                 // ResumeX (0xC0)
-			29: cbOK,                 // CopyPageMappingsBatchX (2020)
-			30: cbQueuePresentX,      // PresentX (2020, 0xF0)
-			31: cbOK,                 // CopyPageMappingsBatchX (2026, 0xF8)
-			32: cbQueuePresentX,      // PresentX (2026, 0x100)
-			33: cbQueueExecuteLists,  // ExecuteCommandListsX (2020)
-			34: cbQueueSignal,        // Signal2X (2026, 0x110)
-			35: cbQueueExecuteLists,  // ExecuteCommandListsX (2026, 0x118)
-		})
+		mem, _, _ := k32VirtualAlloc.Call(0, 0x40, 0x3000, 0x04)
+		if mem != 0 {
+			*(*uintptr)(osPtr(mem)) = queueVtable
+		}
+		return mem
 	}
 
+	allocProto := NewCOMObject("ID3D12CommandAllocatorX", 16, map[int]uintptr{
+		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
+		8: cbOK, // Reset
+		9: cbOK, // ResetX / Free
+	})
+	allocVtable := *(*uintptr)(osPtr(allocProto))
 	newAllocator := func() uintptr {
-		return NewCOMObject("ID3D12CommandAllocatorX", 16, map[int]uintptr{
-			3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
-			8: cbOK, // Reset
-			9: cbOK, // ResetX / Free
-		})
+		mem, _, _ := k32VirtualAlloc.Call(0, 0x20, 0x3000, 0x04)
+		if mem != 0 {
+			*(*uintptr)(osPtr(mem)) = allocVtable
+		}
+		return mem
 	}
 
 	// Vtable partagée pour toutes les ID3D12GraphicsCommandListX (GTA VI en crée 581+ au boot).
@@ -705,6 +718,25 @@ func newD3D12XDevice() uintptr {
 		return mem
 	}
 
+	// Vtable partagée pour ID3D12DescriptorHeapX
+	descHeapProto := NewCOMObject("ID3D12DescriptorHeapX", 16, map[int]uintptr{
+		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
+		// Xbox ABI : slots 9 et 10 retournent le handle 8 octets directement dans RAX !
+		9: syscall.NewCallback(func(this uintptr) uintptr { // GetCPUDescriptorHandleForHeapStart
+			st.mu.Lock()
+			b := st.heapBases[this]
+			st.mu.Unlock()
+			return uintptr(b)
+		}),
+		10: syscall.NewCallback(func(this uintptr) uintptr { // GetGPUDescriptorHandleForHeapStart
+			st.mu.Lock()
+			b := st.heapBases[this]
+			st.mu.Unlock()
+			return uintptr(b)
+		}),
+	})
+	descHeapVtable := *(*uintptr)(osPtr(descHeapProto))
+
 	newDescriptorHeap := func(descPtr uintptr) uintptr {
 		st.heapsCreated.Add(1)
 		// D3D12_DESCRIPTOR_HEAP_DESC : { Type u32, NumDescriptors u32, Flags u32, NodeMask u32 }
@@ -741,43 +773,65 @@ func newD3D12XDevice() uintptr {
 				baseAddr = uintptr(st.nextHeapBase.Add(0x1000000))
 			}
 		}
-		var obj uintptr
-		obj = NewCOMObject("ID3D12DescriptorHeapX", 16, map[int]uintptr{
-			3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
-			// Xbox ABI : slots 9 et 10 retournent le handle 8 octets directement dans RAX !
-			9: syscall.NewCallback(func(this uintptr) uintptr { // GetCPUDescriptorHandleForHeapStart
-				st.mu.Lock()
-				b := st.heapBases[this]
-				st.mu.Unlock()
-				return uintptr(b)
-			}),
-			10: syscall.NewCallback(func(this uintptr) uintptr { // GetGPUDescriptorHandleForHeapStart
-				st.mu.Lock()
-				b := st.heapBases[this]
-				st.mu.Unlock()
-				return uintptr(b)
-			}),
-		})
-		st.mu.Lock()
-		st.heapBases[obj] = uint64(baseAddr)
-		st.mu.Unlock()
+		obj, _, _ := k32VirtualAlloc.Call(0, 0x20, 0x3000, 0x04)
+		if obj != 0 {
+			*(*uintptr)(osPtr(obj)) = descHeapVtable
+			st.mu.Lock()
+			st.heapBases[obj] = uint64(baseAddr)
+			st.mu.Unlock()
+		}
 		return obj
 	}
+
+	// Vtable partagée pour ID3D12ResourceX (0 callback alloué par ressource)
+	resProto := NewCOMObject("ID3D12ResourceX", 24, map[int]uintptr{
+		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
+		8: syscall.NewCallback(func(this, subres, readRange, outDataPtr uintptr) uintptr { // Map
+			st.mu.Lock()
+			va := st.resGPUAddrs[this]
+			st.mu.Unlock()
+			if outDataPtr != 0 {
+				*(*uintptr)(osPtr(outDataPtr)) = uintptr(va)
+			}
+			return hresultOK
+		}),
+		9: cbOK, // Unmap
+		10: syscall.NewCallback(func(a0, a1 uintptr) uintptr { // GetDesc (struct return 56 bytes)
+			st.mu.Lock()
+			_, isA0 := st.resGPUAddrs[a0]
+			var thisObj, outPtr uintptr
+			if isA0 {
+				thisObj, outPtr = a0, a1
+			} else {
+				thisObj, outPtr = a1, a0
+			}
+			d := st.resDescs[thisObj]
+			st.mu.Unlock()
+			if outPtr >= 0x10000 {
+				*(*xgResourceDesc)(osPtr(outPtr)) = d
+			}
+			return outPtr
+		}),
+		11: syscall.NewCallback(func(this uintptr) uintptr { // GetGPUVirtualAddress
+			st.mu.Lock()
+			va := st.resGPUAddrs[this]
+			st.mu.Unlock()
+			return uintptr(va)
+		}),
+	})
+	resVtable := *(*uintptr)(osPtr(resProto))
 
 	newResource := func(gpuVA uint64, descPtr uintptr) uintptr {
 		st.resCreated.Add(1)
 		// D3D12_RESOURCE_DESC : { Dimension u32 (+0), Alignment u64 (+8), Width u64 (+16), Height u32 (+24), ... }
-		var descCopy [56]byte
+		var desc xgResourceDesc
 		allocBytes := uintptr(4 << 20) // 4 MiB par défaut
 		if descPtr != 0 {
-			copy(descCopy[:], unsafe.Slice((*byte)(osPtr(descPtr)), 56))
-			dim := *(*uint32)(osPtr(descPtr))
-			width := *(*uint64)(osPtr(descPtr + 16))
-			height := uint64(*(*uint32)(osPtr(descPtr + 24)))
-			if dim == 1 && width > 0 && width <= (512<<20) { // D3D12_RESOURCE_DIMENSION_BUFFER
-				allocBytes = uintptr((width + 4095) &^ 4095)
-			} else if dim == 3 && width > 0 && height > 0 { // D3D12_RESOURCE_DIMENSION_TEXTURE2D
-				s := width * height * 4
+			desc = *(*xgResourceDesc)(osPtr(descPtr))
+			if desc.Dimension == 1 && desc.Width > 0 && desc.Width <= (512<<20) { // BUFFER
+				allocBytes = uintptr((desc.Width + 4095) &^ 4095)
+			} else if desc.Dimension == 3 && desc.Width > 0 && desc.Height > 0 { // TEXTURE2D
+				s := desc.Width * uint64(desc.Height) * 4
 				if s < 65536 {
 					s = 65536
 				}
@@ -810,62 +864,42 @@ func newD3D12XDevice() uintptr {
 				gpuVA = st.nextGPUAddr.Add(0x100000)
 			}
 		}
-		var obj uintptr
-		obj = NewCOMObject("ID3D12ResourceX", 24, map[int]uintptr{
-			3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
-			8: syscall.NewCallback(func(this, subres, readRange, outDataPtr uintptr) uintptr { // Map
-				st.mu.Lock()
-				va := st.resGPUAddrs[this]
-				st.mu.Unlock()
-				slog.Debug("ID3D12ResourceX!Map", "va", fmt.Sprintf("0x%X", va))
-				if outDataPtr != 0 {
-					*(*uintptr)(osPtr(outDataPtr)) = uintptr(va)
-				}
-				return hresultOK
-			}),
-			9: cbOK, // Unmap
-			10: syscall.NewCallback(func(a0, a1 uintptr) uintptr { // GetDesc (struct return 56 bytes)
-				slog.Debug("ID3D12ResourceX!GetDesc")
-				outPtr := a1
-				if a0 != obj && a0 != 0 {
-					outPtr = a0
-				}
-				if outPtr != 0 {
-					dst := unsafe.Slice((*byte)(osPtr(outPtr)), 56)
-					copy(dst, descCopy[:])
-				}
-				return outPtr
-			}),
-			11: syscall.NewCallback(func(this uintptr) uintptr { // GetGPUVirtualAddress
-				st.mu.Lock()
-				va := st.resGPUAddrs[this]
-				st.mu.Unlock()
-				slog.Debug("ID3D12ResourceX!GetGPUVirtualAddress", "va", fmt.Sprintf("0x%X", va))
-				return uintptr(va)
-			}),
-		})
-		st.mu.Lock()
-		st.resGPUAddrs[obj] = gpuVA
-		if descPtr != 0 {
-			st.resDescs[obj] = *(*xgResourceDesc)(osPtr(descPtr))
+		obj, _, _ := k32VirtualAlloc.Call(0, 0x20, 0x3000, 0x04)
+		if obj != 0 {
+			*(*uintptr)(osPtr(obj)) = resVtable
+			st.mu.Lock()
+			st.resGPUAddrs[obj] = gpuVA
+			st.resDescs[obj] = desc
+			st.mu.Unlock()
 		}
-		st.mu.Unlock()
 		return obj
 	}
 
+	genericChildProto := NewCOMObject("ID3D12DeviceChildX", 24, map[int]uintptr{
+		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
+	})
+	genericChildVtable := *(*uintptr)(osPtr(genericChildProto))
 	newGenericChild := func(area string) uintptr {
-		return NewCOMObject(area, 24, map[int]uintptr{
-			3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
-		})
+		obj, _, _ := k32VirtualAlloc.Call(0, 0x20, 0x3000, 0x04)
+		if obj != 0 {
+			*(*uintptr)(osPtr(obj)) = genericChildVtable
+		}
+		return obj
 	}
 
+	psoProto := NewCOMObjectWithHeader("ID3D12PipelineStateX", 16, 0x40, map[int]uintptr{
+		3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
+		8: cbOK, // GetCachedBlob
+	})
+	psoVtable := *(*uintptr)(osPtr(psoProto))
 	newPipelineState := func() uintptr {
 		st.psoCreated.Add(1)
 		// En-tête 0x40 octets mis à zéro (16 octets Object + 32 octets paquet inline Xbox)
-		return NewCOMObjectWithHeader("ID3D12PipelineStateX", 16, 0x40, map[int]uintptr{
-			3: cbOK, 4: cbOK, 5: cbOK, 6: cbOK, 7: cbGetDevice,
-			8: cbOK, // GetCachedBlob
-		})
+		obj, _, _ := k32VirtualAlloc.Call(0, 0x40, 0x3000, 0x04)
+		if obj != 0 {
+			*(*uintptr)(osPtr(obj)) = psoVtable
+		}
+		return obj
 	}
 
 	// --- Callbacks des slots ID3D12DeviceX ---
@@ -943,15 +977,23 @@ func newD3D12XDevice() uintptr {
 		if streamDesc >= 0x10000 {
 			sz := *(*uint64)(osPtr(streamDesc + 0))
 			sub := *(*uintptr)(osPtr(streamDesc + 8))
-			if sub >= 0x10000 && sz >= 16 && sz <= 4096 {
+			if sub >= 0x10000 && sz >= 24 && sz <= 4096 {
 				q := unsafe.Slice((*uint64)(osPtr(sub)), sz/8)
 				gp := &guestPSO{}
-				for i := 0; i < len(q) && i < 32; i++ {
-					if q[i] >= 0x10000 && q[i] < 0x800000000000 && i+1 < len(q) && q[i+1] >= 32 && q[i+1] <= (16<<20) {
-						if h, ok := storeDXBCBlob(uintptr(q[i]), q[i+1]); ok {
-							if !gp.hasVS {
+				// Un subobject shader dans D3D12_PIPELINE_STATE_STREAM_DESC est précédé de son tag u32
+				// (1=VS, 2=PS) aligné sur 8 octets, suivi de { pShaderBytecode u64, BytecodeLength u64 }.
+				for i := 1; i+1 < len(q) && i < 32; i++ {
+					tag := uint32(q[i-1])
+					if tag != 1 && tag != 2 {
+						continue
+					}
+					ptrVal := q[i]
+					lenVal := q[i+1]
+					if ptrVal >= 0x10000 && ptrVal < 0x800000000000 && (ptrVal&3) == 0 && lenVal >= 32 && lenVal <= (16<<20) {
+						if h, ok := storeDXBCBlob(uintptr(ptrVal), lenVal); ok {
+							if tag == 1 && !gp.hasVS {
 								gp.vsHash, gp.hasVS = h, true
-							} else if !gp.hasPS {
+							} else if tag == 2 && !gp.hasPS {
 								gp.psHash, gp.hasPS = h, true
 							}
 						}

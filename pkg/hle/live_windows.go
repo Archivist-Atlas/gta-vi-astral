@@ -566,8 +566,19 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		return putStr("QVNUUkFMIG9mZmxpbmUgZGV2aWNlIGlkZW50aXR5ISE=", size, bufPtr, usedPtr)
 	})
 
+	const offlineUserHandle uintptr = 0x0000A57A00000001
+	const offlineUserXUID uint64 = 0x0009000001234567
+
 	gdkProviders := map[string]uintptr{
 		"{073B7DCB-1FCF-4030-94BE-E3C9EB623428}": NewCOMObject("xasync", 64, map[int]uintptr{
+			3:  cbGISuccess,       // 0x18 XAsyncGetStatus -> S_OK
+			4:  syscall.NewCallback(func(this, block, outSize uintptr) uintptr { // 0x20 XAsyncGetResultSize
+				if outSize >= 0x10000 {
+					*(*uintptr)(osPtr(outSize)) = 0
+				}
+				return hresultOK
+			}),
+			5:  cbGISuccess,       // 0x28 XAsyncCancel
 			12: cbTaskQueueCreate, // 0x60 XTaskQueueCreate
 			13: cbTaskQueueCreate, // 0x68 XTaskQueueCreateComposite
 			14: syscall.NewCallback(func(this, q, outPtr uintptr) uintptr { // 0x70 XTaskQueueDuplicateHandle
@@ -585,9 +596,150 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			16: cbRegisterToken5,      // 0x80 RegisterConnectivityHintChanged
 			17: cbReturnTrue,          // 0x88 UnregisterConnectivityHintChanged
 		}),
+		"{3E241977-6237-41E9-8559-102C2D9983F1}": NewCOMObject("xaccessibility", 24, map[int]uintptr{
+			3: syscall.NewCallback(func(this, outProps uintptr) uintptr { // XClosedCaptionGetProperties
+				if outProps >= 0x10000 {
+					clear(unsafe.Slice((*byte)(osPtr(outProps)), 40))
+				}
+				return hresultOK
+			}),
+			4: cbGISuccess, // XClosedCaptionSetEnabled
+			5: syscall.NewCallback(func(this, outMode uintptr) uintptr { // XHighContrastGetMode
+				if outMode >= 0x10000 {
+					*(*uint32)(osPtr(outMode)) = 0 // Off
+				}
+				return hresultOK
+			}),
+		}),
 		"{01ACD177-91F9-4763-A38E-CCBB55CE32E0}": NewCOMObject("xuser", 64, map[int]uintptr{
+			3: syscall.NewCallback(func(this, user, outPtr uintptr) uintptr { // XUserDuplicateHandle
+				if outPtr >= 0x10000 {
+					if user == 0 {
+						user = offlineUserHandle
+					}
+					*(*uintptr)(osPtr(outPtr)) = user
+				}
+				return hresultOK
+			}),
+			4: cbGISuccess, // XUserCloseHandle
+			5: syscall.NewCallback(func(this, u1, u2, outCmp uintptr) uintptr { // XUserCompare
+				if outCmp >= 0x10000 {
+					*(*int32)(osPtr(outCmp)) = 0
+				}
+				return hresultOK
+			}),
+			6: syscall.NewCallback(func(this, outMax uintptr) uintptr { // XUserGetMaxUsers
+				if outMax >= 0x10000 {
+					*(*uint32)(osPtr(outMax)) = 4
+				}
+				return hresultOK
+			}),
+			7: syscall.NewCallback(func(this, opts, asyncBlock uintptr) uintptr { // XUserAddAsync
+				slog.Info("xuser!XUserAddAsync -> connexion utilisateur hors-ligne AstralPlayer", "opts", uint32(opts))
+				if asyncBlock >= 0x10000 {
+					cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
+					if cb >= 0x10000 && cb < 0x800000000000 {
+						_, _, _ = syscall.SyscallN(cb, asyncBlock)
+					}
+				}
+				return hresultOK
+			}),
+			8: syscall.NewCallback(func(this, asyncBlock, outUser uintptr) uintptr { // XUserAddResult
+				if outUser >= 0x10000 {
+					*(*uintptr)(osPtr(outUser)) = offlineUserHandle
+				}
+				return hresultOK
+			}),
+			9: syscall.NewCallback(func(this, user, outLocalId uintptr) uintptr { // XUserGetLocalId
+				if outLocalId >= 0x10000 {
+					*(*uint64)(osPtr(outLocalId)) = 1
+				}
+				return hresultOK
+			}),
+			10: syscall.NewCallback(func(this, localId, outUser uintptr) uintptr { // XUserFindUserByLocalId
+				if outUser >= 0x10000 {
+					*(*uintptr)(osPtr(outUser)) = offlineUserHandle
+				}
+				return hresultOK
+			}),
+			11: syscall.NewCallback(func(this, user, outXuid uintptr) uintptr { // XUserGetId
+				if outXuid >= 0x10000 {
+					*(*uint64)(osPtr(outXuid)) = offlineUserXUID
+				}
+				return hresultOK
+			}),
+			12: syscall.NewCallback(func(this, xuid, outUser uintptr) uintptr { // XUserFindUserById
+				if outUser >= 0x10000 {
+					*(*uintptr)(osPtr(outUser)) = offlineUserHandle
+				}
+				return hresultOK
+			}),
+			13: syscall.NewCallback(func(this, user, outGuest uintptr) uintptr { // XUserGetIsGuest
+				if outGuest >= 0x10000 {
+					*(*uint8)(osPtr(outGuest)) = 0
+				}
+				return hresultOK
+			}),
+			14: syscall.NewCallback(func(this, user, outState uintptr) uintptr { // XUserGetState
+				if outState >= 0x10000 {
+					*(*uint32)(osPtr(outState)) = 0 // XUserState::SignedIn
+				}
+				return hresultOK
+			}),
+			15: syscall.NewCallback(func(this, user, comp, size, bufPtr, usedPtr uintptr) uintptr { // XUserGetGamertag
+				return putStr("AstralPlayer", size, bufPtr, usedPtr)
+			}),
+			19: syscall.NewCallback(func(this, user, outAge uintptr) uintptr { // XUserGetAgeGroup
+				if outAge >= 0x10000 {
+					*(*uint32)(osPtr(outAge)) = 3 // Adult
+				}
+				return hresultOK
+			}),
+			20: syscall.NewCallback(func(this, user, opts, priv, outHas, outReason uintptr) uintptr { // XUserCheckPrivilege
+				if outHas >= 0x10000 {
+					*(*uint8)(osPtr(outHas)) = 1
+				}
+				if outReason >= 0x10000 {
+					*(*uint32)(osPtr(outReason)) = 0
+				}
+				return hresultOK
+			}),
 			33: cbRegisterToken5, // 0x108 XUserRegisterForChangeEvent
 			34: cbReturnTrue,     // 0x110 XUserUnregisterForChangeEvent
+		}),
+		"{704C3F58-E629-4CC2-B197-30511B996FE2}": NewCOMObject("xgamesave", 32, map[int]uintptr{
+			3: syscall.NewCallback(func(this, user, scid, syncOnDemand, outProv uintptr) uintptr { // XGameSaveInitializeProvider
+				slog.Info("xgamesave!XGameSaveInitializeProvider -> fournisseur hors-ligne")
+				if outProv >= 0x10000 {
+					*(*uintptr)(osPtr(outProv)) = uintptr(nextHandle.Add(1))
+				}
+				return hresultOK
+			}),
+			4: syscall.NewCallback(func(this, user, scid, syncOnDemand, asyncBlock uintptr) uintptr { // XGameSaveInitializeProviderAsync
+				slog.Info("xgamesave!XGameSaveInitializeProviderAsync -> fournisseur hors-ligne")
+				if asyncBlock >= 0x10000 {
+					cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
+					if cb >= 0x10000 && cb < 0x800000000000 {
+						_, _, _ = syscall.SyscallN(cb, asyncBlock)
+					}
+				}
+				return hresultOK
+			}),
+			5: syscall.NewCallback(func(this, asyncBlock, outProv uintptr) uintptr { // XGameSaveInitializeProviderResult
+				if outProv >= 0x10000 {
+					*(*uintptr)(osPtr(outProv)) = uintptr(nextHandle.Add(1))
+				}
+				return hresultOK
+			}),
+			6: cbGISuccess, // XGameSaveCloseProvider
+			7: syscall.NewCallback(func(this, prov, outQuota uintptr) uintptr { // XGameSaveGetRemainingQuota
+				if outQuota >= 0x10000 {
+					*(*int64)(osPtr(outQuota)) = 256 << 20 // 256 MiB
+				}
+				return hresultOK
+			}),
+			10: cbGISuccess, // XGameSaveEnumerateContainerInfo (0 conteneurs)
+			11: cbGISuccess, // XGameSaveEnumerateContainerInfoByName
 		}),
 		"{973A344E-24BF-4D0F-8457-56C534892B29}": NewCOMObject("xgame", 64, map[int]uintptr{
 			3: cbGameGetTitleID, // 0x18 XGameGetXboxTitleId
