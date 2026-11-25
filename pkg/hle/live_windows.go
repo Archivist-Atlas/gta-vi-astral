@@ -899,8 +899,8 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			25: syscall.NewCallback(func() uintptr { return 0x89245102 }), // 0xC8 XUserGetTokenAndSignatureResult
 			29: cbCompleteAsync4,                                          // 0xE8 XUserResolveIssueWithUiAsync
 			30: cbGISuccess,                                               // 0xF0 XUserResolveIssueWithUiResult
-			33: cbRegisterToken5, // 0x108 XUserRegisterForChangeEvent
-			34: cbReturnTrue,     // 0x110 XUserUnregisterForChangeEvent
+			33: cbRegisterToken5,                                          // 0x108 XUserRegisterForChangeEvent
+			34: cbReturnTrue,                                              // 0x110 XUserUnregisterForChangeEvent
 		}),
 		// XUSER_DEVICE : associe toutes les manettes (DualSense/Xbox/HID) à AstralPlayer
 		"{7D824997-10DC-45AB-86B7-2737767C0BF1}": NewCOMObject("xuser_device", 12, map[int]uintptr{
@@ -1391,15 +1391,46 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	}
 
 	// --- 4. Isolation réseau hors-ligne (ws2_32 & winhttp) ---
-	cbNetBlocked := syscall.NewCallback(func() uintptr {
-		slog.Debug("appel réseau sortant bloqué (mode hors-ligne)")
-		return 0xFFFFFFFF // SOCKET_ERROR / erreur
+	ws2DLL := syscall.NewLazyDLL("ws2_32.dll")
+	ws2SetLastErr := ws2DLL.NewProc("WSASetLastError")
+	k32SetLastErr := k32.NewProc("SetLastError")
+	var netLogCount atomic.Uint64
+	cbNetConnect := syscall.NewCallback(func() uintptr {
+		if netLogCount.Add(1) <= 5 {
+			slog.Info("ws2_32!connect bloqué (WSAENETUNREACH hors-ligne)")
+		}
+		_, _, _ = ws2SetLastErr.Call(10051) // WSAENETUNREACH
+		return 0xFFFFFFFF                   // SOCKET_ERROR
 	})
-	t.bind("ws2_32.dll", "connect", cbNetBlocked)
-	t.bind("ws2_32.dll", "getaddrinfo", cbNetBlocked)
-	t.bind("ws2_32.dll", "GetAddrInfoW", cbNetBlocked)
+	cbNetGetAddr := syscall.NewCallback(func() uintptr {
+		if netLogCount.Add(1) <= 5 {
+			slog.Info("ws2_32!getaddrinfo bloqué (WSAHOST_NOT_FOUND hors-ligne)")
+		}
+		_, _, _ = ws2SetLastErr.Call(11001) // WSAHOST_NOT_FOUND
+		return 11001                        // WSAHOST_NOT_FOUND
+	})
+	t.bind("ws2_32.dll", "connect", cbNetConnect)
+	t.bind("ws2_32.dll", "WSAConnect", cbNetConnect)
+	t.bind("ws2_32.dll", "getaddrinfo", cbNetGetAddr)
+	t.bind("ws2_32.dll", "GetAddrInfoW", cbNetGetAddr)
+	t.bind("ws2_32.dll", "GetAddrInfoExW", cbNetGetAddr)
 
-	// --- 4b. Masquage de la fenêtre Win32 fantôme du titre ("America" 3840x2160) ---
+	cbWinHttpConnect := syscall.NewCallback(func(sess, hostPtr, port, res uintptr) uintptr {
+		if netLogCount.Add(1) <= 10 {
+			slog.Info("winhttp!WinHttpConnect bloqué (hors-ligne)", "host", readUTF16Str(hostPtr), "port", uint32(port))
+		}
+		_, _, _ = k32SetLastErr.Call(12029) // ERROR_WINHTTP_CANNOT_CONNECT
+		return 0                            // NULL handle
+	})
+	cbWinHttpProxy := syscall.NewCallback(func() uintptr {
+		_, _, _ = k32SetLastErr.Call(12180) // ERROR_WINHTTP_AUTODETECTION_FAILED
+		return 0                            // FALSE
+	})
+	t.bind("winhttp.dll", "WinHttpConnect", cbWinHttpConnect)
+	t.bind("winhttp.dll", "WinHttpGetProxyForUrl", cbWinHttpProxy)
+	t.bind("winhttp.dll", "WinHttpGetProxyForUrlEx", cbWinHttpProxy)
+
+	// --- 4b. Masquage de la fenêtre Win32 fantôme du titre ("Americas" 3840x2160) ---
 	// Le jeu conserve un HWND parfaitement valide, mais seule la fenêtre GTA VI Astral reste visible.
 	u32Title := syscall.NewLazyDLL("user32.dll")
 	u32CreateWinW := u32Title.NewProc("CreateWindowExW")
@@ -1422,10 +1453,21 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		r, _, _ := u32SetWinPos.Call(hwnd, after, x, y, cx, cy, flags&^swpShowWindow)
 		return r
 	})
-	t.bind("user32.dll", "CreateWindowExW", cbTitleCreateWinW)
-	t.bind("user32.dll", "CreateWindowExA", cbTitleCreateWinA)
-	t.bind("user32.dll", "ShowWindow", cbTitleShowWin)
-	t.bind("user32.dll", "SetWindowPos", cbTitleSetWinPos)
+	for _, dll := range []string{
+		"user32.dll",
+		"ext-ms-win-ntuser-window-l1-1-0.dll",
+		"ext-ms-win-ntuser-window-l1-1-1.dll",
+		"ext-ms-win-ntuser-window-l1-1-2.dll",
+		"ext-ms-win-ntuser-window-l1-1-3.dll",
+		"ext-ms-win-ntuser-window-l1-1-4.dll",
+		"ext-ms-win-rtcore-ntuser-window-ext-l1-1-0.dll",
+	} {
+		t.bind(dll, "CreateWindowExW", cbTitleCreateWinW)
+		t.bind(dll, "CreateWindowExA", cbTitleCreateWinA)
+		t.bind(dll, "ShowWindow", cbTitleShowWin)
+		t.bind(dll, "ShowWindowAsync", cbTitleShowWin)
+		t.bind(dll, "SetWindowPos", cbTitleSetWinPos)
+	}
 
 	// --- 5. d3d12_xs.dll (Root Signature PC + log CreateDevice) ---
 	type rootSigDesc struct {

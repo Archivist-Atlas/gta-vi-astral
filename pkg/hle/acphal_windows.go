@@ -3,10 +3,13 @@
 package hle
 
 import (
+	"encoding/binary"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -24,7 +27,7 @@ type apuState struct {
 	mu      sync.Mutex
 	regions []apuRegion
 	nextApu uint32
-	shapes  [5]uintptr
+	shapes  [6]uintptr
 }
 
 func (a *apuState) alloc(size, align uint32) (uintptr, uint32) {
@@ -132,44 +135,145 @@ func bindAcpHal(t *LiveTable) {
 		return hresultOK
 	})
 
-	// AcpHalAllocateShapeContexts(ShapeContexts*) :
-	// struct { uint32 counts[5] (+0); uint32 reserved (+20); void* contexts[5] (+24); }
+	// AcpHalAllocateShapeContexts(ShapeContexts*) : 0x60 octets
+	// struct { uint32 counts[6] (+0); void* arrays[6] (+24); uint32 apu[6] (+72); }
 	cbAllocShape := syscall.NewCallback(func(ctxPtr uintptr) uintptr {
 		if ctxPtr == 0 {
 			return hresultInvalidArg
 		}
-		counts := unsafe.Slice((*uint32)(osPtr(ctxPtr)), 5)
-		ptrs := unsafe.Slice((*uintptr)(osPtr(ctxPtr+24)), 5)
-		const contextStride = 64
-		for i := 0; i < 5; i++ {
+		counts := unsafe.Slice((*uint32)(osPtr(ctxPtr)), 6)
+		ptrs := unsafe.Slice((*uintptr)(osPtr(ctxPtr+24)), 6)
+		apus := unsafe.Slice((*uint32)(osPtr(ctxPtr+72)), 6)
+		strides := [6]uint32{32, 32, 64, 64, 64, 64}
+		for i := 0; i < 6; i++ {
 			if counts[i] == 0 {
 				ptrs[i] = 0
+				apus[i] = 0
 				continue
 			}
-			va, _ := apu.alloc(counts[i]*contextStride, 256)
+			va, apuAddr := apu.alloc(counts[i]*strides[i], 256)
 			if va == 0 {
 				return 0x8007000E
 			}
 			ptrs[i] = va
+			apus[i] = apuAddr
 			apu.mu.Lock()
 			apu.shapes[i] = va
 			apu.mu.Unlock()
 		}
-		slog.Info("AcpHal!AcpHalAllocateShapeContexts", "counts", []uint32{counts[0], counts[1], counts[2], counts[3], counts[4]})
+		slog.Info("AcpHal!AcpHalAllocateShapeContexts", "counts", []uint32{counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]})
 		return hresultOK
 	})
 
 	// IAcpHal vtable : Connect(0), Disconnect(1), SubmitCommand(2), PopMessage(3), GetNumMessages(4), Release(5)
 	// Note : IAcpHal n'hérite pas d'IUnknown, ses méthodes démarrent au slot 0.
+	type acpMessage struct {
+		kind    uint32
+		dropped uint32
+		usec    uint32
+		data    [16]byte
+	}
+	var (
+		acpMu       sync.Mutex
+		acpMask     uint32
+		acpCap      = 256
+		acpDropped  uint32
+		acpMsgs     []acpMessage
+		acpSince    = time.Now()
+		acpSubOnce  atomic.Bool
+	)
+	postAcpMsg := func(kind uint32, payload []byte) {
+		if acpMask&kind == 0 {
+			return
+		}
+		if len(acpMsgs) >= acpCap {
+			acpDropped++
+			return
+		}
+		m := acpMessage{
+			kind:    kind,
+			dropped: acpDropped,
+			usec:    uint32(time.Since(acpSince).Microseconds()),
+		}
+		acpDropped = 0
+		copy(m.data[:], payload)
+		acpMsgs = append(acpMsgs, m)
+	}
 	acpHalObj := NewCOMObject("IAcpHal", 16, map[int]uintptr{
-		0: cbOK,                                                    // Connect
-		1: cbOK,                                                    // Disconnect
-		2: cbOK,                                                    // SubmitCommand
-		3: syscall.NewCallback(func(this, msgPtr uintptr) uintptr { // PopMessage -> FALSE (pas de message)
-			return 0
+		0: syscall.NewCallback(func(this, cmds, msgs uintptr) uintptr { // Connect
+			acpMu.Lock()
+			if msgs > 0 && msgs <= 4096 {
+				acpCap = int(msgs)
+			}
+			acpMu.Unlock()
+			return hresultOK
 		}),
-		4: syscall.NewCallback(func(this uintptr) uintptr { return 0 }), // GetNumMessages
-		5: cbOK,                                                         // Release
+		1: syscall.NewCallback(func(this uintptr) uintptr { // Disconnect
+			acpMu.Lock()
+			postAcpMsg(0x80 /* DISCONNECTED */, nil)
+			acpMu.Unlock()
+			return hresultOK
+		}),
+		2: syscall.NewCallback(func(this, cmdArg, idArg, frameArg, dataPtr, notifApu uintptr) uintptr { // SubmitCommand
+			cmd := uint32(cmdArg)
+			id := uint64(idArg)
+			if acpSubOnce.CompareAndSwap(false, true) {
+				slog.Info("IAcpHal!SubmitCommand actif", "cmd", cmd, "id", id, "notif", fmt.Sprintf("0x%X", uint32(notifApu)))
+			}
+			acpMu.Lock()
+			switch cmd {
+			case 2: // REGISTER_MESSAGES
+				if dataPtr >= 0x10000 {
+					acpMask |= *(*uint32)(osPtr(dataPtr))
+				}
+			case 3: // UNREGISTER_MESSAGES
+				if dataPtr >= 0x10000 {
+					acpMask &^= *(*uint32)(osPtr(dataPtr))
+				}
+			case 1: // LOAD_FLOWGRAPH
+				var fg [4]byte
+				if dataPtr >= 0x10000 {
+					binary.LittleEndian.PutUint32(fg[:], *(*uint32)(osPtr(dataPtr + 4)))
+				}
+				postAcpMsg(0x02 /* FLOWGRAPH_COMPLETED */, fg[:])
+			}
+			if id != 0 {
+				var done [16]byte
+				binary.LittleEndian.PutUint32(done[0:4], cmd)
+				binary.LittleEndian.PutUint64(done[4:12], id)
+				frame := uint32(time.Since(acpSince).Microseconds() * 375 / 1_000_000)
+				binary.LittleEndian.PutUint32(done[12:16], frame)
+				postAcpMsg(0x10 /* COMMAND_COMPLETED */, done[:])
+			}
+			acpMu.Unlock()
+			if uint32(notifApu) != 0 {
+				if va := apu.mapApu(uint32(notifApu)); va >= 0x10000 {
+					atomic.StoreUint32((*uint32)(osPtr(va)), 1)
+				}
+			}
+			return hresultOK
+		}),
+		3: syscall.NewCallback(func(this, msgPtr uintptr) uintptr { // PopMessage
+			acpMu.Lock()
+			if len(acpMsgs) == 0 {
+				acpMu.Unlock()
+				return 0
+			}
+			m := acpMsgs[0]
+			acpMsgs = acpMsgs[1:]
+			acpMu.Unlock()
+			if msgPtr >= 0x10000 {
+				*(*acpMessage)(osPtr(msgPtr)) = m
+			}
+			return 1
+		}),
+		4: syscall.NewCallback(func(this uintptr) uintptr { // GetNumMessages
+			acpMu.Lock()
+			n := uintptr(len(acpMsgs))
+			acpMu.Unlock()
+			return n
+		}),
+		5: cbOK, // Release
 	})
 	cbAcpHalCreate := syscall.NewCallback(func(outPtr uintptr) uintptr {
 		slog.Info("AcpHal!AcpHalCreate -> IAcpHal actif")

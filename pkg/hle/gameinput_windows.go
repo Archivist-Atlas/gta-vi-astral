@@ -423,7 +423,8 @@ func bindGameInput(t *LiveTable) {
 			return uintptr(giDeviceConnected)
 		}),
 		5:  cbOK, // GetBatteryState
-		12: cbOK, // SetRumbleState
+		10: cbOK, // SetRumbleState / SetFeedbackMotor (GDK 2026)
+		12: cbOK, // SetRumbleState (GDK 2020)
 	})
 
 	var gamepadPolls atomic.Uint64
