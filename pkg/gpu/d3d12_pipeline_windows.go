@@ -32,6 +32,7 @@ type HostTextureUpload struct {
 	Width   uint32
 	Height  uint32
 	Format  uint32 // DXGI_FORMAT
+	Swizzle uint32 // Layout RDNA2 (0=linéaire, 0x105=SW_4KB_S, 0x109+=SW_64KB_*)
 	Pixels  []byte
 }
 
@@ -539,14 +540,13 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 	if h.NextSRVSlot >= 64 {
 		return h.SRVGPUStart
 	}
-	// Format RGBA8 par défaut si typeless/non standard
-	fmtID := tx.Format
-	if fmtID != 28 && fmtID != 29 && fmtID != 87 && fmtID != 91 {
-		fmtID = 28 // DXGI_FORMAT_R8G8B8A8_UNORM
-	}
-	rowPitch := ((tx.Width * 4) + 255) &^ 255
-	needBytes := uint64(rowPitch) * uint64(tx.Height)
-	if needBytes > (16 << 20) {
+	bpe, block, fmtID := DXGIFormatMetrics(tx.Format)
+	bw := (tx.Width + block - 1) / block
+	bh := (tx.Height + block - 1) / block
+	srcRow := bw * bpe
+	rowPitch := (srcRow + 255) &^ 255
+	needBytes := uint64(rowPitch) * uint64(bh)
+	if needBytes == 0 || needBytes > (16<<20) {
 		return h.SRVGPUStart
 	}
 	heapProps := d3d12HeapProperties{Type: 1 /* DEFAULT */, CreationNodeMask: 1, VisibleNodeMask: 1}
@@ -572,28 +572,30 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 		return h.SRVGPUStart
 	}
 
-	// Copie des pixels dans le buffer d'upload staging puis CopyTextureRegion -> PIXEL_SHADER_RESOURCE
+	// Détuilage RDNA2 -> linéaire puis copie dans le buffer staging UPLOAD + CopyTextureRegion
 	if len(tx.Pixels) > 0 {
-		dstSlice := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadTexPtr))), 16<<20)
-		srcRow := tx.Width * 4
-		for y := uint32(0); y < tx.Height; y++ {
-			sOff := uintptr(y) * uintptr(srcRow)
-			dOff := uintptr(y) * uintptr(rowPitch)
-			if sOff+uintptr(srcRow) <= uintptr(len(tx.Pixels)) && dOff+uintptr(srcRow) <= uintptr(len(dstSlice)) {
-				copy(dstSlice[dOff:dOff+uintptr(srcRow)], tx.Pixels[sOff:sOff+uintptr(srcRow)])
+		linear := DetileRDNA2(tx.Pixels, tx.Width, tx.Height, bpe, block, tx.Swizzle)
+		if len(linear) > 0 {
+			dstSlice := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadTexPtr))), 16<<20)
+			for y := uint32(0); y < bh; y++ {
+				sOff := uintptr(y) * uintptr(srcRow)
+				dOff := uintptr(y) * uintptr(rowPitch)
+				if sOff+uintptr(srcRow) <= uintptr(len(linear)) && dOff+uintptr(srcRow) <= uintptr(len(dstSlice)) {
+					copy(dstSlice[dOff:dOff+uintptr(srcRow)], linear[sOff:sOff+uintptr(srcRow)])
+				}
 			}
+			dstLoc := d3d12TextureCopyLocation{Resource: res, Type: 0 /* SUBRESOURCE_INDEX */}
+			srcLoc := d3d12TextureCopyLocation{
+				Resource: h.UploadTex,
+				Type:     1, // PLACED_FOOTPRINT
+				Format:   fmtID,
+				Width:    tx.Width,
+				Height:   tx.Height,
+				Depth:    1,
+				RowPitch: rowPitch,
+			}
+			_ = comCall(h.CmdList, 16, uintptr(unsafe.Pointer(&dstLoc)), 0, 0, 0, uintptr(unsafe.Pointer(&srcLoc)), 0)
 		}
-		dstLoc := d3d12TextureCopyLocation{Resource: res, Type: 0 /* SUBRESOURCE_INDEX */}
-		srcLoc := d3d12TextureCopyLocation{
-			Resource: h.UploadTex,
-			Type:     1, // PLACED_FOOTPRINT
-			Format:   fmtID,
-			Width:    tx.Width,
-			Height:   tx.Height,
-			Depth:    1,
-			RowPitch: rowPitch,
-		}
-		_ = comCall(h.CmdList, 16, uintptr(unsafe.Pointer(&dstLoc)), 0, 0, 0, uintptr(unsafe.Pointer(&srcLoc)), 0)
 	}
 	b := d3d12ResourceBarrier{Resource: res, Subresource: 0xFFFFFFFF, StateBefore: 0x400 /* COPY_DEST */, StateAfter: 0x80 /* PIXEL_SHADER_RESOURCE */}
 	_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b)))

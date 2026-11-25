@@ -7,22 +7,27 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 var (
-	modUser32           = syscall.NewLazyDLL("user32.dll")
-	modKernel32Win      = syscall.NewLazyDLL("kernel32.dll")
-	procRegisterClassEx = modUser32.NewProc("RegisterClassExW")
-	procCreateWindowEx  = modUser32.NewProc("CreateWindowExW")
-	procShowWindow      = modUser32.NewProc("ShowWindow")
-	procUpdateWindow    = modUser32.NewProc("UpdateWindow")
-	procDefWindowProc   = modUser32.NewProc("DefWindowProcW")
-	procGetMessage      = modUser32.NewProc("GetMessageW")
-	procTranslateMsg    = modUser32.NewProc("TranslateMessage")
-	procDispatchMsg     = modUser32.NewProc("DispatchMessageW")
-	procPostQuitMsg     = modUser32.NewProc("PostQuitMessage")
-	procGetModuleHandle = modKernel32Win.NewProc("GetModuleHandleW")
+	modUser32               = syscall.NewLazyDLL("user32.dll")
+	modKernel32Win          = syscall.NewLazyDLL("kernel32.dll")
+	procRegisterClassEx     = modUser32.NewProc("RegisterClassExW")
+	procCreateWindowEx      = modUser32.NewProc("CreateWindowExW")
+	procShowWindow          = modUser32.NewProc("ShowWindow")
+	procUpdateWindow        = modUser32.NewProc("UpdateWindow")
+	procDefWindowProc       = modUser32.NewProc("DefWindowProcW")
+	procGetMessage          = modUser32.NewProc("GetMessageW")
+	procTranslateMsg        = modUser32.NewProc("TranslateMessage")
+	procDispatchMsg         = modUser32.NewProc("DispatchMessageW")
+	procPostQuitMsg         = modUser32.NewProc("PostQuitMessage")
+	procEnumWindows         = modUser32.NewProc("EnumWindows")
+	procGetWindowThreadPID  = modUser32.NewProc("GetWindowThreadProcessId")
+	procIsWindowVisible     = modUser32.NewProc("IsWindowVisible")
+	procGetModuleHandle     = modKernel32Win.NewProc("GetModuleHandleW")
+	procGetCurrentProcessId = modKernel32Win.NewProc("GetCurrentProcessId")
 )
 
 type wndClassExW struct {
@@ -104,6 +109,9 @@ func EnsureWindow(title string, width, height int) uintptr {
 				slog.Info("fenêtre Win32 ASTRAL ouverte", "hwnd", hwnd, "width", width, "height", height)
 			}
 			ready <- hwnd
+			// Masque discrètement toute fenêtre Win32 en double créée par l'exécutable invité
+			// dans le même processus (sans la détruire, afin que son HWND reste valide pour le moteur).
+			go hideDuplicateProcessWindows(hwnd)
 
 			var m winMsg
 			for {
@@ -118,4 +126,29 @@ func EnsureWindow(title string, width, height int) uintptr {
 		winHWND = <-ready
 	})
 	return winHWND
+}
+
+func hideDuplicateProcessWindows(keepHWND uintptr) {
+	if keepHWND == 0 {
+		return
+	}
+	myPID, _, _ := procGetCurrentProcessId.Call()
+	cb := syscall.NewCallback(func(hwnd, lParam uintptr) uintptr {
+		if hwnd == 0 || hwnd == keepHWND {
+			return 1
+		}
+		var pid uint32
+		_, _, _ = procGetWindowThreadPID.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
+		if uintptr(pid) == myPID {
+			vis, _, _ := procIsWindowVisible.Call(hwnd)
+			if vis != 0 {
+				_, _, _ = procShowWindow.Call(hwnd, 0 /* SW_HIDE */)
+			}
+		}
+		return 1
+	})
+	for i := 0; i < 20; i++ {
+		time.Sleep(500 * time.Millisecond)
+		_, _, _ = procEnumWindows.Call(cb, 0)
+	}
 }

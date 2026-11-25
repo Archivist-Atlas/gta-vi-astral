@@ -395,7 +395,13 @@ func newD3D12XDevice() uintptr {
 			if st.activeSRVTex != nil {
 				tx := *st.activeSRVTex
 				if tx.GuestVA >= 0x10000 && tx.Width > 0 && tx.Height > 0 && tx.Width <= 4096 && tx.Height <= 4096 {
-					sz := uint64(tx.Width) * uint64(tx.Height) * 4
+					bpe, block, _ := gpu.DXGIFormatMetrics(tx.Format)
+					bw := (uint64(tx.Width) + uint64(block) - 1) / uint64(block)
+					bh := (uint64(tx.Height) + uint64(block) - 1) / uint64(block)
+					sz := bw * bh * uint64(bpe)
+					if sz < 4096 && tx.Swizzle&0xFF != 0 {
+						sz = 4096
+					}
 					if sz > 0 && sz <= (16<<20) {
 						pix := make([]byte, sz)
 						copy(pix, unsafe.Slice((*byte)(osPtr(uintptr(tx.GuestVA))), sz))
@@ -569,18 +575,20 @@ func newD3D12XDevice() uintptr {
 				if cbVA >= 0x10000 && cbVA < 0x800000000000 {
 					st.activeRootVA = cbVA
 				}
-			case 0x53525632: // "SRV2" : { tag u32, fmt u32 (+4), gpuVA u64 (+8), w u32 (+16), h u32 (+20), dim u32 (+24) }
+			case 0x53525632: // "SRV2" : { tag u32, fmt u32 (+4), gpuVA u64 (+8), w u32 (+16), h u32 (+20), dim u32 (+24), swz u32 (+28) }
 				dim := *(*uint32)(osPtr(baseDesc + 24))
 				va := *(*uint64)(osPtr(baseDesc + 8))
 				w := *(*uint32)(osPtr(baseDesc + 16))
 				h := *(*uint32)(osPtr(baseDesc + 20))
 				fmtID := *(*uint32)(osPtr(baseDesc + 4))
+				swz := *(*uint32)(osPtr(baseDesc + 28))
 				if dim == 3 && va >= 0x10000 && va < 0x800000000000 && w > 0 && h > 0 {
 					st.activeSRVTex = &gpu.HostTextureUpload{
 						GuestVA: va,
 						Width:   w,
 						Height:  h,
 						Format:  fmtID,
+						Swizzle: swz,
 					}
 				}
 			default:
@@ -1371,7 +1379,7 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
-	writeSRV2 := func(handle uintptr, gpuVA uint64, w, h, fmtID, dim uint32) {
+	writeSRV2 := func(handle uintptr, gpuVA uint64, w, h, fmtID, dim, swz uint32) {
 		if handle < 0x10000 {
 			return
 		}
@@ -1381,7 +1389,7 @@ func newD3D12XDevice() uintptr {
 		*(*uint32)(osPtr(handle + 16)) = w
 		*(*uint32)(osPtr(handle + 20)) = h
 		*(*uint32)(osPtr(handle + 24)) = dim
-		*(*uint32)(osPtr(handle + 28)) = 0
+		*(*uint32)(osPtr(handle + 28)) = swz
 	}
 	var srvCount, placedSRVCount atomic.Uint64
 	cbCreateSRV := syscall.NewCallback(func(this, res, descPtr, handle uintptr) uintptr {
@@ -1394,7 +1402,7 @@ func newD3D12XDevice() uintptr {
 			d = st.resDescs[res]
 			st.mu.Unlock()
 		}
-		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension)
+		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension, d.Layout)
 		return 0
 	})
 	cbCreatePlacedSRV := syscall.NewCallback(func(this, resDescPtr, srvDescPtr, handle, gpuVA uintptr) uintptr {
@@ -1405,9 +1413,9 @@ func newD3D12XDevice() uintptr {
 		}
 		va := uint64(gpuVA)
 		if gpuTrace && n <= 6 && d.Dimension == 3 {
-			slog.Info("GPU_TRACE CreatePlacedSRV(Tex2D)", "n", n, "va", fmt.Sprintf("0x%X", va), "w", d.Width, "h", d.Height, "fmt", d.Format)
+			slog.Info("GPU_TRACE CreatePlacedSRV(Tex2D)", "n", n, "va", fmt.Sprintf("0x%X", va), "w", d.Width, "h", d.Height, "fmt", d.Format, "layout", fmt.Sprintf("0x%X", d.Layout))
 		}
-		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension)
+		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension, d.Layout)
 		return 0
 	})
 	cbCreateUAV := syscall.NewCallback(func(this, res, counter, descPtr, handle uintptr) uintptr {
