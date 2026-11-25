@@ -31,6 +31,12 @@ Progression globale : [█████████████░░░░░░
 
 Les captures d'écran illustrant les jalons techniques sont stockées dans [`docs/screenshots/`](docs/screenshots/).
 
+### Écran de chargement / préchargeur (splash D3D12 + barre néon temps réel)
+
+![Écran de chargement GTA VI Astral](docs/screenshots/03-ecran-chargement-preloader.jpg)
+
+*Écran de préchargement natif dans la fenêtre `gta-vi-astral` (icône synthwave dédiée + barre de progression néon pilotée en temps réel par DirectStorage, `XUser` et `XGameSave`).*
+
 ### Profil `ASTRALPLAYER (A)` actif & sélectionnable à la manette
 
 ![Sélecteur de profil et AstralPlayer (A)](docs/screenshots/02-selecteur-profil-astralplayer.png)
