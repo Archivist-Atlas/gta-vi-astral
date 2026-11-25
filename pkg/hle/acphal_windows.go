@@ -6,11 +6,14 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/tphakala/go-opus/opus"
 )
 
 var (
@@ -53,7 +56,7 @@ func (a *apuState) alloc(size, align uint32) (uintptr, uint32) {
 	return mem, apuAddr
 }
 
-func (a *apuState) mapVA(va uintptr, size uint32) uint32 {
+func (a *apuState) lookupVA(va uintptr) uint32 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, r := range a.regions {
@@ -61,17 +64,20 @@ func (a *apuState) mapVA(va uintptr, size uint32) uint32 {
 			return r.apu + uint32(va-r.va)
 		}
 	}
-	if a.nextApu == 0 {
-		a.nextApu = 0x10000
+	return 0
+}
+
+func (a *apuState) free(va uintptr) {
+	a.mu.Lock()
+	for i, r := range a.regions {
+		if r.va == va {
+			a.regions = append(a.regions[:i], a.regions[i+1:]...)
+			a.mu.Unlock()
+			_, _, _ = k32VirtualFree.Call(va, 0, 0x8000 /* MEM_RELEASE */)
+			return
+		}
 	}
-	apuAddr := (a.nextApu + 63) &^ 63
-	sz := size
-	if sz == 0 {
-		sz = 64
-	}
-	a.nextApu = apuAddr + ((sz + 63) &^ 63)
-	a.regions = append(a.regions, apuRegion{va: va, apu: apuAddr, size: sz})
-	return apuAddr
+	a.mu.Unlock()
 }
 
 func (a *apuState) mapApu(apu uint32) uintptr {
@@ -89,7 +95,6 @@ func (a *apuState) mapApu(apu uint32) uintptr {
 func bindAcpHal(t *LiveTable) {
 	apu := &apuState{nextApu: 0x10000}
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
-	cbOne := syscall.NewCallback(func() uintptr { return 1 })
 
 	cbApuCreateHeap := syscall.NewCallback(func(size, flags uintptr) uintptr {
 		slog.Info("AcpHal!ApuCreateHeap", "size", uint32(size), "flags", uint32(flags))
@@ -110,17 +115,30 @@ func bindAcpHal(t *LiveTable) {
 		return hresultOK
 	})
 	cbApuFree := syscall.NewCallback(func(va uintptr) uintptr {
-		return hresultOK
-	})
-	cbApuMapVA := syscall.NewCallback(func(apuOut, va, size uintptr) uintptr {
-		if apuOut == 0 {
-			return hresultInvalidArg
+		if va >= 0x10000 {
+			apu.free(va)
 		}
-		*(*uint32)(osPtr(apuOut)) = apu.mapVA(va, uint32(size))
 		return hresultOK
 	})
+	// ABI AcpHal.dll : uint32 ApuMapVirtualAddress(const void* ptr) -> adresse APU 32 bits (0 si hors tas)
+	cbApuMapVA := syscall.NewCallback(func(va uintptr) uintptr {
+		return uintptr(apu.lookupVA(va))
+	})
+	// ABI AcpHal.dll : void* ApuMapApuAddress(uint32 apuAddr)
 	cbApuMapApu := syscall.NewCallback(func(apuAddr uintptr) uintptr {
 		return apu.mapApu(uint32(apuAddr))
+	})
+	// ABI AcpHal.dll : bool ApuIsVirtualAddressValid(const void* ptr, uint32 align)
+	cbApuIsValid := syscall.NewCallback(func(va, align uintptr) uintptr {
+		addr := apu.lookupVA(va)
+		if addr == 0 {
+			return 0
+		}
+		al := uint32(align)
+		if al != 0 && addr%al != 0 {
+			return 0
+		}
+		return 1
 	})
 	cbApuHeapState := syscall.NewCallback(func(statePtr, flags uintptr) uintptr {
 		if statePtr == 0 {
@@ -144,7 +162,7 @@ func bindAcpHal(t *LiveTable) {
 		counts := unsafe.Slice((*uint32)(osPtr(ctxPtr)), 6)
 		ptrs := unsafe.Slice((*uintptr)(osPtr(ctxPtr+24)), 6)
 		apus := unsafe.Slice((*uint32)(osPtr(ctxPtr+72)), 6)
-		strides := [6]uint32{32, 32, 64, 64, 64, 64}
+		strides := [6]uint32{32, 256, 256, 16, 64, 256}
 		for i := 0; i < 6; i++ {
 			if counts[i] == 0 {
 				ptrs[i] = 0
@@ -289,28 +307,57 @@ func bindAcpHal(t *LiveTable) {
 		t.bind(dll, "ApuFree", cbApuFree)
 		t.bind(dll, "ApuMapVirtualAddress", cbApuMapVA)
 		t.bind(dll, "ApuMapApuAddress", cbApuMapApu)
-		t.bind(dll, "ApuIsVirtualAddressValid", cbOne)
+		t.bind(dll, "ApuIsVirtualAddressValid", cbApuIsValid)
 		t.bind(dll, "ApuHeapGetState", cbApuHeapState)
 		t.bind(dll, "AcpHalAllocateShapeContexts", cbAllocShape)
 		t.bind(dll, "AcpHalReleaseShapeContexts", cbOK)
 		t.bind(dll, "AcpHalCreate", cbAcpHalCreate)
 	}
 
-	// --- xapu.dll (décodeur audio matériel Xbox Series, ABI 72 octets ApuResult) ---
+	// --- xapu.dll (décodeur audio matériel Xbox Series Opus -> PCM float32, ABI 80 octets ApuResult) ---
+	const (
+		xapuQueueFull      = 0x8AC81000
+		xapuPendingResults = 0x8AC81001
+		xapuInvalidCommand = 0x8AC81002
+		xapuInvalidStream  = 0x8AC81003
+		xapuAlreadyActive  = 0x8AC81005
+		xapuBadPacket      = 0x8AC81008
+		xapuDeinterleaved  = 4
+		xapuResultEvent    = 8
+		xapuCmdSignal      = 1
+		xapuMaxFrames      = 5760 // 120 ms @ 48 kHz
+	)
 	type xapuResult struct {
-		raw [72]byte // CommandId(24) + state(4) + stateData(8) + usec(8) + error(4) + frames(4) + outLen(4) + outPtr(8) + pitch(4) + inLen(4) + inPtr(8)
+		// ABI exact #[repr(C, packed)] 80 octets (0x50) :
+		// CommandId(24) + state(4) + stateData(8) + usec(8) + error(4) +
+		// frames(4) + outLen(4) + outPtr(8) + pitch(4) + inLen(4) + inPtr(8)
+		raw [80]byte
+	}
+	type xapuStream struct {
+		dec      *opus.Decoder
+		channels int
+		pcmBuf   []int16
 	}
 	type xapuConn struct {
-		mu      sync.Mutex
-		readyEv uintptr
-		results []xapuResult
-		since   time.Time
+		mu        sync.Mutex
+		dataMem   uintptr
+		readyEv   uintptr
+		options   uint32
+		perStream uint32
+		streams   []*xapuStream
+		queued    []uint32
+		results   []xapuResult
+		commands  uint32
+		dequeued  uint32
+		since     time.Time
 	}
 	var (
 		nextXApuHandle atomic.Uint64
 		xapuMu         sync.Mutex
 		xapuConns      = map[uintptr]*xapuConn{}
 		xapuEnqLogged  atomic.Bool
+		xapuDecLogged  atomic.Bool
+		xapuDecCount   atomic.Uint64
 		xdspActLogged  atomic.Bool
 	)
 	nextXApuHandle.Store(0x880000)
@@ -320,100 +367,241 @@ func bindAcpHal(t *LiveTable) {
 			return hresultInvalidArg
 		}
 		// XApuConnectInput : { process u32 (+0), streams u32 (+4), cmds u32 (+8), data_bytes u32 (+12), frames u32 (+16), options u32 (+20) }
+		process := *(*uint32)(osPtr(inPtr + 0))
 		streams := *(*uint32)(osPtr(inPtr + 4))
+		perStream := *(*uint32)(osPtr(inPtr + 8))
 		dataBytes := *(*uint32)(osPtr(inPtr + 12))
 		options := *(*uint32)(osPtr(inPtr + 20))
-		var dataMem uintptr
-		if dataBytes > 0 {
-			allocSz := (uintptr(dataBytes) + 65535) &^ 65535
-			dataMem, _, _ = k32VirtualAlloc.Call(0, allocSz, 0x3000, 0x04)
+		if streams == 0 || streams > 500 || perStream == 0 || perStream > 16 || dataBytes == 0 {
+			return hresultInvalidArg
+		}
+		if process != 1 { // DECODE_OPUS = 1
+			slog.Warn("xapu!XApuConnect mode non supporté", "process", process)
+			return hresultNotImpl
+		}
+		allocSz := (uintptr(dataBytes) + 65535) &^ 65535
+		dataMem, _, _ := k32VirtualAlloc.Call(0, allocSz, 0x3000, 0x04)
+		if dataMem == 0 {
+			return 0x8007000E // E_OUTOFMEMORY
 		}
 		var readyEv uintptr
-		if options&8 != 0 {
+		if options&xapuResultEvent != 0 {
 			readyEv, _, _ = k32CreateEventW.Call(0, 0, 0, 0)
 		}
 		*(*uintptr)(osPtr(outPtr + 0)) = dataMem
 		*(*uintptr)(osPtr(outPtr + 8)) = readyEv
 		h := uintptr(nextXApuHandle.Add(1))
 		xapuMu.Lock()
-		xapuConns[h] = &xapuConn{readyEv: readyEv, since: time.Now()}
+		xapuConns[h] = &xapuConn{
+			dataMem:   dataMem,
+			readyEv:   readyEv,
+			options:   options,
+			perStream: perStream,
+			streams:   make([]*xapuStream, streams),
+			queued:    make([]uint32, streams),
+			since:     time.Now(),
+		}
 		xapuMu.Unlock()
 		*(*uintptr)(osPtr(handleOut)) = h
-		slog.Info("xapu!XApuConnect", "streams", streams, "dataBytes", dataBytes, "handle", h)
+		slog.Info("xapu!XApuConnect (décodeur Opus 48kHz actif)", "streams", streams, "perStream", perStream, "dataBytes", dataBytes, "options", options, "handle", h)
 		return hresultOK
 	})
-	cbXApuEnqueue := syscall.NewCallback(func(handle, cmdPtr uintptr) uintptr {
+	cbXApuDisconnect := syscall.NewCallback(func(handle uintptr) uintptr {
 		xapuMu.Lock()
 		c := xapuConns[handle]
+		delete(xapuConns, handle)
 		xapuMu.Unlock()
-		if c != nil && cmdPtr >= 0x10000 {
-			kind := *(*uint32)(osPtr(cmdPtr + 0))
-			opts := *(*uint32)(osPtr(cmdPtr + 12))
-			if xapuEnqLogged.CompareAndSwap(false, true) {
-				slog.Info("xapu!XApuEnqueueCommand actif", "handle", handle, "kind", kind)
-			}
-			var res xapuResult
-			copy(res.raw[0:24], unsafe.Slice((*byte)(osPtr(cmdPtr)), 24))
-			binary.LittleEndian.PutUint64(res.raw[36:44], uint64(time.Since(c.since).Microseconds()))
-			if kind == 3 { // PROCESS : met le buffer de sortie PCM à zéro proprement (évite grésillements non initialisés)
-				frameCnt := *(*uint32)(osPtr(cmdPtr + 36))
-				inLen := *(*uint32)(osPtr(cmdPtr + 40))
-				inPtr := *(*uint64)(osPtr(cmdPtr + 44))
-				outLen := *(*uint32)(osPtr(cmdPtr + 52))
-				outPtr := *(*uint64)(osPtr(cmdPtr + 56))
-				if outPtr >= 0x10000 && outPtr < 0x800000000000 && outLen > 0 && outLen <= (1<<20) {
-					clear(unsafe.Slice((*byte)(osPtr(uintptr(outPtr))), outLen))
-				}
-				binary.LittleEndian.PutUint32(res.raw[48:52], frameCnt)
-				binary.LittleEndian.PutUint32(res.raw[52:56], outLen)
-				binary.LittleEndian.PutUint64(res.raw[56:64], outPtr)
-				binary.LittleEndian.PutUint32(res.raw[64:68], 0x3F800000) // pitch = 1.0f
-				binary.LittleEndian.PutUint32(res.raw[68:72], inLen)
-				_ = inPtr
-			}
-			c.mu.Lock()
-			c.results = append(c.results, res)
-			c.mu.Unlock()
-			if opts&1 != 0 && c.readyEv != 0 {
-				_, _, _ = k32SetEvent.Call(c.readyEv)
-			}
+		if c == nil {
+			return hresultInvalidArg
+		}
+		if c.readyEv != 0 {
+			_, _, _ = k32CloseHandle.Call(c.readyEv)
+		}
+		if c.dataMem != 0 {
+			_, _, _ = k32VirtualFree.Call(c.dataMem, 0, 0x8000)
 		}
 		return hresultOK
 	})
-	cbXApuGetResultCount := syscall.NewCallback(func(handle, totalPtr uintptr) uintptr {
-		var n uint32
-		xapuMu.Lock()
-		c := xapuConns[handle]
-		xapuMu.Unlock()
-		if c != nil {
-			c.mu.Lock()
-			n = uint32(len(c.results))
-			c.mu.Unlock()
+	cbXApuEnqueue := syscall.NewCallback(func(handle, cmdPtr, totalOut uintptr) uintptr {
+		if handle == 0 || cmdPtr < 0x10000 {
+			return hresultInvalidArg
 		}
-		if totalPtr != 0 {
-			*(*uint32)(osPtr(totalPtr)) = n
-		}
-		return hresultOK
-	})
-	cbXApuDequeueResult := syscall.NewCallback(func(handle, resPtr uintptr) uintptr {
 		xapuMu.Lock()
 		c := xapuConns[handle]
 		xapuMu.Unlock()
 		if c == nil {
-			return 0x8AC81001 // XAPU_E_PENDING_RESULTS
+			return hresultInvalidArg
+		}
+		kind := *(*uint32)(osPtr(cmdPtr + 0))
+		stream := *(*uint32)(osPtr(cmdPtr + 4))
+		opts := *(*uint32)(osPtr(cmdPtr + 12))
+		if xapuEnqLogged.CompareAndSwap(false, true) {
+			slog.Info("xapu!XApuEnqueueCommand actif", "handle", handle, "kind", kind, "stream", stream)
+		}
+
+		c.mu.Lock()
+		if int(stream) >= len(c.streams) {
+			c.mu.Unlock()
+			return xapuInvalidStream
+		}
+		if c.queued[stream] >= c.perStream {
+			c.mu.Unlock()
+			return xapuQueueFull
+		}
+
+		var res xapuResult
+		copy(res.raw[0:24], unsafe.Slice((*byte)(osPtr(cmdPtr)), 24))
+		binary.LittleEndian.PutUint64(res.raw[36:44], uint64(time.Since(c.since).Microseconds()))
+		binary.LittleEndian.PutUint32(res.raw[64:68], 0x3F800000) // pitch = 1.0f
+
+		switch kind {
+		case 1: // ACTIVATE
+			ch := int(*(*uint32)(osPtr(cmdPtr + 24)))
+			if c.streams[stream] != nil {
+				binary.LittleEndian.PutUint32(res.raw[44:48], xapuAlreadyActive)
+			} else if ch < 1 || ch > 2 {
+				binary.LittleEndian.PutUint32(res.raw[44:48], uint32(hresultInvalidArg))
+			} else if dec, err := opus.NewDecoder(48000, ch); err == nil {
+				c.streams[stream] = &xapuStream{
+					dec:      dec,
+					channels: ch,
+					pcmBuf:   make([]int16, xapuMaxFrames*ch),
+				}
+			} else {
+				binary.LittleEndian.PutUint32(res.raw[44:48], uint32(hresultInvalidArg))
+			}
+		case 2: // DEACTIVATE
+			c.streams[stream] = nil
+		case 3: // PROCESS (décodage Opus -> float32 PCM entrelacé ou désentrelacé)
+			firstFrame := int(*(*uint32)(osPtr(cmdPtr + 32)))
+			frameCount := int(*(*uint32)(osPtr(cmdPtr + 36)))
+			inLen := *(*uint32)(osPtr(cmdPtr + 40))
+			inPtr := *(*uint64)(osPtr(cmdPtr + 44))
+			outLen := *(*uint32)(osPtr(cmdPtr + 52))
+			outPtr := *(*uint64)(osPtr(cmdPtr + 56))
+			binary.LittleEndian.PutUint64(res.raw[56:64], outPtr)
+			binary.LittleEndian.PutUint32(res.raw[68:72], inLen)
+			binary.LittleEndian.PutUint64(res.raw[72:80], inPtr)
+
+			st := c.streams[stream]
+			if st == nil || st.dec == nil {
+				binary.LittleEndian.PutUint32(res.raw[44:48], xapuInvalidStream)
+			} else if inPtr < 0x10000 || outPtr < 0x10000 || inLen == 0 || inLen > (1<<20) || outLen > (4<<20) {
+				binary.LittleEndian.PutUint32(res.raw[44:48], uint32(hresultInvalidArg))
+			} else {
+				pkt := unsafe.Slice((*byte)(osPtr(uintptr(inPtr))), inLen)
+				decoded, err := st.dec.Decode(pkt, st.pcmBuf)
+				if err != nil {
+					binary.LittleEndian.PutUint32(res.raw[44:48], xapuBadPacket)
+				} else {
+					ch := st.channels
+					first := firstFrame
+					if first > decoded {
+						first = decoded
+					}
+					frames := decoded - first
+					if frameCount < frames {
+						frames = frameCount
+					}
+					maxOutFrames := int(outLen) / (4 * ch)
+					if maxOutFrames < frames {
+						frames = maxOutFrames
+					}
+					if frames < 0 {
+						frames = 0
+					}
+					nBytes := uint32(frames * ch * 4)
+					if nBytes > 0 {
+						outBytes := unsafe.Slice((*byte)(osPtr(uintptr(outPtr))), nBytes)
+						kept := st.pcmBuf[first*ch : (first+frames)*ch]
+						const inv32768 = float32(1.0 / 32768.0)
+						if c.options&xapuDeinterleaved != 0 && ch == 2 {
+							rightBase := frames * 4
+							for i := 0; i < frames; i++ {
+								l := math.Float32bits(float32(kept[i*2]) * inv32768)
+								r := math.Float32bits(float32(kept[i*2+1]) * inv32768)
+								binary.LittleEndian.PutUint32(outBytes[i*4:], l)
+								binary.LittleEndian.PutUint32(outBytes[rightBase+i*4:], r)
+							}
+						} else {
+							for i, sample := range kept {
+								binary.LittleEndian.PutUint32(outBytes[i*4:], math.Float32bits(float32(sample)*inv32768))
+							}
+						}
+					}
+					binary.LittleEndian.PutUint32(res.raw[48:52], uint32(frames))
+					binary.LittleEndian.PutUint32(res.raw[52:56], nBytes)
+					if n := xapuDecCount.Add(1); xapuDecLogged.CompareAndSwap(false, true) || n%500 == 0 {
+						slog.Info("xapu!Opus décodage PCM actif", "stream", stream, "ch", ch, "inBytes", inLen, "frames", frames, "totalPackets", n)
+					}
+				}
+			}
+		case 4: // NOTIFY
+		case 5: // RESET
+			if st := c.streams[stream]; st != nil && st.dec != nil {
+				st.dec.Reset()
+			}
+		default:
+			c.mu.Unlock()
+			return xapuInvalidCommand
+		}
+
+		c.queued[stream]++
+		c.commands++
+		totalCmds := c.commands
+		c.results = append(c.results, res)
+		c.mu.Unlock()
+
+		if totalOut >= 0x10000 {
+			*(*uint32)(osPtr(totalOut)) = totalCmds
+		}
+		if opts&xapuCmdSignal != 0 && c.readyEv != 0 {
+			_, _, _ = k32SetEvent.Call(c.readyEv)
+		}
+		return hresultOK
+	})
+	// ABI xapu.dll : uint32 XApuGetResultCount(handle, uint32* totalDequeued) -> nombre de résultats en attente
+	cbXApuGetResultCount := syscall.NewCallback(func(handle, totalPtr uintptr) uintptr {
+		xapuMu.Lock()
+		c := xapuConns[handle]
+		xapuMu.Unlock()
+		if c == nil {
+			return 0
+		}
+		c.mu.Lock()
+		pending := uint32(len(c.results))
+		dequeued := c.dequeued
+		c.mu.Unlock()
+		if totalPtr >= 0x10000 {
+			*(*uint32)(osPtr(totalPtr)) = dequeued
+		}
+		return uintptr(pending)
+	})
+	cbXApuDequeueResult := syscall.NewCallback(func(handle, resPtr uintptr) uintptr {
+		if handle == 0 || resPtr < 0x10000 {
+			return hresultInvalidArg
+		}
+		xapuMu.Lock()
+		c := xapuConns[handle]
+		xapuMu.Unlock()
+		if c == nil {
+			return xapuPendingResults
 		}
 		c.mu.Lock()
 		if len(c.results) == 0 {
 			c.mu.Unlock()
-			return 0x8AC81001 // XAPU_E_PENDING_RESULTS
+			return xapuPendingResults
 		}
 		res := c.results[0]
 		c.results = c.results[1:]
-		c.mu.Unlock()
-		if resPtr >= 0x10000 {
-			dst := unsafe.Slice((*byte)(osPtr(resPtr)), 72)
-			copy(dst, res.raw[:])
+		stream := binary.LittleEndian.Uint32(res.raw[4:8])
+		if int(stream) < len(c.queued) && c.queued[stream] > 0 {
+			c.queued[stream]--
 		}
+		c.dequeued++
+		c.mu.Unlock()
+		dst := unsafe.Slice((*byte)(osPtr(resPtr)), 80)
+		copy(dst, res.raw[:])
 		return hresultOK
 	})
 	cbXApuGetUtilization := syscall.NewCallback(func(a, b, outPtr uintptr) uintptr {
@@ -423,7 +611,7 @@ func bindAcpHal(t *LiveTable) {
 		return hresultOK
 	})
 	t.bind("xapu.dll", "XApuConnect", cbXApuConnect)
-	t.bind("xapu.dll", "XApuDisconnect", cbOK)
+	t.bind("xapu.dll", "XApuDisconnect", cbXApuDisconnect)
 	t.bind("xapu.dll", "XApuEnqueueCommand", cbXApuEnqueue)
 	t.bind("xapu.dll", "XApuDequeueResult", cbXApuDequeueResult)
 	t.bind("xapu.dll", "XApuGetResultCount", cbXApuGetResultCount)

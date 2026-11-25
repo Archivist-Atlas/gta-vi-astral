@@ -873,11 +873,14 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
+	var multiSRVLogCount atomic.Uint32
 	cbListSetRootTable := syscall.NewCallback(func(this, rootIdx, baseDesc uintptr) uintptr {
 		listSlotHits[36].Add(1)
 		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
 			st.mu.Lock()
 			foundSRV := false
+			srvSlots := 0
+			var srvSummary string
 			for s := uintptr(0); s < 8; s++ {
 				slotPtr := baseDesc + s*32
 				tag := *(*uint32)(osPtr(slotPtr))
@@ -894,14 +897,21 @@ func newD3D12XDevice() uintptr {
 						}
 					}
 				case 0x53525632: // "SRV2"
-					if !foundSRV {
-						dim := *(*uint32)(osPtr(slotPtr + 24))
-						va := *(*uint64)(osPtr(slotPtr + 8))
-						w := *(*uint32)(osPtr(slotPtr + 16))
-						h := *(*uint32)(osPtr(slotPtr + 20))
-						fmtID := *(*uint32)(osPtr(slotPtr + 4))
-						swz := *(*uint32)(osPtr(slotPtr + 28))
-						if dim == 3 && va >= 0x10000 && va < 0x800000000000 && w > 0 && h > 0 {
+					dim := *(*uint32)(osPtr(slotPtr + 24))
+					va := *(*uint64)(osPtr(slotPtr + 8))
+					w := *(*uint32)(osPtr(slotPtr + 16))
+					h := *(*uint32)(osPtr(slotPtr + 20))
+					fmtID := *(*uint32)(osPtr(slotPtr + 4))
+					swz := *(*uint32)(osPtr(slotPtr + 28))
+					if (dim == 2 || dim == 3) && va >= 0x10000 && va < 0x800000000000 && w > 0 {
+						if h == 0 {
+							h = 1
+						}
+						srvSlots++
+						if multiSRVLogCount.Load() < 12 {
+							srvSummary += fmt.Sprintf("[s%d:va=0x%X %dx%d f=%d d=%d swz=0x%X] ", s, va, w, h, fmtID, dim, swz)
+						}
+						if !foundSRV {
 							st.activeSRVVA = va
 							st.activeSRVTex = &gpu.HostTextureUpload{
 								GuestVA: va,
@@ -916,6 +926,9 @@ func newD3D12XDevice() uintptr {
 				}
 			}
 			st.mu.Unlock()
+			if srvSlots > 1 && multiSRVLogCount.Add(1) <= 12 {
+				slog.Info("RootTable multi-SRV détectée", "rootIdx", uint32(rootIdx), "count", srvSlots, "slots", srvSummary)
+			}
 		}
 		return 0
 	})
@@ -1950,7 +1963,13 @@ func newD3D12XDevice() uintptr {
 			d = st.resDescs[res]
 			st.mu.Unlock()
 		}
-		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension, d.Layout)
+		fmtID := d.Format
+		if descPtr >= 0x10000 {
+			if vf := *(*uint32)(osPtr(descPtr)); vf != 0 {
+				fmtID = vf
+			}
+		}
+		writeSRV2(handle, va, uint32(d.Width), d.Height, fmtID, d.Dimension, d.Layout)
 		return 0
 	})
 	cbCreatePlacedSRV := syscall.NewCallback(func(this, resDescPtr, srvDescPtr, handle uintptr) uintptr {
