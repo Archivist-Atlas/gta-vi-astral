@@ -1873,8 +1873,24 @@ func newD3D12XDevice() uintptr {
 	var nextFrameToken atomic.Uint64
 	nextFrameToken.Store(1)
 
+	var (
+		winmmDLL            = syscall.NewLazyDLL("winmm.dll")
+		procTimeBeginPeriod = winmmDLL.NewProc("timeBeginPeriod")
+		framePacerMu        sync.Mutex
+		nextFrameDeadline   time.Time
+		framePeriod         = 16667 * time.Microsecond // 60 Hz par défaut
+	)
+	if procTimeBeginPeriod.Find() == nil {
+		_, _, _ = procTimeBeginPeriod.Call(1) // résolution timer Windows 1 ms (évite Sleep(16ms) -> 35ms = 28 FPS)
+	}
 	cbSetFrameInterval := syscall.NewCallback(func(this, output, interval, period, flags uintptr) uintptr {
-		slog.Debug("D3D12DeviceX!SetFrameIntervalX", "interval", interval, "period", period)
+		p := uint32(period)
+		framePacerMu.Lock()
+		if p >= 4000 && p <= 50000 {
+			framePeriod = time.Duration(p) * time.Microsecond
+		}
+		framePacerMu.Unlock()
+		slog.Debug("D3D12DeviceX!SetFrameIntervalX", "interval", interval, "period", p)
 		return hresultOK
 	})
 	cbScheduleFrameEvent := syscall.NewCallback(func(this, eventType, offset, flags uintptr) uintptr {
@@ -1882,7 +1898,19 @@ func newD3D12XDevice() uintptr {
 		return hresultOK
 	})
 	cbWaitFrameEvent := syscall.NewCallback(func(this, eventType, timeout, reserved, flags, outToken uintptr) uintptr {
-		time.Sleep(16 * time.Millisecond)
+		now := time.Now()
+		framePacerMu.Lock()
+		period := framePeriod
+		if nextFrameDeadline.IsZero() || now.After(nextFrameDeadline.Add(period*2)) {
+			nextFrameDeadline = now.Add(period)
+		} else {
+			nextFrameDeadline = nextFrameDeadline.Add(period)
+		}
+		wait := time.Until(nextFrameDeadline)
+		framePacerMu.Unlock()
+		if wait > 0 {
+			time.Sleep(wait)
+		}
 		tok := nextFrameToken.Add(1)
 		slog.Debug("D3D12DeviceX!WaitFrameEventX", "event", eventType, "token", tok)
 		if outToken != 0 {

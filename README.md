@@ -8,15 +8,15 @@ Système modulaire en **Go** pour l'analyse, la recompilation de shaders et l'ex
 > **Projet expérimental en cours de développement — NON JOUABLE actuellement.**
 > Le moteur démarre, charge toutes ses archives (`.rpf` + TTDB + licences), connecte l'utilisateur hors-ligne (`XUser` + `XGameSave`) et tourne en boucle continue **780+ frames `PresentX` sur 45 s (0 crash, 0 `WARN`)** avec recompilation live de ses shaders RDNA2 sur GPU Windows, mais le rendu 3D complet et l'audio ne sont **pas encore fonctionnels**.
 
-## Avancement global : ~45 %
+## Avancement global : ~46 %
 
 ```text
-Progression globale : [█████████░░░░░░░░░░░] 45 %
+Progression globale : [█████████░░░░░░░░░░░] 46 %
 ```
 
 - **Boot natif continu + `XUser` + `XGameSave` + `XAsyncRun` + `XStore` + DirectStorage (`story000.rpf`)** : ✅ Opérationnel (`90 %`)
-- **Interfaces 2D / menus de configuration (`ASTRALPLAYER (A)` -> `EXPÉRIENCE DE NAVIGATION` -> `TERMINER LA CONFIGURATION ?`)** : 🔄 En cours (`~75 %` — navigation fonctionnelle, affichage UI encore imparfait)
-- **Audio console (`xapu` Opus + `AcpHal` XMA2 vers WASAPI)** : 🔄 Début (`~20 %` — sortie WASAPI active, décodage Opus/XMA2 non implémenté)
+- **Interfaces 2D / menus de configuration (`ASTRALPLAYER (A)` -> `EXPÉRIENCE DE NAVIGATION` -> `TERMINER LA CONFIGURATION ?`)** : 🔄 En cours (`~75 %` — navigation et textes fonctionnels, fond de panneau UI encore imparfait)
+- **Audio console (`xapu` Opus + `AcpHal` XMA2 vers WASAPI)** : 🔄 En cours (`~35 %` — décodage Opus 48 kHz pur Go opérationnel pour les sons UI/clics + pacing 60 Hz ; décodage XMA2 et audio d'intro à compléter)
 - **Rendu 3D temps réel & monde ouvert jouable (shaders 3D bindless, G-Buffer, Depth-Stencil, BCPack, ray tracing)** : ⏳ Début (`~15 %`)
 
 | Sous-système | Avancement | État actuel | Reste à faire |
@@ -24,7 +24,7 @@ Progression globale : [█████████░░░░░░░░░░
 | **Chargeur PE / Mémoire / CPU x64** | `90 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, VEH + émulation AMD Zen 2 (`CLZERO`, `MONITORX`, `MWAITX`, `RDPRU`, `CLWB`, SSE4a `INSERTQ`/`EXTRQ`), pools physiques 64 KiB (`xmem` 6,2 Go) + `xmemMapAlias` + `xmemWritePhysical`. | Cas limites CPU/mémoire en monde ouvert. |
 | **Stockage & Streaming (`VirtualFS` / `DirectStorage`)** | `75 %` | 20+ `.rpf` (jusqu'à `story000.rpf` / `story000_script.rpf`) et TTDB `.ttpf` ouverts ; 23 000+ requêtes `ReadAt` + `zlib`, `EnqueueSignal`, et `PAGE_DESTINATION` (pages physiques 64 KiB). | Décompression **BCPack** (textures 3D BC1–BC7) et exécution **asynchrone** multi-thread (pour ne plus bloquer l'audio). |
 | **OS Console / HLE (`xgameruntime`, `GameInput`)** | `88 %` | `xasync`/`XTaskQueue` (ports partagés composites), `xuser` (`AstralPlayer`), `xgamesave` 30 slots sur disque, `xstore`/`xgameui`/`xnetworking` hors-ligne, `OEM\ConsoleMode`, `GameInput` complet (DualSense PS5 / XInput / clavier). | APIs secondaires rencontrées en jeu. |
-| **Audio (`AcpHal` / `xapu` / `chad`)** | `20 %` | Allocation APU, canal `IAcpHal`, `XApuConnect` / `ApuResult` 72 octets, sortie WASAPI active. | Décodage réel **Opus** (`xapu.dll`) et **XMA2** (`AcpHal`), suppression des saccades au chargement. |
+| **Audio (`AcpHal` / `xapu` / `chad`)** | `35 %` | Allocation/mapping APU (`ApuMapVirtualAddress` corrigé), canal `IAcpHal`, décodeur **Opus 48 kHz pur Go** actif (`xapu.dll`, `ApuResult` 80 octets, sons de clics UI audibles), pacing 60 Hz (`timeBeginPeriod(1)`). | Décodage **XMA2** (`AcpHal` SHAPE 350 contextes), correction complète de l'audio global d'intro. |
 | **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `30 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10 partiel, recompilation live HLSL SM 5.0 suffisante pour l'UI 2D Scaleform et quelques Compute Shaders simples. | Masque `EXEC` par lane, descripteurs **bindless**, `LDS`/`FLAT`, émulation wave64, **DXIL SM 6.6**, Mesh/Amplification Shaders (indispensables pour la 3D). |
 | **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `35 %` | Fenêtre Win32 unique 1280×720, `PresentX` à 30 fps, rejeu de passes 2D/UI, RenderTargets offscreen, rafraîchissement dynamique de l'atlas de police, détuilage RDNA2, Compute root bindings de base. | **G-Buffer / MRT**, **Depth-Stencil (`DSV`)**, tas de descripteurs bindless, `ExecuteIndirect`, synchronisation inter-files (`Wait64BitValueX`), rendu 3D complet. |
 
