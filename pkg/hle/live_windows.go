@@ -1399,6 +1399,34 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	t.bind("ws2_32.dll", "getaddrinfo", cbNetBlocked)
 	t.bind("ws2_32.dll", "GetAddrInfoW", cbNetBlocked)
 
+	// --- 4b. Masquage de la fenêtre Win32 fantôme du titre ("America" 3840x2160) ---
+	// Le jeu conserve un HWND parfaitement valide, mais seule la fenêtre GTA VI Astral reste visible.
+	u32Title := syscall.NewLazyDLL("user32.dll")
+	u32CreateWinW := u32Title.NewProc("CreateWindowExW")
+	u32CreateWinA := u32Title.NewProc("CreateWindowExA")
+	u32SetWinPos := u32Title.NewProc("SetWindowPos")
+	const wsVisible uintptr = 0x10000000
+	const swpShowWindow uintptr = 0x0040
+	cbTitleCreateWinW := syscall.NewCallback(func(exStyle, cls, title, style, x, y, w, h, parent, menu, inst, param uintptr) uintptr {
+		r, _, _ := u32CreateWinW.Call(exStyle, cls, title, style&^wsVisible, x, y, w, h, parent, menu, inst, param)
+		return r
+	})
+	cbTitleCreateWinA := syscall.NewCallback(func(exStyle, cls, title, style, x, y, w, h, parent, menu, inst, param uintptr) uintptr {
+		r, _, _ := u32CreateWinA.Call(exStyle, cls, title, style&^wsVisible, x, y, w, h, parent, menu, inst, param)
+		return r
+	})
+	cbTitleShowWin := syscall.NewCallback(func(hwnd, cmdShow uintptr) uintptr {
+		return 1 // TRUE sans afficher la fenêtre fantôme du titre
+	})
+	cbTitleSetWinPos := syscall.NewCallback(func(hwnd, after, x, y, cx, cy, flags uintptr) uintptr {
+		r, _, _ := u32SetWinPos.Call(hwnd, after, x, y, cx, cy, flags&^swpShowWindow)
+		return r
+	})
+	t.bind("user32.dll", "CreateWindowExW", cbTitleCreateWinW)
+	t.bind("user32.dll", "CreateWindowExA", cbTitleCreateWinA)
+	t.bind("user32.dll", "ShowWindow", cbTitleShowWin)
+	t.bind("user32.dll", "SetWindowPos", cbTitleSetWinPos)
+
 	// --- 5. d3d12_xs.dll (Root Signature PC + log CreateDevice) ---
 	type rootSigDesc struct {
 		NumParameters     uint32

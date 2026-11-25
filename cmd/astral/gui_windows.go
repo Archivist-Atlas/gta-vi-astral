@@ -23,7 +23,10 @@ import (
 )
 
 var (
-	guiUser32   = syscall.NewLazyDLL("user32.dll")
+	procAttachConsole = guiKernel32.NewProc("AttachConsole")
+	procGetStdHandle  = guiKernel32.NewProc("GetStdHandle")
+	procGetFileType   = guiKernel32.NewProc("GetFileType")
+	guiUser32         = syscall.NewLazyDLL("user32.dll")
 	guiGdi32    = syscall.NewLazyDLL("gdi32.dll")
 	guiKernel32 = syscall.NewLazyDLL("kernel32.dll")
 	guiShell32  = syscall.NewLazyDLL("shell32.dll")
@@ -161,6 +164,29 @@ type guiApp struct {
 	busy      bool
 	gameCmd   *exec.Cmd
 	pending   []func()
+}
+
+// attachParentConsoleIfCLI rattache la console parente lorsqu'astral.exe (compilé en windowsgui)
+// est lancé en ligne de commande depuis PowerShell/CMD sans redirection de pipe.
+func attachParentConsoleIfCLI() {
+	// Si stdout/stderr sont déjà un pipe ou un fichier (lanceur GUI ou redirection), ne rien toucher.
+	const stdOutHandle = ^uintptr(10) // STD_OUTPUT_HANDLE (-11)
+	hOut, _, _ := procGetStdHandle.Call(stdOutHandle)
+	if hOut != 0 && hOut != ^uintptr(0) {
+		ft, _, _ := procGetFileType.Call(hOut)
+		if ft == 2 || ft == 3 || ft == 1 { // CHAR, PIPE, DISK déjà valides
+			return
+		}
+	}
+	const attachParentProcess = ^uintptr(0) // (DWORD)-1
+	r, _, _ := procAttachConsole.Call(attachParentProcess)
+	if r == 0 {
+		return
+	}
+	if f, err := os.OpenFile("CONOUT$", os.O_WRONLY, 0); err == nil {
+		os.Stdout = f
+		os.Stderr = f
+	}
 }
 
 func runDefaultUI() {

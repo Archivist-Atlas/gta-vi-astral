@@ -2,6 +2,8 @@
 
 package main
 
+func attachParentConsoleIfCLI() {}
+
 func runDefaultUI() {
 	runInteractiveMenu()
 }

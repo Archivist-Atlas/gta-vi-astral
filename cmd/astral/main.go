@@ -29,6 +29,9 @@ import (
 const version = "0.1.0-dev"
 
 func main() {
+	if len(os.Args) >= 2 {
+		attachParentConsoleIfCLI()
+	}
 	core.InitLogger(os.Stderr)
 
 	if len(os.Args) < 2 {
