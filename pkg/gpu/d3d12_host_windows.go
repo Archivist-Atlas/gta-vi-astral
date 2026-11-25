@@ -544,12 +544,44 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 						// ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView (slot 38)
 						_ = comCall(h.CmdList, 38, 0, uintptr(h.UploadCBGPU+cbSlot))
 					}
+					// Expansion Xbox RECTLIST (topo=17, 3 sommets par rectangle -> 2 triangles = 6 sommets)
+					drawVB := d.VBData
+					drawCnt := d.VertexCount
+					if !d.Indexed && (d.Topology == 17 || d.Topology >= 32) && d.VertexCount >= 3 && d.VertexCount%3 == 0 && d.VBStride == 24 && uint32(len(d.VBData)) >= d.VertexCount*24 {
+						numRects := d.VertexCount / 3
+						expanded := make([]byte, numRects*6*24)
+						for r := uint32(0); r < numRects; r++ {
+							v0 := d.VBData[(r*3+0)*24 : (r*3+1)*24]
+							v1 := d.VBData[(r*3+1)*24 : (r*3+2)*24]
+							v2 := d.VBData[(r*3+2)*24 : (r*3+3)*24]
+							var v3 [24]byte
+							copy(v3[:], v2)
+							f0 := unsafe.Slice((*float32)(unsafe.Pointer(&v0[0])), 6)
+							f1 := unsafe.Slice((*float32)(unsafe.Pointer(&v1[0])), 6)
+							f2 := unsafe.Slice((*float32)(unsafe.Pointer(&v2[0])), 6)
+							f3 := unsafe.Slice((*float32)(unsafe.Pointer(&v3[0])), 6)
+							f3[0] = f1[0] + f2[0] - f0[0]
+							f3[1] = f1[1] + f2[1] - f0[1]
+							f3[2] = f1[2] + f2[2] - f0[2]
+							f3[4] = f1[4] + f2[4] - f0[4]
+							f3[5] = f1[5] + f2[5] - f0[5]
+							base := r * 6 * 24
+							copy(expanded[base+0*24:], v0)
+							copy(expanded[base+1*24:], v1)
+							copy(expanded[base+2*24:], v2)
+							copy(expanded[base+3*24:], v1)
+							copy(expanded[base+4*24:], v3[:])
+							copy(expanded[base+5*24:], v2)
+						}
+						drawVB = expanded
+						drawCnt = numRects * 6
+					}
 					// Upload Vertex Buffer si fourni par le titre
-					if len(d.VBData) > 0 && d.VBStride > 0 && h.UploadVBPtr != 0 && h.UploadVBGPU != 0 {
-						nBytes := uint64(len(d.VBData))
+					if len(drawVB) > 0 && d.VBStride > 0 && h.UploadVBPtr != 0 && h.UploadVBGPU != 0 {
+						nBytes := uint64(len(drawVB))
 						if vbOff+nBytes <= (256 << 10) {
 							dstVB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadVBPtr))), 256<<10)[vbOff : vbOff+nBytes]
-							copy(dstVB, d.VBData)
+							copy(dstVB, drawVB)
 							vbv := d3d12VertexBufferView{
 								BufferLocation: h.UploadVBGPU + vbOff,
 								SizeInBytes:    uint32(nBytes),
@@ -582,7 +614,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 							continue
 						}
 					}
-					_ = comCall(h.CmdList, 12, uintptr(d.VertexCount), uintptr(d.InstanceCount), uintptr(d.StartVertex), uintptr(d.StartInstance))
+					_ = comCall(h.CmdList, 12, uintptr(drawCnt), uintptr(d.InstanceCount), uintptr(d.StartVertex), uintptr(d.StartInstance))
 				}
 			}
 

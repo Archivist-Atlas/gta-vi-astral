@@ -62,8 +62,11 @@ func (e SigElement) ComponentCount() int {
 	return n
 }
 
-// DXGIFormat retourne le DXGI_FORMAT correspondant à ComponentType et Mask.
+// DXGIFormat retourne le DXGI_FORMAT correspondant à ComponentType, SemanticName et Mask.
 func (e SigElement) DXGIFormat() uint32 {
+	if strings.HasPrefix(strings.ToUpper(e.SemanticName), "COLOR") && e.ComponentType == 3 && e.ComponentCount() == 4 {
+		return 28 // DXGI_FORMAT_R8G8B8A8_UNORM (4 octets, stride standard 24B = POS3+COL4+UV2)
+	}
 	n := e.ComponentCount()
 	switch e.ComponentType {
 	case 1: // UINT

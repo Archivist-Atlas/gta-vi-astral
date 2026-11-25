@@ -135,33 +135,27 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 		// Injection des user SGPRs depuis RootConst
 		b.WriteString("    s[0] = RootConst[0].x; s[1] = RootConst[0].y; s[2] = RootConst[0].z; s[3] = RootConst[0].w;\n")
 
-		// Liaison des entrées ISG1 vers les VGPR initiaux
+		// Liaison des entrées ISG1 vers les VGPR initiaux (convention RDNA2/Xbox :
+		// v[0..3] = valeurs système VertexID/InstanceID, attribut i = v[4 + Register*4 .. +3]).
 		if !isPS {
 			vidBound := false
-			nextV := 0
 			for idx, el := range inputs {
 				up := strings.ToUpper(el.SemanticName)
 				if up == "SV_VERTEXID" {
 					b.WriteString(fmt.Sprintf("    v[0] = inp.in%d;\n", idx))
 					vidBound = true
-					if nextV < 1 {
-						nextV = 1
-					}
 				} else if up == "SV_INSTANCEID" {
 					b.WriteString(fmt.Sprintf("    v[1] = inp.in%d;\n", idx))
-					if nextV < 2 {
-						nextV = 2
-					}
 				} else if !strings.HasPrefix(up, "SV_") {
+					baseV := int(4 + el.Register*4)
 					comps := el.ComponentCount()
 					chs := "xyzw"
-					for c := 0; c < comps && nextV < 64; c++ {
+					for c := 0; c < comps && baseV+c < 64; c++ {
 						if comps == 1 {
-							b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d);\n", nextV, idx))
+							b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d);\n", baseV+c, idx))
 						} else {
-							b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d.%c);\n", nextV, idx, chs[c]))
+							b.WriteString(fmt.Sprintf("    v[%d] = asuint(inp.in%d.%c);\n", baseV+c, idx, chs[c]))
 						}
-						nextV++
 					}
 				}
 			}

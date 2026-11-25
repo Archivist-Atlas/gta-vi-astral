@@ -90,6 +90,7 @@ func newD3D12XDevice() uintptr {
 	st.nextGPUAddr.Store(0x0000200000000000)
 
 	gpuTrace := os.Getenv("ASTRAL_GPU_TRACE") == "1"
+	dumpFrame := os.Getenv("ASTRAL_DUMP_FRAME") == "1"
 	var listSlotHits [160]atomic.Uint64
 
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
@@ -303,6 +304,31 @@ func newD3D12XDevice() uintptr {
 				}
 				slog.Info("GPU_TRACE CommandListX slots @ frame 60", "slots", summary, "psos", st.psoCreated.Load(), "heaps", st.heapsCreated.Load(), "res", st.resCreated.Load())
 			}
+		}
+		if dumpFrame && n == 500 {
+			var sb string
+			sb += fmt.Sprintf("=== FRAME 500: %d draws, %d dispatches, clear=%v ===\n", len(draws), len(dispatches), clr)
+			for i, d := range draws {
+				var vbPreview string
+				if len(d.VBData) >= 24 {
+					f := unsafe.Slice((*float32)(unsafe.Pointer(&d.VBData[0])), 6)
+					vbPreview = fmt.Sprintf("f=[%.3f,%.3f,%.3f,%.3f,%.3f,%.3f]", f[0], f[1], f[2], f[3], f[4], f[5])
+				}
+				var texInfo string
+				if d.SRVTex != nil {
+					nz := 0
+					for _, b := range d.SRVTex.Pixels {
+						if b != 0 {
+							nz++
+						}
+					}
+					texInfo = fmt.Sprintf("tex=%dx%d fmt=%d swz=0x%X nz=%d/%d", d.SRVTex.Width, d.SRVTex.Height, d.SRVTex.Format, d.SRVTex.Swizzle, nz, len(d.SRVTex.Pixels))
+				}
+				sb += fmt.Sprintf("  draw[%d]: idx=%v topo=%d cnt=%d inst=%d pso=0x%X vbStride=%d vbLen=%d %s ibLen=%d cbLen=%d %s\n",
+					i, d.Indexed, d.Topology, d.VertexCount, d.InstanceCount, d.HostPSO, d.VBStride, len(d.VBData), vbPreview, len(d.IBData), len(d.CBData), texInfo)
+			}
+			_ = os.WriteFile(os.TempDir()+"\\astral_frame500.txt", []byte(sb), 0o644)
+			slog.Info("ASTRAL_DUMP_FRAME écrit", "draws", len(draws), "dispatches", len(dispatches))
 		}
 		gpu.PresentHostFrame(0, clr, nil, 0, 0, 0, dispatches, draws...)
 		return hresultOK
@@ -633,6 +659,10 @@ func newD3D12XDevice() uintptr {
 			"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
 			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
 		)
+		if dumpFrame {
+			_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_vs.hlsl", os.TempDir(), hPSO), []byte(vsOut.Source), 0o644)
+			_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_ps.hlsl", os.TempDir(), hPSO), []byte(psOut.Source), 0o644)
+		}
 		if gpuTrace {
 			slog.Info("GPU_TRACE PSO missing ops", "guestPSO", fmt.Sprintf("0x%X", psoObj), "vsMissing", vsOut.MissingOps, "psMissing", psOut.MissingOps)
 		}
@@ -669,20 +699,27 @@ func newD3D12XDevice() uintptr {
 				if cbVA >= 0x10000 && cbVA < 0x800000000000 {
 					st.activeRootVA = cbVA
 				}
-			case 0x53525632: // "SRV2" : { tag u32, fmt u32 (+4), gpuVA u64 (+8), w u32 (+16), h u32 (+20), dim u32 (+24), swz u32 (+28) }
-				dim := *(*uint32)(osPtr(baseDesc + 24))
-				va := *(*uint64)(osPtr(baseDesc + 8))
-				w := *(*uint32)(osPtr(baseDesc + 16))
-				h := *(*uint32)(osPtr(baseDesc + 20))
-				fmtID := *(*uint32)(osPtr(baseDesc + 4))
-				swz := *(*uint32)(osPtr(baseDesc + 28))
-				if dim == 3 && va >= 0x10000 && va < 0x800000000000 && w > 0 && h > 0 {
-					st.activeSRVTex = &gpu.HostTextureUpload{
-						GuestVA: va,
-						Width:   w,
-						Height:  h,
-						Format:  fmtID,
-						Swizzle: swz,
+			case 0x53525632: // "SRV2" : scan jusqu'à 4 slots (32B chacun) pour trouver la première Texture2D
+				for s := uintptr(0); s < 4; s++ {
+					slotPtr := baseDesc + s*32
+					if *(*uint32)(osPtr(slotPtr)) != 0x53525632 {
+						break
+					}
+					dim := *(*uint32)(osPtr(slotPtr + 24))
+					va := *(*uint64)(osPtr(slotPtr + 8))
+					w := *(*uint32)(osPtr(slotPtr + 16))
+					h := *(*uint32)(osPtr(slotPtr + 20))
+					fmtID := *(*uint32)(osPtr(slotPtr + 4))
+					swz := *(*uint32)(osPtr(slotPtr + 28))
+					if dim == 3 && va >= 0x10000 && va < 0x800000000000 && w > 0 && h > 0 {
+						st.activeSRVTex = &gpu.HostTextureUpload{
+							GuestVA: va,
+							Width:   w,
+							Height:  h,
+							Format:  fmtID,
+							Swizzle: swz,
+						}
+						break
 					}
 				}
 			default:
