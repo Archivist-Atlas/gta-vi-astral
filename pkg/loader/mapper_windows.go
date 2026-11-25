@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/core"
@@ -382,32 +383,60 @@ func installVEH(sess *LiveSession) {
 			// Émulation AMD Zen 2 sur CPU Intel (0xC000001D = STATUS_ILLEGAL_INSTRUCTION) :
 			// - CLZERO   (0F 01 FC) : met à zéro la ligne de cache 64 octets pointée par RAX
 			// - MONITORX (0F 01 FA) / MWAITX (0F 01 FB) : attente basse consommation (no-op sûr)
+			// - RDPRU    (0F 01 FD) : lecture compteur MPERF/APERF -> horloge monotone dans EAX:EDX
+			// - CLWB     (66 [REX] 0F AE /6) : cache line write-back hint (no-op sûr sur PC cohérent)
+			// - SSE4a    (INSERTQ F2 0F 78/79, EXTRQ 66 0F 78/79) : bitfield insert/extract sur XMM0..XMM15
 			if code == 0xC000001D && ep.ContextRecord != 0 && addr > 0x10000 {
-				b := unsafe.Slice((*byte)(ptrFromAddr(addr)), 12)
-				if b[0] == 0x0F && b[1] == 0x01 && (b[2] == 0xFA || b[2] == 0xFB) {
-					ripPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0xF8))
-					*ripPtr += 3
-					return ^uintptr(0) // EXCEPTION_CONTINUE_EXECUTION (-1)
+				room := 0x1000 - (addr & 0xFFF)
+				nRead := room
+				if nRead > 16 {
+					nRead = 16
 				}
-				if b[0] == 0x0F && b[1] == 0x01 && b[2] == 0xFC {
-					raxPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0x78))
-					ripPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0xF8))
-					start := *raxPtr &^ 63
-					// Fast-path : boucle "clzero; add rax, 0x40; cmp rax, r10; jb -12"
-					if b[3] == 0x48 && b[4] == 0x83 && b[5] == 0xC0 && b[6] == 0x40 &&
-						b[7] == 0x4C && b[8] == 0x39 && b[9] == 0xD0 && b[10] == 0x72 && b[11] == 0xF4 {
-						r10 := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0xC8))
-						if r10 > start && (r10-start) <= (256<<20) {
-							n := ((r10 - start + 63) &^ 63)
-							clear(unsafe.Slice((*byte)(ptrFromAddr(uintptr(start))), n))
-							*raxPtr = start + n
-							*ripPtr += 12
-							return ^uintptr(0) // EXCEPTION_CONTINUE_EXECUTION (-1)
+				b := unsafe.Slice((*byte)(ptrFromAddr(addr)), nRead)
+				ripPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0xF8))
+				if len(b) >= 3 && b[0] == 0x0F && b[1] == 0x01 {
+					switch b[2] {
+					case 0xFA, 0xFB: // MONITORX / MWAITX
+						*ripPtr += 3
+						return ^uintptr(0)
+					case 0xFD: // RDPRU
+						rcx := uint32(*(*uint64)(ptrFromAddr(ep.ContextRecord + 0x80)))
+						var cycles uint64
+						if rcx <= 1 {
+							cycles = uint64(time.Now().UnixNano())
 						}
+						*(*uint64)(ptrFromAddr(ep.ContextRecord + 0x78)) = cycles & 0xFFFFFFFF
+						*(*uint64)(ptrFromAddr(ep.ContextRecord + 0x88)) = cycles >> 32
+						*ripPtr += 3
+						return ^uintptr(0)
+					case 0xFC: // CLZERO
+						raxPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0x78))
+						start := *raxPtr &^ 63
+						if len(b) >= 12 && b[3] == 0x48 && b[4] == 0x83 && b[5] == 0xC0 && b[6] == 0x40 &&
+							b[7] == 0x4C && b[8] == 0x39 && b[9] == 0xD0 && b[10] == 0x72 && b[11] == 0xF4 {
+							r10 := *(*uint64)(ptrFromAddr(ep.ContextRecord + 0xC8))
+							if r10 > start && (r10-start) <= (256<<20) {
+								n := ((r10 - start + 63) &^ 63)
+								clear(unsafe.Slice((*byte)(ptrFromAddr(uintptr(start))), n))
+								*raxPtr = start + n
+								*ripPtr += 12
+								return ^uintptr(0)
+							}
+						}
+						clear(unsafe.Slice((*byte)(ptrFromAddr(uintptr(start))), 64))
+						*ripPtr += 3
+						return ^uintptr(0)
 					}
-					clear(unsafe.Slice((*byte)(ptrFromAddr(uintptr(start))), 64))
-					*ripPtr += 3
-					return ^uintptr(0) // EXCEPTION_CONTINUE_EXECUTION (-1)
+				}
+				if l := clwbLen(b); l > 0 {
+					*ripPtr += uint64(l)
+					return ^uintptr(0)
+				}
+				// XMM0..XMM15 dans Windows x64 CONTEXT : FltSave (+0x100) + XmmRegisters (+0xA0) = +0x1A0
+				xmm := (*[16][2]uint64)(ptrFromAddr(ep.ContextRecord + 0x1A0))
+				if l := emulateSSE4a(b, xmm); l > 0 {
+					*ripPtr += uint64(l)
+					return ^uintptr(0)
 				}
 			}
 			vehMu.RLock()
@@ -421,7 +450,7 @@ func installVEH(sess *LiveSession) {
 				dataDir = s.DataDir
 			}
 			msg := fmt.Sprintf("ASTRAL VEH: exception 0x%08X à %s", code, where)
-			if (code == 0xC0000005 || code == 0x80000003 || code == 0xC0000374) && ep.ContextRecord != 0 {
+			if (code == 0xC0000005 || code == 0xC000001D || code == 0x80000003 || code == 0xC0000374) && ep.ContextRecord != 0 {
 				if code == 0xC0000005 && ep.ExceptionRecord.NumberParameters >= 2 {
 					op := "read"
 					if ep.ExceptionRecord.ExceptionInformation[0] == 1 {

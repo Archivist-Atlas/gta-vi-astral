@@ -8,10 +8,10 @@ Système modulaire en **Go** pour l'analyse, la recompilation de shaders et l'ex
 > **Projet expérimental en cours de développement — NON JOUABLE actuellement.**
 > Le moteur démarre, charge toutes ses archives (`.rpf` + TTDB + licences), connecte l'utilisateur hors-ligne (`XUser` + `XGameSave`) et tourne en boucle continue **780+ frames `PresentX` sur 45 s (0 crash, 0 `WARN`)** avec recompilation live de ses shaders RDNA2 sur GPU Windows, mais le rendu 3D complet et l'audio ne sont **pas encore fonctionnels**.
 
-## Avancement global : ~82 %
+## Avancement global : ~83 %
 
 ```text
-Progression globale : [████████████████░░░░] 82 %
+Progression globale : [█████████████████░░░] 83 %
 ```
 
 - **Boot natif continu + `XUser` + `XGameSave` + `XAsyncRun` + `XStore` + GPU Compute (1 380+ frames / 65 s, 0 crash)** : ✅ Terminé (`100 %`)
@@ -21,7 +21,7 @@ Progression globale : [████████████████░░░
 
 | Sous-système | Avancement | État actuel | Reste à faire |
 | :--- | :---: | :--- | :--- |
-| **Chargeur PE / Mémoire / CPU x64** | `94 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, VEH + émulation `CLZERO`/`MONITORX`/`MWAITX`, pools physiques 64 KiB (`xmem` 6,2 Go) + **aliasing de pages physiques `xmemMapAlias` (`MapViewOfFile3`) pour le tas de streaming GPU**. | Ajustements ponctuels sur de nouveaux chemins CPU en jeu. |
+| **Chargeur PE / Mémoire / CPU x64** | `96 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, **VEH + émulation complète AMD Zen 2 sur CPU Intel (`CLZERO`, `MONITORX`, `MWAITX`, `RDPRU`, `CLWB` et SSE4a `INSERTQ`/`EXTRQ` sur `XMM0..15`)**, pools physiques 64 KiB (`xmem` 6,2 Go) + aliasing de pages physiques `xmemMapAlias` (`MapViewOfFile3`) pour le tas de streaming GPU. | Ajustements ponctuels sur de nouveaux chemins CPU en jeu. |
 | **Stockage & Streaming (`VirtualFS` / `DirectStorage`)** | `86 %` | 14+ `.rpf` (dont `core_restofworld.rpf` / `core_restofworld001.rpf`), `core_bvh4.rpf`, `core_licenses_data.rpf` et archives TTDB (`ttdb_ui`, `ttdb_peds`, `ttdb_props`, `ttdb_vfx`, `textures_loose`) ouverts ; **11 500+ requêtes `ReadAt` + `zlib`** avec vtables COM partagées O(1), `IDStorageQueueX::EnqueueSignal` -> `ID3D12Fence::Signal` et streaming de textures BC3 actif. | Décompression matérielle **BCPack** (BC1–BC7) et `PAGE_DESTINATION` pour le streaming lourd du monde. |
 | **OS Console / HLE (`xgameruntime`, `GameInput`, Audio)** | `99 %` | **`xasync`/`XTaskQueue` complet avec ports partagés `XTaskQueueCreateComposite` (`XAsyncRun`, `XAsyncGetStatus` + complétions unifiées `XUser`/`XGameSave`/`XStore`)**, `xuser` complet (`AstralPlayer`, `E_GAMEUSER_FAILED_TO_GET_TOKEN = 0x89245111`), `xgamesave` 30 slots sur disque (`GetContainerInfo` -> `S_OK`, `EnumerateContainerInfo`), `xstore` & `xgameui` hors-ligne, `OEM\ConsoleMode`, `RegisterAppStateChangeNotification` / `AppConstrained`, `xnetworking` 18 slots + proxy `MFPlat.DLL!MFCreateSourceResolver`, `IAcpHal` + `xapu` (`XApuEnqueueCommand` actif), et **`GameInput` complet** (DualSense PS5 `0x054C:0x0CE6` / XInput / HID + clavier). | Décodage audio PCM réel (`xapu` Opus / `XMA2` vers WASAPI). |
 | **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `69 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10 (littéraux 32-bit `VOP2`/`VOP3` 12 octets), IR SSA, `ISG1`/`OSG1`, recompilation live RDNA2 -> HLSL **VS/PS (6+ PSOs compilés jusqu'à `50/50` VS / `73/76` PS) & Compute (`cs_5_0` : 5+ Compute PSOs compilés en matériel D3D12 jusqu'à `1 871/1 928 ins`)**, détection auto du slot CBV (`vsCBSlot=0..5`), `MUBUF` indexé dynamique, `v_med3_f32` et `RootConst[1024]`. | Masque `EXEC` par lane, descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), compilation asynchrone. |
