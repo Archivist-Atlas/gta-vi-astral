@@ -90,6 +90,7 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 		b.WriteString("    [unroll] for (uint _i = 0; _i < 64; _i++) { s[_i] = 0u; v[_i] = 0u; }\n")
 		b.WriteString("    bool scc = (gid.x == 0xFFFFFFFFu);\n")
 		b.WriteString("    bool vcc = (gtid.x == 0xFFFFFFFFu);\n")
+		b.WriteString("    bool _exec = true;\n")
 		b.WriteString("    s[0] = RootConst[0].x; s[1] = RootConst[0].y; s[2] = gid.x; s[3] = gid.y; s[4] = gid.z;\n")
 		b.WriteString("    v[0] = gtid.x; v[1] = gtid.y; v[2] = gtid.z;\n")
 	} else {
@@ -126,6 +127,7 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 		b.WriteString("    [unroll] for (uint _i = 0; _i < 64; _i++) { s[_i] = 0u; v[_i] = 0u; }\n")
 		b.WriteString("    bool scc = false;\n")
 		b.WriteString("    bool vcc = false;\n")
+		b.WriteString("    bool _exec = true;\n")
 		b.WriteString("    float4 exp_pos = float4(0.0, 0.0, 0.0, 1.0);\n")
 		b.WriteString("    float4 exp_param[8];\n")
 		b.WriteString("    float4 exp_mrt[4];\n")
@@ -363,7 +365,12 @@ func emitSingleInst(b *strings.Builder, gi GFX10Inst, isPS, isCS bool, inputs []
 	}
 	if stmt, ok := lowerGFX10ToHLSL(gi, isPS, isCS, inputs); ok {
 		if stmt != "" {
-			b.WriteString(indent + stmt + "\n")
+			switch gi.Encoding {
+			case EncVOP1, EncVOP2, EncVOP3, EncVOPC, EncMIMG:
+				b.WriteString(indent + "if (_exec) { " + stmt + " }\n")
+			default:
+				b.WriteString(indent + stmt + "\n")
+			}
 		}
 		out.LoweredInsts++
 	} else {
@@ -403,6 +410,10 @@ func gfx10SrcU32(src uint32, lit uint32, hasLit bool) string {
 	switch {
 	case src < 64:
 		return fmt.Sprintf("s[%d]", src)
+	case src == 106: // VCC_LO
+		return "(vcc ? 1u : 0u)"
+	case src == 126: // EXEC_LO
+		return "(_exec ? 1u : 0u)"
 	case src >= 128 && src <= 192:
 		return fmt.Sprintf("%du", src-128)
 	case src >= 193 && src <= 208:
@@ -675,10 +686,19 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 		ssrc0 := w0 & 0xFF
 		op := (w0 >> 8) & 0xFF
 		sdst := (w0 >> 16) & 0x7F
-		if sdst >= 64 {
-			return "", true // registres système (EXEC/VCC/M0) ignorés en mode scalaire
-		}
 		su := gfx10SrcU32(ssrc0, gi.Literal, gi.HasLit)
+		if sdst == 126 { // EXEC_LO
+			switch op {
+			case 0x03, 0x04: // s_mov_b32 / s_mov_b64 exec, src
+				return fmt.Sprintf("_exec = (%s != 0u);", su), true
+			case 0x07, 0x08: // s_not_b32 / s_not_b64 exec, src
+				return fmt.Sprintf("_exec = (%s == 0u);", su), true
+			}
+			return "", true
+		}
+		if sdst >= 64 {
+			return "", true
+		}
 		switch op {
 		case 0x03: // s_mov_b32
 			return fmt.Sprintf("s[%d] = %s;", sdst, su), true
@@ -689,8 +709,16 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 			return fmt.Sprintf("s[%d] = %s;", sdst, su), true
 		case 0x07: // s_not_b32
 			return fmt.Sprintf("s[%d] = ~(%s);", sdst, su), true
-		case 0x1D, 0x20, 0x21, 0x24: // s_wqm_b64 / s_and_saveexec_b64 / s_and_saveexec_b32
+		case 0x1D: // s_wqm_b64
 			return "", true
+		case 0x20, 0x21, 0x24, 0x3C: // s_and_saveexec_b64 / b32
+			return fmt.Sprintf("s[%d] = _exec ? 1u : 0u; _exec = _exec && (%s != 0u);", sdst, su), true
+		case 0x22, 0x3E: // s_or_saveexec_b64 / b32
+			return fmt.Sprintf("s[%d] = _exec ? 1u : 0u; _exec = _exec || (%s != 0u);", sdst, su), true
+		case 0x23, 0x3F: // s_xor_saveexec_b64 / b32
+			return fmt.Sprintf("s[%d] = _exec ? 1u : 0u; _exec = (_exec != (%s != 0u));", sdst, su), true
+		case 0x26, 0x42: // s_andn2_saveexec_b64 / b32
+			return fmt.Sprintf("s[%d] = _exec ? 1u : 0u; _exec = _exec && (%s == 0u);", sdst, su), true
 		}
 
 	case EncSOPK:
@@ -709,11 +737,24 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 		ssrc1 := (w0 >> 8) & 0xFF
 		sdst := (w0 >> 16) & 0x7F
 		op := (w0 >> 23) & 0x7F
+		s0 := gfx10SrcU32(ssrc0, gi.Literal, gi.HasLit)
+		s1 := gfx10SrcU32(ssrc1, gi.Literal, gi.HasLit)
+		if sdst == 126 { // EXEC_LO : masquage par lane (ex. branches sRGB / if-else)
+			switch op {
+			case 0x0E, 0x0F: // s_and_b32 / b64
+				return fmt.Sprintf("_exec = ((%s != 0u) && (%s != 0u));", s0, s1), true
+			case 0x10, 0x11: // s_or_b32 / b64
+				return fmt.Sprintf("_exec = ((%s != 0u) || (%s != 0u));", s0, s1), true
+			case 0x12, 0x13: // s_xor_b32 / b64
+				return fmt.Sprintf("_exec = ((%s != 0u) != (%s != 0u));", s0, s1), true
+			case 0x14, 0x15: // s_andn2_b32 / b64
+				return fmt.Sprintf("_exec = ((%s != 0u) && (%s == 0u));", s0, s1), true
+			}
+			return "", true
+		}
 		if sdst >= 64 {
 			return "", true
 		}
-		s0 := gfx10SrcU32(ssrc0, gi.Literal, gi.HasLit)
-		s1 := gfx10SrcU32(ssrc1, gi.Literal, gi.HasLit)
 		switch op {
 		case 0x00, 0x02, 0x04: // s_add_u32 / s_add_i32 / s_addc_u32
 			return fmt.Sprintf("s[%d] = (%s + %s);", sdst, s0, s1), true
@@ -868,9 +909,23 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 		if !isPS {
 			return "", false
 		}
-		if vdata+3 < 64 && vaddr+1 < 64 {
-			return fmt.Sprintf("{ float4 _t = Tex0.Sample(Samp0, float2(asfloat(v[%d]), asfloat(v[%d]))); v[%d]=asuint(_t.x); v[%d]=asuint(_t.y); v[%d]=asuint(_t.z); v[%d]=asuint(_t.w); }",
-				vaddr, vaddr+1, vdata, vdata+1, vdata+2, vdata+3), true
+		if vdata < 64 && vaddr+1 < 64 {
+			dmask := (w0 >> 8) & 0xF
+			if dmask == 0 {
+				dmask = 0xF
+			}
+			chs := [4]byte{'x', 'y', 'z', 'w'}
+			var sb strings.Builder
+			sb.WriteString(fmt.Sprintf("{ float4 _t = Tex0.Sample(Samp0, float2(asfloat(v[%d]), asfloat(v[%d])));", vaddr, vaddr+1))
+			dstReg := vdata
+			for c := uint32(0); c < 4; c++ {
+				if dmask&(1<<c) != 0 && dstReg < 64 {
+					sb.WriteString(fmt.Sprintf(" v[%d]=asuint(_t.%c);", dstReg, chs[c]))
+					dstReg++
+				}
+			}
+			sb.WriteString(" }")
+			return sb.String(), true
 		}
 
 	case EncEXP:
