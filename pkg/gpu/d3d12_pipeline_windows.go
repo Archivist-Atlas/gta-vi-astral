@@ -758,7 +758,7 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 		srvGPU:   gpuHandle,
 		uploaded: true,
 	}
-	slog.Info("Host D3D12 Texture2D SRV créée et uploadée", "va", fmt.Sprintf("0x%X", tx.GuestVA), "w", tx.Width, "h", tx.Height, "fmt", fmtID, "slot", slot)
+	slog.Info("Host D3D12 Texture2D SRV créée et uploadée", "va", fmt.Sprintf("0x%X", tx.GuestVA), "w", tx.Width, "h", tx.Height, "fmt", fmtID, "swz", fmt.Sprintf("0x%X", tx.Swizzle), "slot", slot)
 	return gpuHandle
 }
 

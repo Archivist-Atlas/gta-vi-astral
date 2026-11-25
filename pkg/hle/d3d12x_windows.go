@@ -35,6 +35,36 @@ type fenceWaiter struct {
 
 var k32SetEvent = k32.NewProc("SetEvent")
 
+type winMemBasicInfo struct {
+	BaseAddress       uintptr
+	AllocationBase    uintptr
+	AllocationProtect uint32
+	PartitionId       uint16
+	_pad0             uint16
+	RegionSize        uintptr
+	State             uint32
+	Protect           uint32
+	Type              uint32
+	_pad1             uint32
+}
+
+func isGuestReadable(addr uintptr, sz uint64) bool {
+	if addr < 0x10000 || addr >= 0x800000000000 || sz == 0 {
+		return false
+	}
+	var mbi winMemBasicInfo
+	r, _, _ := k32VirtualQuery.Call(addr, uintptr(unsafe.Pointer(&mbi)), unsafe.Sizeof(mbi))
+	if r == 0 || mbi.State != 0x1000 /* MEM_COMMIT */ {
+		return false
+	}
+	prot := mbi.Protect & 0xFF
+	if prot == 0x01 /* NOACCESS */ || mbi.Protect&0x100 /* PAGE_GUARD */ != 0 {
+		return false
+	}
+	end := mbi.BaseAddress + mbi.RegionSize
+	return addr+uintptr(sz) <= end
+}
+
 // d3d12xState centralise les objets COM Xbox Series D3D12.X créés pendant le boot.
 type d3d12xState struct {
 	mu              sync.Mutex
@@ -395,27 +425,85 @@ func newD3D12XDevice() uintptr {
 	})
 	// Vtables partagées O(1) pour Queue, Allocator, DescriptorHeap, Resource, PSO et enfants génériques
 	// (évite la limite de 2000 syscall.NewCallback du runtime Go lorsque le jeu crée des milliers de ressources).
+	var pageMapLogged atomic.Bool
+	cbQueueCopyPageMappings := syscall.NewCallback(func(this, countArg, batchesPtr, poolArg, poolPagesArg, flagsArg uintptr) uintptr {
+		count := uint32(countArg)
+		pool := uint64(poolArg)
+		poolPages := uint32(poolPagesArg)
+		if count == 0 || batchesPtr < 0x10000 {
+			return hresultOK
+		}
+		type pageRange struct {
+			kind  uint32
+			start uint32
+			count uint32
+		}
+		type pageBatch struct {
+			destination uint64
+			count       uint32
+			_pad        uint32
+			ranges      uintptr
+		}
+		const pageBytes = uint64(64 << 10)
+		batches := unsafe.Slice((*pageBatch)(osPtr(batchesPtr)), count)
+		var mappedPages uint64
+		for _, b := range batches {
+			if b.ranges < 0x10000 || b.count == 0 {
+				continue
+			}
+			ranges := unsafe.Slice((*pageRange)(osPtr(b.ranges)), b.count)
+			at := b.destination
+			for _, r := range ranges {
+				lenBytes := uint64(r.count) * pageBytes
+				src := pool + uint64(r.start)*pageBytes
+				switch r.kind {
+				case 0: // plage contiguë depuis le pool
+					if uint64(r.start)+uint64(r.count) <= uint64(poolPages) {
+						if xmemMapAlias(at, src, lenBytes) {
+							mappedPages += uint64(r.count)
+						}
+					}
+				case 1: // page constante répétée r.count fois
+					if r.start < poolPages {
+						for k := uint64(0); k < uint64(r.count); k++ {
+							if xmemMapAlias(at+k*pageBytes, src, pageBytes) {
+								mappedPages++
+							}
+						}
+					}
+				case 2: // démapping
+					_ = xmemMapAlias(at, 0, lenBytes)
+				case 3: // inchangé
+				}
+				at += lenBytes
+			}
+		}
+		if mappedPages > 0 && pageMapLogged.CompareAndSwap(false, true) {
+			slog.Info("ID3D12CommandQueueX!CopyPageMappingsBatchX actif", "batches", count, "mappedPages", mappedPages, "pool", fmt.Sprintf("0x%X", pool))
+		}
+		return hresultOK
+	})
 	queueProto := NewCOMObjectWithHeader("ID3D12CommandQueueX", 48, 0x40, map[int]uintptr{
 		3:  cbOK, // GetPrivateData
 		4:  cbOK, // SetPrivateData
 		5:  cbOK, // SetPrivateDataInterface
 		6:  cbOK, // SetName
 		7:  cbGetDevice,
-		10: cbQueueExecuteLists,  // ExecuteCommandLists
-		14: cbQueueSignal,        // Signal (2020)
-		15: cbOK,                 // Wait (2020)
-		16: cbQueueSignal,        // Signal (2026, 0x80)
-		17: cbOK,                 // Wait (2026, 0x88)
-		18: cbQueueTimestampFreq, // GetTimestampFrequency (2026, 0x90)
-		23: cbOK,                 // SuspendX (0xB8)
-		24: cbOK,                 // ResumeX (0xC0)
-		29: cbOK,                 // CopyPageMappingsBatchX (2020)
-		30: cbQueuePresentX,      // PresentX (2020, 0xF0)
-		31: cbOK,                 // CopyPageMappingsBatchX (2026, 0xF8)
-		32: cbQueuePresentX,      // PresentX (2026, 0x100)
-		33: cbQueueExecuteLists,  // ExecuteCommandListsX (2020)
-		34: cbQueueSignal,        // Signal2X (2026, 0x110)
-		35: cbQueueExecuteLists,  // ExecuteCommandListsX (2026, 0x118)
+		10: cbQueueExecuteLists,     // ExecuteCommandLists
+		14: cbQueueSignal,           // Signal (2020)
+		15: cbOK,                    // Wait (2020)
+		16: cbQueueSignal,           // Signal (2026, 0x80)
+		17: cbOK,                    // Wait (2026, 0x88)
+		18: cbQueueTimestampFreq,    // GetTimestampFrequency (2026, 0x90)
+		23: cbOK,                    // SuspendX (0xB8)
+		24: cbOK,                    // ResumeX (0xC0)
+		29: cbQueueCopyPageMappings, // CopyPageMappingsBatchX (2020)
+		30: cbQueuePresentX,         // PresentX (2020, 0xF0)
+		31: cbQueueCopyPageMappings, // CopyPageMappingsBatchX (2026, 0xF8)
+		32: cbQueuePresentX,         // PresentX (2026, 0x100)
+		33: cbQueueExecuteLists,     // ExecuteCommandListsX (2020)
+		34: cbQueueSignal,           // Signal2X (2026, 0x110)
+		35: cbQueueExecuteLists,     // ExecuteCommandListsX (2026, 0x118)
 	})
 	queueVtable := *(*uintptr)(osPtr(queueProto))
 	newQueue := func() uintptr {
@@ -537,7 +625,7 @@ func newD3D12XDevice() uintptr {
 					if sz < 4096 && tx.Swizzle&0xFF != 0 {
 						sz = 4096
 					}
-					if sz > 0 && sz <= (16<<20) {
+					if sz > 0 && sz <= (16<<20) && isGuestReadable(uintptr(tx.GuestVA), sz) {
 						pix := make([]byte, sz)
 						copy(pix, unsafe.Slice((*byte)(osPtr(uintptr(tx.GuestVA))), sz))
 						tx.Pixels = pix
@@ -1742,13 +1830,18 @@ func newD3D12XDevice() uintptr {
 		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension, d.Layout)
 		return 0
 	})
-	cbCreatePlacedSRV := syscall.NewCallback(func(this, resDescPtr, srvDescPtr, handle, gpuVA uintptr) uintptr {
+	cbCreatePlacedSRV := syscall.NewCallback(func(this, resDescPtr, srvDescPtr, handle uintptr) uintptr {
 		n := placedSRVCount.Add(1)
 		var d xgResourceDesc
 		if resDescPtr >= 0x10000 {
 			d = *(*xgResourceDesc)(osPtr(resDescPtr))
 		}
-		va := uint64(gpuVA)
+		var va uint64
+		if srvDescPtr >= 0x10000 {
+			// Sur Xbox Series (CreatePlacedShaderResourceView, slot 70 / 0x230), l'adresse GPU 64-bit
+			// est stockée dans srvDescPtr + 40 (desc[10..11]), juste après les 40 octets D3D12_SHADER_RESOURCE_VIEW_DESC.
+			va = *(*uint64)(osPtr(srvDescPtr + 40))
+		}
 		if gpuTrace && n <= 6 && d.Dimension == 3 {
 			slog.Info("GPU_TRACE CreatePlacedSRV(Tex2D)", "n", n, "va", fmt.Sprintf("0x%X", va), "w", d.Width, "h", d.Height, "fmt", d.Format, "layout", fmt.Sprintf("0x%X", d.Layout))
 		}

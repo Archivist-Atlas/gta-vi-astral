@@ -208,9 +208,62 @@ func (p *physAllocator) mapScatter(addressesPtr, n, pagesPtr uintptr) uintptr {
 	return 1
 }
 
+var globalPhysAlloc *physAllocator
+
+// xmemMapAlias aliase les pages physiques déjà mappées à [from, from+length) vers [to, to+length)
+// (utilisé par ID3D12CommandQueueX::CopyPageMappingsBatchX pour le streaming de textures GTA VI).
+// Si from == 0, la plage [to, to+length) est simplement démappée en préservant le placeholder.
+func xmemMapAlias(to, from, length uint64) bool {
+	if globalPhysAlloc == nil || to == 0 || length == 0 {
+		return true
+	}
+	return globalPhysAlloc.mapAlias(uintptr(to), uintptr(from), uintptr(length))
+}
+
+func (p *physAllocator) findSliceLocked(addr uintptr) (physSlice, bool) {
+	for vBase, v := range p.views {
+		if addr >= vBase && addr < vBase+v.size {
+			pageOff := (addr - vBase) / xmemPageSize
+			return physSlice{section: v.slice.section, index: v.slice.index + pageOff}, true
+		}
+	}
+	return physSlice{}, false
+}
+
+func (p *physAllocator) mapAlias(to, from, length uintptr) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.unmapLocked(to, length)
+	if from == 0 {
+		return true
+	}
+	nPages := length / xmemPageSize
+	for i := uintptr(0); i < nPages; {
+		first, ok := p.findSliceLocked(from + i*xmemPageSize)
+		if !ok {
+			return false
+		}
+		run := uintptr(1)
+		for i+run < nPages {
+			next, okN := p.findSliceLocked(from + (i+run)*xmemPageSize)
+			if !okN || next.section != first.section || next.index != first.index+run {
+				break
+			}
+			run++
+		}
+		if !p.mapRunLocked(to+i*xmemPageSize, run*xmemPageSize, first) {
+			return false
+		}
+		i += run
+	}
+	return true
+}
+
 // bindXMemPhysical enregistre les fonctions de pages physiques XMem dans LiveTable.
 func bindXMemPhysical(t *LiveTable) {
 	phys := newPhysAllocator()
+	globalPhysAlloc = phys
 	t.bind("xmem.dll", "XMemAllocatePhysicalPages", syscall.NewCallback(phys.allocate))
 	t.bind("xmem.dll", "XMemFreePhysicalPages", syscall.NewCallback(phys.free))
 	t.bind("xmem.dll", "XMemMapPhysicalPages", syscall.NewCallback(phys.mapPages))

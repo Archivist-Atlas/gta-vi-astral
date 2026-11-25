@@ -106,35 +106,35 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 			completeAsync(asyncBlock)
 			return hresultOK
 		}),
-		5: syscall.NewCallback(func(this, asyncBlock, outProv uintptr) uintptr { // 0x28 XGameSaveInitializeProviderResult
+		5: traceSlot("InitializeProviderResult", syscall.NewCallback(func(this, asyncBlock, outProv uintptr) uintptr { // 0x28 XGameSaveInitializeProviderResult
 			if outProv >= 0x10000 {
 				*(*uintptr)(osPtr(outProv)) = uintptr(gs.nextHandle.Add(1))
 			}
 			return hresultOK
-		}),
-		6: cbOK, // 0x30 XGameSaveCloseProvider
-		7: syscall.NewCallback(func(this, prov, outQuota uintptr) uintptr { // 0x38 XGameSaveGetRemainingQuota
+		})),
+		6: traceSlot("CloseProvider", cbOK), // 0x30 XGameSaveCloseProvider
+		7: traceSlot("GetRemainingQuota", syscall.NewCallback(func(this, prov, outQuota uintptr) uintptr { // 0x38 XGameSaveGetRemainingQuota
 			if outQuota >= 0x10000 {
 				*(*int64)(osPtr(outQuota)) = 256 << 20 // 256 MiB
 			}
 			return hresultOK
-		}),
-		8: syscall.NewCallback(func(this, prov, asyncBlock uintptr) uintptr { // 0x40 XGameSaveGetRemainingQuotaAsync
+		})),
+		8: traceSlot("GetRemainingQuotaAsync", syscall.NewCallback(func(this, prov, asyncBlock uintptr) uintptr { // 0x40 XGameSaveGetRemainingQuotaAsync
 			completeAsync(asyncBlock)
 			return hresultOK
-		}),
-		9: syscall.NewCallback(func(this, asyncBlock, outQuota uintptr) uintptr { // 0x48 XGameSaveGetRemainingQuotaResult
+		})),
+		9: traceSlot("GetRemainingQuotaResult", syscall.NewCallback(func(this, asyncBlock, outQuota uintptr) uintptr { // 0x48 XGameSaveGetRemainingQuotaResult
 			if outQuota >= 0x10000 {
 				*(*int64)(osPtr(outQuota)) = 256 << 20
 			}
 			return hresultOK
-		}),
-		10: cbOK, // 0x50 XGameSaveDeleteContainer
-		11: syscall.NewCallback(func(this, prov, namePtr, asyncBlock uintptr) uintptr { // 0x58 XGameSaveDeleteContainerAsync
+		})),
+		10: traceSlot("DeleteContainer", cbOK), // 0x50 XGameSaveDeleteContainer
+		11: traceSlot("DeleteContainerAsync", syscall.NewCallback(func(this, prov, namePtr, asyncBlock uintptr) uintptr { // 0x58 XGameSaveDeleteContainerAsync
 			completeAsync(asyncBlock)
 			return hresultOK
-		}),
-		12: cbOK, // 0x60 XGameSaveDeleteContainerResult
+		})),
+		12: traceSlot("DeleteContainerResult", cbOK), // 0x60 XGameSaveDeleteContainerResult
 		13: traceSlot("GetContainerInfo", syscall.NewCallback(func(this, prov, namePtr, ctx, cb uintptr) uintptr { // 0x68 XGameSaveGetContainerInfo
 			return 0x80830008 // E_GS_BLOB_NOT_FOUND / container non encore créé
 		})),
