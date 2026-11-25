@@ -35,6 +35,15 @@ type HostDrawPass struct {
 	PassIndex     uint32
 	FrameNumber   uint32
 	HostPSO       uintptr
+	VBData        []byte
+	VBStride      uint32
+	CBData        []byte
+}
+
+type d3d12VertexBufferView struct {
+	BufferLocation uint64
+	SizeInBytes    uint32
+	StrideInBytes  uint32
 }
 
 type d3d12ShaderBytecode struct {
@@ -375,7 +384,7 @@ func (h *HostD3D12) initReplayPipeline() {
 		return
 	}
 
-	// Param 0 : 16 constantes 32-bit dans b0 (uint4 RootConst[4])
+	// Param 0 : Root CBV dans b0 (cbuffer RootData : register(b0) { uint4 RootConst[64]; })
 	// Param 1 : DescriptorTable 1 SRV dans t0 (Texture2D<float4> Tex0)
 	srvRange := d3d12DescriptorRange{
 		RangeType:                         0, // SRV
@@ -386,9 +395,9 @@ func (h *HostD3D12) initReplayPipeline() {
 	}
 	params := [2]d3d12RootParameter{
 		{
-			ParameterType:    1, // 32BIT_CONSTANTS
+			ParameterType:    2, // D3D12_ROOT_PARAMETER_TYPE_CBV
 			Union0:           0, // ShaderRegister=0, RegisterSpace=0
-			Union1:           16, // Num32BitValues=16
+			Union1:           0,
 			ShaderVisibility: 0, // ALL
 		},
 		{
@@ -462,7 +471,7 @@ func (h *HostD3D12) initReplayPipeline() {
 
 	const hlslSrc = `
 cbuffer RootData : register(b0) {
-    uint4 RootConst[4];
+    uint4 RootConst[64];
 };
 struct VSOut {
     float4 pos : SV_Position;
@@ -488,5 +497,37 @@ float4 PSMain(VSOut i) : SV_Target {
 		return
 	}
 	h.ReplayPSO = pso
-	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS DXBC, b0+t0+s0)", "rootSig", fmt.Sprintf("0x%X", rootSig), "pso", fmt.Sprintf("0x%X", pso))
+	// Buffers dynamiques persistants UPLOAD pour VB (256 KiB) et CB (64 KiB = 64 slots x 1024 B)
+	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(256 << 10)
+	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(64 << 10)
+	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS DXBC, RootCBV b0 + SRV t0 + VB)",
+		"rootSig", fmt.Sprintf("0x%X", rootSig), "pso", fmt.Sprintf("0x%X", pso))
+}
+
+func (h *HostD3D12) createUploadBuffer(size uint64) (res uintptr, cpuPtr uintptr, gpuVA uint64) {
+	heapProps := d3d12HeapProperties{Type: 2 /* UPLOAD */, CreationNodeMask: 1, VisibleNodeMask: 1}
+	bufDesc := d3d12ResourceDesc{
+		Dimension:        1, // BUFFER
+		Width:            size,
+		Height:           1,
+		DepthOrArraySize: 1,
+		MipLevels:        1,
+		SampleCount:      1,
+		Layout:           1, // ROW_MAJOR
+	}
+	if int32(comCall(h.Device, 27,
+		uintptr(unsafe.Pointer(&heapProps)), 0,
+		uintptr(unsafe.Pointer(&bufDesc)),
+		0x00000A83, // GENERIC_READ
+		0,
+		uintptr(unsafe.Pointer(&guidID3D12Resource[0])),
+		uintptr(unsafe.Pointer(&res)),
+	)) < 0 || res == 0 {
+		return 0, 0, 0
+	}
+	if int32(comCall(res, 8, 0, 0, uintptr(unsafe.Pointer(&cpuPtr)))) < 0 || cpuPtr == 0 {
+		return res, 0, 0
+	}
+	gpuVA = uint64(comCall(res, 11)) // GetGPUVirtualAddress
+	return res, cpuPtr, gpuVA
 }

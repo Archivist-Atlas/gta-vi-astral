@@ -46,6 +46,10 @@ type d3d12xState struct {
 	psos            map[uintptr]*guestPSO
 	dxbcBlobs       map[[16]byte][]byte
 	activeHostPSO   uintptr
+	activeVBVA      uintptr
+	activeVBSize    uint32
+	activeVBStride  uint32
+	activeRootVA    uintptr
 	frameDraws      []gpu.HostDrawPass
 	lastClearColor  [4]float32
 	hasClearColor   bool
@@ -367,13 +371,27 @@ func newD3D12XDevice() uintptr {
 		n := st.drawCalls.Add(1)
 		st.mu.Lock()
 		if len(st.frameDraws) < 64 {
-			st.frameDraws = append(st.frameDraws, gpu.HostDrawPass{
+			pass := gpu.HostDrawPass{
 				VertexCount:   uint32(vtxCount),
 				InstanceCount: uint32(instCount),
 				StartVertex:   uint32(startVtx),
 				StartInstance: uint32(startInst),
 				HostPSO:       st.activeHostPSO,
-			})
+				VBStride:      st.activeVBStride,
+			}
+			if st.activeVBVA >= 0x10000 && st.activeVBSize > 0 {
+				cpLen := st.activeVBSize
+				if cpLen > 4096 {
+					cpLen = 4096
+				}
+				pass.VBData = make([]byte, cpLen)
+				copy(pass.VBData, unsafe.Slice((*byte)(osPtr(st.activeVBVA)), cpLen))
+			}
+			if st.activeRootVA >= 0x10000 {
+				pass.CBData = make([]byte, 256)
+				copy(pass.CBData, unsafe.Slice((*byte)(osPtr(st.activeRootVA)), 256))
+			}
+			st.frameDraws = append(st.frameDraws, pass)
 		}
 		st.mu.Unlock()
 		if gpuTrace && n <= 12 {
@@ -506,6 +524,9 @@ func newD3D12XDevice() uintptr {
 			"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
 			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
 		)
+		if gpuTrace {
+			slog.Info("GPU_TRACE PSO missing ops", "guestPSO", fmt.Sprintf("0x%X", psoObj), "vsMissing", vsOut.MissingOps, "psMissing", psOut.MissingOps)
+		}
 	}
 	cbListSetPSO := syscall.NewCallback(func(this, pso uintptr) uintptr {
 		listSlotHits[25].Add(1)
@@ -524,10 +545,57 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
+	cbListSetRootTable := syscall.NewCallback(func(this, rootIdx, baseDesc uintptr) uintptr {
+		c := listSlotHits[36].Add(1)
+		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
+			st.mu.Lock()
+			st.activeRootVA = baseDesc
+			st.mu.Unlock()
+		}
+		if gpuTrace && c <= 8 {
+			slog.Info("GPU_TRACE SetGraphicsRootDescriptorTable", "n", c, "rootIdx", uint32(rootIdx), "gpuHandle", fmt.Sprintf("0x%X", baseDesc))
+		}
+		return 0
+	})
+	cbListSetRootSRV := syscall.NewCallback(func(this, rootIdx, gpuVA uintptr) uintptr {
+		c := listSlotHits[44].Add(1)
+		if gpuVA >= 0x10000 && gpuVA < 0x800000000000 {
+			st.mu.Lock()
+			st.activeRootVA = gpuVA
+			st.mu.Unlock()
+		}
+		if gpuTrace && c <= 8 {
+			slog.Info("GPU_TRACE SetGraphicsRootSRV", "n", c, "rootIdx", uint32(rootIdx), "gpuVA", fmt.Sprintf("0x%X", gpuVA))
+		}
+		return 0
+	})
+	cbListSetVB := syscall.NewCallback(func(this, startSlot, numViews, viewsPtr uintptr) uintptr {
+		c := listSlotHits[48].Add(1)
+		if uint32(numViews) > 0 && viewsPtr >= 0x10000 {
+			// D3D12_VERTEX_BUFFER_VIEW : { BufferLocation u64 (+0), SizeInBytes u32 (+8), StrideInBytes u32 (+12) }
+			loc := *(*uint64)(osPtr(viewsPtr + 0))
+			sz := *(*uint32)(osPtr(viewsPtr + 8))
+			stride := *(*uint32)(osPtr(viewsPtr + 12))
+			if loc >= 0x10000 && loc < 0x800000000000 && sz > 0 && stride > 0 {
+				st.mu.Lock()
+				st.activeVBVA = uintptr(loc)
+				st.activeVBSize = sz
+				st.activeVBStride = stride
+				st.mu.Unlock()
+			}
+			if gpuTrace && c <= 8 {
+				slog.Info("GPU_TRACE IASetVertexBuffers", "n", c, "slot", uint32(startSlot), "views", uint32(numViews), "va", fmt.Sprintf("0x%X", loc), "size", sz, "stride", stride)
+			}
+		}
+		return 0
+	})
 	cmdListSlots[12] = cbListDrawInst     // DrawInstanced
 	cmdListSlots[13] = cbListDrawIdx      // DrawIndexedInstanced
 	cmdListSlots[14] = cbListDispatch     // Dispatch
 	cmdListSlots[25] = cbListSetPSO       // SetPipelineState
+	cmdListSlots[36] = cbListSetRootTable // SetGraphicsRootDescriptorTable (Xbox #36 = PC #32)
+	cmdListSlots[44] = cbListSetRootSRV   // SetGraphicsRootShaderResourceView (Xbox #44 = PC #40)
+	cmdListSlots[48] = cbListSetVB        // IASetVertexBuffers (Xbox #48 = PC #44)
 	cmdListSlots[52] = cbListClearRTV     // ClearRenderTargetView (Xbox slot 52 = PC slot 48)
 	cmdListSlots[60] = cbListCopyMem      // CopyMemoryToMemoryX (0x1E0)
 	cmdListSlots[78] = cbListDispatch     // DispatchX (0x270)

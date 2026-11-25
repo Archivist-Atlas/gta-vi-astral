@@ -91,6 +91,12 @@ type HostD3D12 struct {
 	UploadBuf     uintptr
 	UploadPtr     uintptr
 	UploadPitch   uint32
+	UploadVB      uintptr
+	UploadVBPtr   uintptr
+	UploadVBGPU   uint64
+	UploadCB      uintptr
+	UploadCBPtr   uintptr
+	UploadCBGPU   uint64
 	ReplayRootSig uintptr
 	ReplayPSO     uintptr
 	SRVHeap       uintptr
@@ -349,14 +355,26 @@ func (h *HostD3D12) initPresentPipeline() {
 	h.Ready = true
 }
 
+// DeviceRemovedReason interroge ID3D12Device::GetDeviceRemovedReason (slot 37) pour le diagnostic GPU.
+func (h *HostD3D12) DeviceRemovedReason() uint32 {
+	if h == nil || h.Device == 0 {
+		return 0
+	}
+	return uint32(comCall(h.Device, 37))
+}
+
 func (h *HostD3D12) waitGPU() {
 	if h.Queue == 0 || h.Fence == 0 {
 		return
 	}
 	h.FenceValue++
 	val := h.FenceValue
-	_ = comCall(h.Queue, 14, h.Fence, uintptr(val)) // Signal
-	if uint64(comCall(h.Fence, 8)) < val {           // GetCompletedValue
+	hr := comCall(h.Queue, 14, h.Fence, uintptr(val)) // Signal
+	if int32(hr) < 0 {
+		slog.Error("Host D3D12 Queue::Signal échoué", "hr", fmt.Sprintf("0x%08X", uint32(hr)), "removedReason", fmt.Sprintf("0x%08X", h.DeviceRemovedReason()))
+		return
+	}
+	if uint64(comCall(h.Fence, 8)) < val { // GetCompletedValue
 		_ = comCall(h.Fence, 9, uintptr(val), h.FenceEvent) // SetEventOnCompletion
 		_, _, _ = procWaitForSingleObj.Call(h.FenceEvent, 2000)
 	}
@@ -442,7 +460,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 					_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart) // SetGraphicsRootDescriptorTable(param=1, t0)
 				}
 				total := uint32(len(draws))
-				for _, d := range draws {
+				vbOff := uint64(0)
+				for idxPass, d := range draws {
 					if d.VertexCount == 0 || d.InstanceCount == 0 {
 						continue
 					}
@@ -451,8 +470,37 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 						pso = h.ReplayPSO
 					}
 					_ = comCall(h.CmdList, 25, pso) // SetPipelineState
-					consts := [16]uint32{d.FrameNumber, d.PassIndex, total, 0}
-					_ = comCall(h.CmdList, 36, 0, 16, uintptr(unsafe.Pointer(&consts[0])), 0) // SetGraphicsRoot32BitConstants
+					// Upload Constant Buffer (1024 octets alignés sur 256 octets, slot = idxPass % 64)
+					if h.UploadCBPtr != 0 && h.UploadCBGPU != 0 {
+						cbSlot := uint64(idxPass%64) * 1024
+						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 64<<10)[cbSlot : cbSlot+1024]
+						clear(dstCB)
+						if len(d.CBData) > 0 {
+							copy(dstCB, d.CBData)
+						} else {
+							*(*uint32)(unsafe.Pointer(&dstCB[0])) = d.FrameNumber
+							*(*uint32)(unsafe.Pointer(&dstCB[4])) = d.PassIndex
+							*(*uint32)(unsafe.Pointer(&dstCB[8])) = total
+						}
+						// ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView (slot 38)
+						_ = comCall(h.CmdList, 38, 0, uintptr(h.UploadCBGPU+cbSlot))
+					}
+					// Upload Vertex Buffer si fourni par le titre
+					if len(d.VBData) > 0 && d.VBStride > 0 && h.UploadVBPtr != 0 && h.UploadVBGPU != 0 {
+						nBytes := uint64(len(d.VBData))
+						if vbOff+nBytes <= (256 << 10) {
+							dstVB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadVBPtr))), 256<<10)[vbOff : vbOff+nBytes]
+							copy(dstVB, d.VBData)
+							vbv := d3d12VertexBufferView{
+								BufferLocation: h.UploadVBGPU + vbOff,
+								SizeInBytes:    uint32(nBytes),
+								StrideInBytes:  d.VBStride,
+							}
+							// ID3D12GraphicsCommandList::IASetVertexBuffers (slot 44)
+							_ = comCall(h.CmdList, 44, 0, 1, uintptr(unsafe.Pointer(&vbv)))
+							vbOff = (vbOff + nBytes + 255) &^ 255
+						}
+					}
 					_ = comCall(h.CmdList, 12, uintptr(d.VertexCount), uintptr(d.InstanceCount), uintptr(d.StartVertex), uintptr(d.StartInstance))
 				}
 			}

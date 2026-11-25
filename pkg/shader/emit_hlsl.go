@@ -14,6 +14,7 @@ type HLSLOutput struct {
 	Target         string // "vs_5_0" ou "ps_5_0"
 	Source         string
 	InputElements  []SigElement // éléments non-SV_* de ISG1 pour D3D12_INPUT_LAYOUT_DESC
+	MissingOps     []string     // encodages/mots non encore abaissés (diagnostic)
 	TotalInsts     int
 	LoweredInsts   int
 	UnsupportedOps int
@@ -48,8 +49,14 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 
 	b.WriteString("// Généré par gta-vi-astral (RDNA2/GFX10 -> HLSL SM 5.0)\n")
 	b.WriteString("cbuffer RootData : register(b0) {\n")
-	b.WriteString("    uint4 RootConst[4];\n")
+	b.WriteString("    uint4 RootConst[64];\n")
 	b.WriteString("};\n")
+	b.WriteString("uint _readCB(uint byteOff) {\n")
+	b.WriteString("    uint idx = (byteOff >> 4) & 63u;\n")
+	b.WriteString("    uint comp = (byteOff >> 2) & 3u;\n")
+	b.WriteString("    uint4 v4 = RootConst[idx];\n")
+	b.WriteString("    return (comp == 0u) ? v4.x : (comp == 1u) ? v4.y : (comp == 2u) ? v4.z : v4.w;\n")
+	b.WriteString("}\n")
 	if isPS {
 		b.WriteString("Texture2D<float4> Tex0 : register(t0);\n")
 		b.WriteString("SamplerState Samp0 : register(s0);\n")
@@ -135,6 +142,14 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 			out.LoweredInsts++
 			continue
 		}
+		if gi.Encoding == EncSOPP && ((gi.Word0>>16)&0x7F) == 0x20 { // s_clause
+			out.LoweredInsts++
+			continue
+		}
+		if gi.Encoding == EncVOP3 && ((gi.Word0>>16)&0x3FF) == 0x180 { // v_nop (metadata tag)
+			out.LoweredInsts++
+			continue
+		}
 		if stmt, ok := lowerGFX10ToHLSL(gi, isPS, inputs); ok {
 			if stmt != "" {
 				b.WriteString("    " + stmt + "\n")
@@ -142,6 +157,9 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 			out.LoweredInsts++
 		} else {
 			out.UnsupportedOps++
+			if len(out.MissingOps) < 12 {
+				out.MissingOps = append(out.MissingOps, fmt.Sprintf("%s(%08X/%08X)", gi.Encoding, gi.Word0, gi.Word1))
+			}
 			b.WriteString(fmt.Sprintf("    // unimpl %04x %s %08x %08x\n", gi.PC, gi.Encoding, gi.Word0, gi.Word1))
 		}
 	}
@@ -351,6 +369,8 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS bool, inputs []SigElement) (string, boo
 			return fmt.Sprintf("v[%d] = asuint(%s * asfloat(0x%08Xu) + %s);", vdst, s0f, gi.Literal, s1f), true
 		case 0x2D: // v_fmaak_f32 (avec littéral)
 			return fmt.Sprintf("v[%d] = asuint(%s * %s + asfloat(0x%08Xu));", vdst, s0f, s1f, gi.Literal), true
+		case 0x2F: // v_cvt_pkrtz_f16_f32 (pack deux float32 en FP16x2 pour exp mrt0 compr)
+			return fmt.Sprintf("v[%d] = (f32tof16(%s) & 0xFFFFu) | (f32tof16(%s) << 16);", vdst, s0f, s1f), true
 		}
 
 	case EncVOP3:
@@ -396,8 +416,15 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS bool, inputs []SigElement) (string, boo
 		switch op {
 		case 0x03: // s_mov_b32
 			return fmt.Sprintf("s[%d] = %s;", sdst, su), true
+		case 0x04: // s_mov_b64
+			if sdst+1 < 64 {
+				return fmt.Sprintf("s[%d] = %s; s[%d] = 0u;", sdst, su, sdst+1), true
+			}
+			return fmt.Sprintf("s[%d] = %s;", sdst, su), true
 		case 0x07: // s_not_b32
 			return fmt.Sprintf("s[%d] = ~(%s);", sdst, su), true
+		case 0x1D, 0x20, 0x21, 0x24: // s_wqm_b64 / s_and_saveexec_b64 / s_and_saveexec_b32
+			return "", true
 		}
 
 	case EncSOPK:
@@ -438,6 +465,54 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS bool, inputs []SigElement) (string, boo
 			return fmt.Sprintf("s[%d] = (%s >> (%s & 31u));", sdst, s0, s1), true
 		case 0x2C: // s_mul_i32
 			return fmt.Sprintf("s[%d] = asuint(asint(%s) * asint(%s));", sdst, s0, s1), true
+		}
+
+	case EncSMEM:
+		op := (w0 >> 18) & 0xFF
+		sdata := (w0 >> 6) & 0x7F
+		off := w1 & 0x1FFFFF // offset 21-bit en octets (GFX10)
+		count := uint32(0)
+		switch op {
+		case 0x00, 0x08: // s_load_dword / s_buffer_load_dword
+			count = 1
+		case 0x01, 0x09: // s_load_dwordx2 / s_buffer_load_dwordx2
+			count = 2
+		case 0x02, 0x0A: // s_load_dwordx4 / s_buffer_load_dwordx4
+			count = 4
+		case 0x03, 0x0B: // s_load_dwordx8 / s_buffer_load_dwordx8
+			count = 8
+		case 0x04, 0x0C: // s_load_dwordx16 / s_buffer_load_dwordx16
+			count = 16
+		}
+		if count > 0 && sdata+count <= 64 {
+			var parts []string
+			for i := uint32(0); i < count; i++ {
+				parts = append(parts, fmt.Sprintf("s[%d] = _readCB(%du);", sdata+i, off+i*4))
+			}
+			return strings.Join(parts, " "), true
+		}
+
+	case EncMUBUF:
+		op := (w0 >> 18) & 0x7F
+		off := w0 & 0xFFF
+		vdata := (w1 >> 8) & 0xFF
+		count := uint32(0)
+		switch op {
+		case 0x0C, 0x08, 0x09, 0x0A, 0x0B: // buffer_load_dword / format_x
+			count = 1
+		case 0x0D: // buffer_load_dwordx2
+			count = 2
+		case 0x0F: // buffer_load_dwordx3
+			count = 3
+		case 0x0E: // buffer_load_dwordx4
+			count = 4
+		}
+		if count > 0 && vdata+count <= 64 {
+			var parts []string
+			for i := uint32(0); i < count; i++ {
+				parts = append(parts, fmt.Sprintf("v[%d] = _readCB(%du);", vdata+i, off+i*4))
+			}
+			return strings.Join(parts, " "), true
 		}
 
 	case EncVINTRP:
