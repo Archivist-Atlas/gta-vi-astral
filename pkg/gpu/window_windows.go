@@ -3,6 +3,7 @@
 package gpu
 
 import (
+	_ "embed"
 	"log/slog"
 	"runtime"
 	"sync"
@@ -10,6 +11,12 @@ import (
 	"time"
 	"unsafe"
 )
+
+//go:embed astral_icon_256.png
+var astralIcon256 []byte
+
+//go:embed astral_icon_32.png
+var astralIcon32 []byte
 
 var (
 	modUser32               = syscall.NewLazyDLL("user32.dll")
@@ -26,9 +33,26 @@ var (
 	procEnumWindows         = modUser32.NewProc("EnumWindows")
 	procGetWindowThreadPID  = modUser32.NewProc("GetWindowThreadProcessId")
 	procIsWindowVisible     = modUser32.NewProc("IsWindowVisible")
+	procCreateIconFromResEx = modUser32.NewProc("CreateIconFromResourceEx")
+	procSendMessage         = modUser32.NewProc("SendMessageW")
 	procGetModuleHandle     = modKernel32Win.NewProc("GetModuleHandleW")
 	procGetCurrentProcessId = modKernel32Win.NewProc("GetCurrentProcessId")
 )
+
+func createIconFromPNG(pngData []byte) uintptr {
+	if len(pngData) == 0 {
+		return 0
+	}
+	hIcon, _, _ := procCreateIconFromResEx.Call(
+		uintptr(unsafe.Pointer(&pngData[0])),
+		uintptr(len(pngData)),
+		1,          // fIcon = TRUE
+		0x00030000, // dwVer = 3.0 (PNG support Vista+)
+		0, 0,       // taille par défaut adaptée au DPI système
+		0,          // LR_DEFAULTCOLOR
+	)
+	return hIcon
+}
 
 type wndClassExW struct {
 	Size       uint32
@@ -82,11 +106,19 @@ func EnsureWindow(title string, width, height int) uintptr {
 				return r
 			})
 
+			hIconBig := createIconFromPNG(astralIcon256)
+			hIconSmall := createIconFromPNG(astralIcon32)
+			if hIconSmall == 0 {
+				hIconSmall = hIconBig
+			}
+
 			wc := wndClassExW{
 				Size:       uint32(unsafe.Sizeof(wndClassExW{})),
 				Style:      0x0003, // CS_HREDRAW | CS_VREDRAW
 				WndProc:    wndProc,
 				Instance:   hInst,
+				Icon:       hIconBig,
+				IconSm:     hIconSmall,
 				Background: 5, // COLOR_WINDOW
 				ClassName:  className,
 			}
@@ -104,9 +136,16 @@ func EnsureWindow(title string, width, height int) uintptr {
 				0, 0, hInst, 0,
 			)
 			if hwnd != 0 {
+				const wmSetIcon = 0x0080
+				if hIconBig != 0 {
+					_, _, _ = procSendMessage.Call(hwnd, wmSetIcon, 1 /* ICON_BIG */, hIconBig)
+				}
+				if hIconSmall != 0 {
+					_, _, _ = procSendMessage.Call(hwnd, wmSetIcon, 0 /* ICON_SMALL */, hIconSmall)
+				}
 				_, _, _ = procShowWindow.Call(hwnd, 5 /* SW_SHOW */)
 				_, _, _ = procUpdateWindow.Call(hwnd)
-				slog.Info("fenêtre Win32 ASTRAL ouverte", "hwnd", hwnd, "width", width, "height", height)
+				slog.Info("fenêtre Win32 ASTRAL ouverte", "hwnd", hwnd, "width", width, "height", height, "icon", hIconBig != 0)
 			}
 			ready <- hwnd
 			// Masque discrètement toute fenêtre Win32 en double créée par l'exécutable invité
