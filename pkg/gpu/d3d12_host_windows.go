@@ -134,6 +134,10 @@ type HostD3D12 struct {
 	ReadbackPtr     uintptr
 	ReadbackPitch   uint32
 	introFrameCount uint32
+	introReached    bool
+	splashBuf       []byte
+	splashFrame     uint64
+	splashPct       float32
 	Ready           bool
 }
 
@@ -416,6 +420,10 @@ func (h *HostD3D12) initPresentPipeline() {
 
 	h.initReplayPipeline()
 	h.Ready = true
+	// Affiche immédiatement le splash GTA VI Astral dès l'ouverture de la fenêtre (avant la 1re trame PresentX)
+	if h.UploadBuf != 0 && h.UploadPtr != 0 {
+		go func() { h.Present(0) }()
+	}
 }
 
 // DeviceRemovedReason interroge ID3D12Device::GetDeviceRemovedReason (slot 37) pour le diagnostic GPU.
@@ -460,6 +468,23 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 
 		_ = comCall(h.CmdAlloc, 8)                // Allocator::Reset
 		_ = comCall(h.CmdList, 10, h.CmdAlloc, 0) // CommandList::Reset
+
+		// Pendant le chargement initial (avant l'arrivée de l'interface Scaleform à 8+ draws/trame),
+		// affiche le logo GTA VI Astral + barre de progression néon animée sur le backbuffer.
+		if len(draws) >= 8 {
+			h.introReached = true
+			ReportBootProgress(1.0)
+		} else if len(dispatches) > 0 {
+			ReportBootProgress(0.92)
+		}
+		if !h.introReached && len(srcRGBA) == 0 && h.UploadBuf != 0 && h.UploadPtr != 0 {
+			if splash := h.renderSplashRGBA(); len(splash) > 0 {
+				srcRGBA = splash
+				srcW = h.Width
+				srcH = h.Height
+				srcPitch = h.Width * 4
+			}
+		}
 
 		if len(srcRGBA) > 0 && h.UploadBuf != 0 && h.UploadPtr != 0 && srcW > 0 && srcH > 0 {
 			copyW := srcW

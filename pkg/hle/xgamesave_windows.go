@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"unsafe"
+
+	"github.com/Archivist-Atlas/gta-vi-astral/pkg/gpu"
 )
 
 type gameSaveState struct {
@@ -82,6 +84,7 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 		}),
 		4: syscall.NewCallback(func(this, user, scid, syncOnDemand, asyncBlock uintptr) uintptr { // XGameSaveInitializeProviderAsync
 			slog.Info("xgamesave!XGameSaveInitializeProviderAsync -> stockage disque hors-ligne", "dir", gs.rootDir)
+			gpu.ReportBootProgress(0.90)
 			completeAsync(asyncBlock)
 			return hresultOK
 		}),

@@ -637,6 +637,7 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			}),
 			7: syscall.NewCallback(func(this, opts, asyncBlock uintptr) uintptr { // XUserAddAsync
 				slog.Info("xuser!XUserAddAsync -> connexion utilisateur hors-ligne AstralPlayer", "opts", uint32(opts))
+				gpu.ReportBootProgress(0.86)
 				if asyncBlock >= 0x10000 {
 					cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
 					if cb >= 0x10000 && cb < 0x800000000000 {
