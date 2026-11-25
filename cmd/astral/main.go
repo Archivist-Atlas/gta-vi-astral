@@ -32,7 +32,7 @@ func main() {
 	core.InitLogger(os.Stderr)
 
 	if len(os.Args) < 2 {
-		runInteractiveMenu()
+		runDefaultUI()
 		return
 	}
 

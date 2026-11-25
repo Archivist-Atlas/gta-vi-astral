@@ -54,6 +54,17 @@ func createIconFromPNG(pngData []byte) uintptr {
 	return hIcon
 }
 
+// WindowIcons retourne les handles HICON (grand pour la barre des tâches, petit pour la barre de titre)
+// générés depuis l'icône GTA VI Astral embarquée.
+func WindowIcons() (big, small uintptr) {
+	big = createIconFromPNG(astralIcon256)
+	small = createIconFromPNG(astralIcon32)
+	if small == 0 {
+		small = big
+	}
+	return big, small
+}
+
 type wndClassExW struct {
 	Size       uint32
 	Style      uint32
