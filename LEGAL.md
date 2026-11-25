@@ -1,6 +1,6 @@
 # Mentions légales et avertissement relatif aux droits d'auteur
 
-**Projet :** Archivist-Atlas — GTA VI Recompilation Project  
+**Projet :** GTA VI Astral — GTA VI Recompilation Project  
 **Responsable du projet :** Archivist-Atlas  
 **Statut :** Projet indépendant, non officiel et expérimental
 
@@ -8,7 +8,7 @@
 
 ## 1. Nature et indépendance du projet
 
-Archivist-Atlas est un projet indépendant de recherche et de développement logiciel consacré à l'étude des techniques de recompilation, de compatibilité multiplateforme et d'intégration de systèmes d'intelligence artificielle dans les environnements logiciels.
+GTA VI Astral est un projet indépendant de recherche et de développement logiciel consacré à l'étude des techniques de recompilation, de compatibilité multiplateforme et d'intégration de systèmes d'intelligence artificielle dans les environnements logiciels.
 
 Le projet envisage notamment d'étudier les possibilités d'intégration d'un système d'intelligence artificielle indépendant destiné à enrichir les interactions entre les joueurs et les personnages non joueurs (PNJ).
 
@@ -26,7 +26,7 @@ Ce projet n'est ni affilié, ni approuvé, ni sponsorisé par Rockstar Games, Ro
 
 ## 2. Absence de distribution de code source et de ressources propriétaires
 
-Le dépôt GitHub d'Archivist-Atlas a vocation à contenir uniquement du code développé indépendamment par ses contributeurs, ainsi que la documentation nécessaire à son fonctionnement.
+Le dépôt GitHub de GTA VI Astral a vocation à contenir uniquement du code développé indépendamment par ses contributeurs, ainsi que la documentation nécessaire à son fonctionnement.
 
 Le projet n'a pas pour objectif de distribuer les éléments propriétaires suivants :
 
@@ -55,7 +55,7 @@ Les éventuelles opérations d'analyse, de reproduction ou de transformation doi
 
 ## 4. Rétro-ingénierie, recompilation et interopérabilité
 
-Les travaux d'Archivist-Atlas comprennent des recherches sur l'analyse de logiciels compilés, la traduction de code machine et le développement de composants logiciels indépendants.
+Les travaux de GTA VI Astral comprennent des recherches sur l'analyse de logiciels compilés, la traduction de code machine et le développement de composants logiciels indépendants.
 
 L'un des objectifs techniques à long terme consiste à étudier les possibilités d'intégration d'un moteur d'intelligence artificielle indépendant avec un environnement logiciel compatible.
 
@@ -149,9 +149,9 @@ Cette décision concerne l'interprétation des exceptions relatives à l'utilisa
 
 Elle ne constitue pas une autorisation générale de décompiler un logiciel dans le but d'y ajouter des fonctionnalités.
 
-### 5.5. Rapport entre l'interopérabilité et les objectifs d'Archivist-Atlas
+### 5.5. Rapport entre l'interopérabilité et les objectifs de GTA VI Astral
 
-La vision technique d'Archivist-Atlas prévoit le développement d'un moteur d'intelligence artificielle indépendant.
+La vision technique de GTA VI Astral prévoit le développement d'un moteur d'intelligence artificielle indépendant.
 
 Ce moteur pourrait comprendre plusieurs composants :
 
@@ -198,7 +198,7 @@ La publication d'un logiciel sur GitHub ne confère aucune immunité contre une 
 
 Les textes mentionnés dans cette section constituent des références documentaires et non une certification de conformité juridique.
 
-Archivist-Atlas ne prétend pas que l'ensemble de ses activités bénéficie automatiquement des exceptions citées.
+GTA VI Astral ne prétend pas que l'ensemble de ses activités bénéficie automatiquement des exceptions citées.
 
 Chaque opération doit être appréciée au regard de sa finalité, de ses modalités techniques, des droits détenus par la personne qui l'effectue et des dispositions applicables dans les juridictions concernées.
 
@@ -210,13 +210,13 @@ Grand Theft Auto, GTA, GTA VI, Rockstar Games, Rockstar North et les dénominati
 
 Ces dénominations sont utilisées exclusivement à des fins descriptives et d'identification du logiciel concerné par les recherches.
 
-Aucun droit de propriété sur ces marques n'est revendiqué par Archivist-Atlas.
+Aucun droit de propriété sur ces marques n'est revendiqué par GTA VI Astral.
 
 Les droits d'auteur, marques, brevets et autres droits de propriété intellectuelle appartenant à des tiers restent la propriété de leurs détenteurs respectifs.
 
 ## 7. Absence d'affiliation ou d'approbation
 
-Archivist-Atlas est un projet indépendant.
+GTA VI Astral est un projet indépendant.
 
 Il n'est ni développé, ni approuvé, ni soutenu, ni sponsorisé par Rockstar Games, Rockstar North ou Take-Two Interactive.
 
