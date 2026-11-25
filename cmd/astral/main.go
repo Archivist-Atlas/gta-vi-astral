@@ -34,16 +34,20 @@ func main() {
 		attachParentConsoleIfCLI()
 	}
 	if len(os.Args) < 2 {
+		core.InitLogger(os.Stderr)
+		runDefaultUI()
+		return
+	}
+	if os.Args[1] == "run" {
 		if lf, lerr := os.Create(filepath.Join(os.TempDir(), "astral_last.log")); lerr == nil {
 			defer lf.Close()
 			core.InitLogger(io.MultiWriter(os.Stderr, lf))
 		} else {
 			core.InitLogger(os.Stderr)
 		}
-		runDefaultUI()
-		return
+	} else {
+		core.InitLogger(os.Stderr)
 	}
-	core.InitLogger(os.Stderr)
 
 	var err error
 	switch os.Args[1] {

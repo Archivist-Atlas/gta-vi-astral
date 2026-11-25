@@ -469,7 +469,7 @@ func bindGameInput(t *LiveTable) {
 				slog.Info("IGameInputReading!GetGamepadState actif (manette XInput/HID + clavier Windows connectés)")
 			}
 			if st.Buttons != 0 {
-				if c := btnDelivered.Add(1); c <= 5 || c%60 == 0 {
+				if c := btnDelivered.Add(1); c <= 10 || c%60 == 0 {
 					slog.Info("IGameInputReading!GetGamepadState -> bouton transmis au jeu", "n", c, "buttons", fmt.Sprintf("0x%04X", st.Buttons), "seq", *(*uint64)(osPtr(this + 0x08)))
 				}
 			}
@@ -723,7 +723,9 @@ func bindGameInput(t *LiveTable) {
 	})
 	cbGetPrevReading := syscall.NewCallback(func(this, refReading, inputKind, device, outReading uintptr) uintptr {
 		kind := uint32(inputKind)
-		logGI(9, "GetPreviousReading", "kind", fmt.Sprintf("0x%X", kind))
+		if traceCounts[9].Add(1) <= 3 {
+			slog.Info("IGameInput!GetPreviousReading", "kind", fmt.Sprintf("0x%X", kind), "ref", fmt.Sprintf("0x%X", refReading))
+		}
 		if (kind != 0 && kind&giKindGamepad == 0) || refReading < 0x10000 || outReading < 0x10000 {
 			return giReadingNotFound
 		}
