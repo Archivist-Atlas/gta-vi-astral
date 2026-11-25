@@ -24,6 +24,8 @@ const (
 
 var (
 	k32CreateFileMappingW = k32.NewProc("CreateFileMappingW")
+	k32MapViewOfFile      = k32.NewProc("MapViewOfFile")
+	k32UnmapViewOfFile    = k32.NewProc("UnmapViewOfFile")
 	k32CloseHandle        = k32.NewProc("CloseHandle")
 	kbaseMapViewOfFile3   = kbase.NewProc("MapViewOfFile3")
 	kbaseUnmapViewOfFile2 = kbase.NewProc("UnmapViewOfFile2")
@@ -258,6 +260,71 @@ func (p *physAllocator) mapAlias(to, from, length uintptr) bool {
 		i += run
 	}
 	return true
+}
+
+// xmemWritePhysical écrit data dans une liste de pages physiques 64 KiB XMem
+// en commençant à offset (0..65535) dans la première page (utilisé par DirectStorage PAGE_DESTINATION).
+func xmemWritePhysical(pages []uintptr, offset int, data []byte) bool {
+	if globalPhysAlloc == nil || len(pages) == 0 || len(data) == 0 {
+		return false
+	}
+	return globalPhysAlloc.writePhysical(pages, offset, data)
+}
+
+func (p *physAllocator) writePhysical(pages []uintptr, offset int, data []byte) bool {
+	p.mu.Lock()
+	slices := make([]physSlice, len(pages))
+	for i, id := range pages {
+		s, ok := p.pages[id]
+		if !ok {
+			p.mu.Unlock()
+			return false
+		}
+		slices[i] = s
+	}
+	p.mu.Unlock()
+
+	const fileMapWrite = 0x0002
+	remaining := data
+	curOff := offset
+	for i := 0; i < len(slices) && len(remaining) > 0; {
+		first := slices[i]
+		run := 1
+		for i+run < len(slices) {
+			next := slices[i+run]
+			if next.section != first.section || next.index != first.index+uintptr(run) {
+				break
+			}
+			run++
+		}
+		runBytes := uintptr(run) * xmemPageSize
+		fileOff := uint64(first.index) * uint64(xmemPageSize)
+		view, _, _ := k32MapViewOfFile.Call(
+			first.section,
+			fileMapWrite,
+			uintptr(fileOff>>32),
+			uintptr(fileOff&0xFFFFFFFF),
+			runBytes,
+		)
+		if view == 0 {
+			return false
+		}
+		// Commit des pages réservées (SEC_RESERVE) avant écriture
+		_, _, _ = k32VirtualAlloc.Call(view, runBytes, memCommitFlag, pageRW)
+		avail := int(runBytes) - curOff
+		if avail > len(remaining) {
+			avail = len(remaining)
+		}
+		if avail > 0 {
+			dst := unsafe.Slice((*byte)(osPtr(view+uintptr(curOff))), avail)
+			copy(dst, remaining[:avail])
+			remaining = remaining[avail:]
+		}
+		_, _, _ = k32UnmapViewOfFile.Call(view)
+		curOff = 0
+		i += run
+	}
+	return len(remaining) == 0
 }
 
 // bindXMemPhysical enregistre les fonctions de pages physiques XMem dans LiveTable.
