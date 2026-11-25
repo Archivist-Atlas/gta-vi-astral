@@ -87,3 +87,79 @@ copy astral.example.toml astral.toml
 ## Documentation
 
 Toute la documentation technique en français est disponible dans [`docs/README.md`](docs/README.md).
+
+---
+
+## Vision du projet
+
+### Présentation
+
+**Archivist-Atlas — GTA VI Recompilation Project** est un projet indépendant de recherche et de développement logiciel consacré à l'étude des techniques de recompilation, de compatibilité multiplateforme et d'intégration de systèmes d'intelligence artificielle dans les environnements vidéoludiques.
+
+L'objectif à long terme est d'explorer les possibilités offertes par la recompilation logicielle afin d'étudier l'intégration de fonctionnalités indépendantes qui ne sont pas nécessairement prévues dans l'environnement d'exécution d'origine.
+
+GTA VI constitue une cible de recherche envisagée pour expérimenter ces technologies.
+
+### Objectif principal : des personnages non joueurs pilotés par IA
+
+L'une des ambitions principales du projet est d'étudier le développement d'un système indépendant d'intelligence artificielle destiné à enrichir les interactions entre les joueurs et les personnages non joueurs (PNJ).
+
+Les systèmes traditionnels reposent souvent sur des dialogues prédéfinis, des arbres de conversation et des comportements scriptés. Archivist-Atlas souhaite explorer des approches permettant de rendre ces interactions plus dynamiques, contextuelles et cohérentes.
+
+Les axes de recherche envisagés comprennent :
+
+- **Conversations dynamiques** : permettre aux PNJ de générer des réponses adaptées au contexte des échanges avec le joueur.
+- **Mémoire persistante** : étudier la possibilité pour les PNJ de conserver des informations pertinentes issues de leurs interactions précédentes.
+- **Personnalités individuelles** : développer des profils comportementaux distincts, avec des préférences, des habitudes et des styles de communication propres à chaque personnage.
+- **Réactions contextuelles** : permettre aux personnages de prendre en compte les événements environnants et les situations auxquelles ils sont confrontés.
+- **Comportements adaptatifs** : explorer des systèmes dans lesquels les réactions et les interactions évoluent en fonction des expériences simulées des personnages.
+- **Interactions sociales** : étudier la possibilité de faire évoluer les relations entre les PNJ en fonction des événements et des informations qu'ils partagent.
+
+L'objectif n'est pas simplement de remplacer les dialogues existants par un modèle conversationnel, mais d'étudier une architecture capable de combiner mémoire, personnalité, contexte et comportement.
+
+### Recompilation et compatibilité PC
+
+La recherche sur la recompilation constitue un axe technique du projet. Elle vise à étudier les mécanismes nécessaires à l'analyse de logiciels compilés, à la traduction de code machine et à la génération de code adapté à différents environnements d'exécution.
+
+Les travaux envisagés comprennent notamment :
+
+- L'analyse des structures des exécutables.
+- L'étude des architectures processeur et des instructions machine.
+- La création de représentations intermédiaires du code.
+- L'exploration de techniques de traduction et de génération de code natif.
+- L'étude des interfaces entre les logiciels et les systèmes d'exploitation.
+- Le développement de composants indépendants de compatibilité et d'interopérabilité.
+
+Cette recherche doit également permettre d'étudier les possibilités d'intégration d'un moteur d'intelligence artificielle indépendant avec un environnement logiciel compatible. La recompilation et l'intégration IA constituent deux axes techniques distincts, dont les interfaces et les contraintes devront être étudiées et documentées.
+
+### Architecture d'intelligence artificielle envisagée
+
+L'architecture envisagée repose sur plusieurs composants indépendants :
+
+- **Moteur conversationnel** : génération de dialogues adaptés au contexte.
+- **Système de mémoire** : conservation des informations pertinentes relatives aux interactions.
+- **Gestion des personnalités** : définition des caractéristiques et comportements propres à chaque PNJ.
+- **Moteur décisionnel** : interprétation des situations et sélection de réactions cohérentes.
+- **Couche d'intégration** : communication entre le moteur IA et un environnement logiciel compatible.
+
+L'exécution de ces composants pourra être étudiée localement sur PC ou au moyen de services externes, selon les contraintes de performances, de confidentialité et d'architecture.
+
+### Indépendance du développement
+
+Archivist-Atlas développe ses propres outils et composants logiciels. Le projet distingue clairement les technologies développées indépendamment des logiciels tiers étudiés dans le cadre de ses recherches.
+
+Il n'a pas pour objectif de distribuer le code source propriétaire, les exécutables, les ressources graphiques, les fichiers audio ou les autres contenus protégés appartenant aux éditeurs des logiciels concernés. Toute utilisation de fichiers tiers reste soumise aux droits et autorisations applicables.
+
+### Cadre juridique
+
+Les travaux de recherche sont conduits dans le respect des législations applicables en matière de propriété intellectuelle, de logiciels et de protection des mesures techniques.
+
+Les références juridiques et les précisions relatives aux activités envisagées sont présentées dans le fichier [`LEGAL.md`](LEGAL.md).
+
+Le présent projet ne revendique aucune autorisation générale de décompilation, de reproduction ou de modification de logiciels propriétaires.
+
+### Indépendance et absence d'affiliation
+
+Archivist-Atlas est un projet indépendant, non officiel et sans affiliation avec Rockstar Games, Rockstar North ou Take-Two Interactive.
+
+Les noms de produits et marques éventuellement mentionnés sont utilisés uniquement à des fins descriptives et restent la propriété de leurs détenteurs respectifs.
