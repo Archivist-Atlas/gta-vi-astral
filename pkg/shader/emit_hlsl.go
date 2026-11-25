@@ -88,8 +88,8 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 		b.WriteString("    uint s[64];\n")
 		b.WriteString("    uint v[64];\n")
 		b.WriteString("    [unroll] for (uint _i = 0; _i < 64; _i++) { s[_i] = 0u; v[_i] = 0u; }\n")
-		b.WriteString("    bool scc = false;\n")
-		b.WriteString("    bool vcc = false;\n")
+		b.WriteString("    bool scc = (gid.x == 0xFFFFFFFFu);\n")
+		b.WriteString("    bool vcc = (gtid.x == 0xFFFFFFFFu);\n")
 		b.WriteString("    s[0] = RootConst[0].x; s[1] = RootConst[0].y; s[2] = gid.x; s[3] = gid.y; s[4] = gid.z;\n")
 		b.WriteString("    v[0] = gtid.x; v[1] = gtid.y; v[2] = gtid.z;\n")
 	} else {
@@ -257,15 +257,18 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 		}
 
 		b.WriteString("    uint _pc = 0u;\n")
-		b.WriteString("    [loop] for (uint _step = 0u; _step < 256u; _step++) {\n")
-		b.WriteString("        switch (_pc) {\n")
+		b.WriteString("    bool _run = true;\n")
+		b.WriteString("    [loop] for (uint _step = 0u; _step < 256u && _run; _step++) {\n")
+		b.WriteString("        uint _cur = _pc;\n")
+		b.WriteString("        _run = false;\n")
 		for _, blk := range blocks {
-			b.WriteString(fmt.Sprintf("        case %du:\n", blk.startPC))
+			b.WriteString(fmt.Sprintf("        [branch] if (_cur == %du) {\n", blk.startPC))
+			b.WriteString("            _run = true;\n")
 			terminated := false
 			for _, gi := range blk.insts {
 				if gi.IsEndPgm {
 					out.LoweredInsts++
-					b.WriteString("            _step = 256u; break;\n")
+					b.WriteString("            _run = false;\n")
 					terminated = true
 					break
 				}
@@ -276,19 +279,19 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 					out.LoweredInsts++
 					switch op {
 					case 0x02: // s_branch
-						b.WriteString(fmt.Sprintf("            _pc = %du; break;\n", tgt))
+						b.WriteString(fmt.Sprintf("            _pc = %du;\n", tgt))
 					case 0x04: // s_cbranch_scc0
-						b.WriteString(fmt.Sprintf("            _pc = (!scc) ? %du : %du; break;\n", tgt, blk.nextPC))
+						b.WriteString(fmt.Sprintf("            _pc = (!scc) ? %du : %du;\n", tgt, blk.nextPC))
 					case 0x05: // s_cbranch_scc1
-						b.WriteString(fmt.Sprintf("            _pc = (scc) ? %du : %du; break;\n", tgt, blk.nextPC))
+						b.WriteString(fmt.Sprintf("            _pc = (scc) ? %du : %du;\n", tgt, blk.nextPC))
 					case 0x06: // s_cbranch_vccz
-						b.WriteString(fmt.Sprintf("            _pc = (!vcc) ? %du : %du; break;\n", tgt, blk.nextPC))
+						b.WriteString(fmt.Sprintf("            _pc = (!vcc) ? %du : %du;\n", tgt, blk.nextPC))
 					case 0x07: // s_cbranch_vccnz
-						b.WriteString(fmt.Sprintf("            _pc = (vcc) ? %du : %du; break;\n", tgt, blk.nextPC))
+						b.WriteString(fmt.Sprintf("            _pc = (vcc) ? %du : %du;\n", tgt, blk.nextPC))
 					case 0x08, 0x09: // s_cbranch_execz / execnz (lane active)
-						b.WriteString(fmt.Sprintf("            _pc = %du; break;\n", blk.nextPC))
+						b.WriteString(fmt.Sprintf("            _pc = %du;\n", blk.nextPC))
 					default:
-						b.WriteString(fmt.Sprintf("            _pc = %du; break;\n", blk.nextPC))
+						b.WriteString(fmt.Sprintf("            _pc = %du;\n", blk.nextPC))
 					}
 					terminated = true
 					break
@@ -297,14 +300,14 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 			}
 			if !terminated {
 				if blk.nextPC == 0xFFFFFFFF {
-					b.WriteString("            _step = 256u; break;\n")
+					b.WriteString("            _run = false;\n")
 				} else {
-					b.WriteString(fmt.Sprintf("            _pc = %du; break;\n", blk.nextPC))
+					b.WriteString(fmt.Sprintf("            _pc = %du;\n", blk.nextPC))
 				}
 			}
+			b.WriteString("        }\n")
 		}
-		b.WriteString("        default:\n            _step = 256u; break;\n")
-		b.WriteString("        }\n    }\n")
+		b.WriteString("    }\n")
 	}
 
 	if isCS {
@@ -853,11 +856,21 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 		return fmt.Sprintf("v[%d] = 0u;", vdst), true
 
 	case EncMIMG:
+		op := (w0 >> 18) & 0xFF
+		vdata := (w1 >> 8) & 0xFF
+		vaddr := w1 & 0xFF
+		if isCS {
+			if op >= 0x08 && op <= 0x0F && vdata < 64 { // image_store*
+				return fmt.Sprintf("UAV0.Store(((dtid.x + dtid.y * 64u + dtid.z * 4096u) * 4u) & 0xFFFFCu, v[%d]);", vdata), true
+			}
+			if op <= 0x07 && vdata+3 < 64 { // image_load*
+				return fmt.Sprintf("{ uint _m = UAV0.Load(((dtid.x + dtid.y * 64u) * 4u) & 0xFFFFCu); v[%d]=_m; v[%d]=_m; v[%d]=_m; v[%d]=0x3F800000u; }", vdata, vdata+1, vdata+2, vdata+3), true
+			}
+			return "", false
+		}
 		if !isPS {
 			return "", false
 		}
-		vdata := (w1 >> 8) & 0xFF
-		vaddr := w1 & 0xFF
 		if vdata+3 < 64 && vaddr+1 < 64 {
 			return fmt.Sprintf("{ float4 _t = Tex0.Sample(Samp0, float2(asfloat(v[%d]), asfloat(v[%d]))); v[%d]=asuint(_t.x); v[%d]=asuint(_t.y); v[%d]=asuint(_t.z); v[%d]=asuint(_t.w); }",
 				vaddr, vaddr+1, vdata, vdata+1, vdata+2, vdata+3), true

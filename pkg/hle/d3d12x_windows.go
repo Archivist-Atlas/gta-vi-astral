@@ -742,6 +742,9 @@ func newD3D12XDevice() uintptr {
 			if err != nil {
 				return
 			}
+			if dumpFrame {
+				_ = os.WriteFile(fmt.Sprintf("%s\\astral_cs_%X.hlsl", os.TempDir(), psoObj), []byte(csOut.Source), 0o644)
+			}
 			hPSO, cerr := gpu.CompileHostComputePSO(csOut.Source, csOut.EntryPoint)
 			if cerr != nil {
 				slog.Warn("Recompilation Compute PSO RDNA2->HLSL->D3D12 échouée", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
@@ -1323,14 +1326,6 @@ func newD3D12XDevice() uintptr {
 			"vsLen", vsLen, "vsMagic", magicStr(vsPtr, vsLen),
 			"psLen", psLen, "psMagic", magicStr(psPtr, psLen))
 	}
-	cbCreatePSO := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
-		slog.Debug("D3D12DeviceX!CreatePSO")
-		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
-		}
-		inspectPSO("CreatePSO", desc)
-		return hresultOK
-	})
 	storeDXBCBlob := func(p uintptr, l uint64) ([16]byte, bool) {
 		var h [16]byte
 		if p < 0x10000 || l < 32 || l > (16<<20) {
@@ -1350,6 +1345,58 @@ func newD3D12XDevice() uintptr {
 		st.mu.Unlock()
 		return h, true
 	}
+	storeGraphicsPSODesc := func(psoObj, desc uintptr) {
+		if desc < 0x10000 {
+			return
+		}
+		vsPtr := *(*uintptr)(osPtr(desc + 0x08))
+		vsLen := *(*uint64)(osPtr(desc + 0x10))
+		psPtr := *(*uintptr)(osPtr(desc + 0x18))
+		psLen := *(*uint64)(osPtr(desc + 0x20))
+		gp := &guestPSO{}
+		if h, ok := storeDXBCBlob(vsPtr, vsLen); ok {
+			gp.vsHash, gp.hasVS = h, true
+		}
+		if h, ok := storeDXBCBlob(psPtr, psLen); ok {
+			gp.psHash, gp.hasPS = h, true
+		}
+		if gp.hasVS || gp.hasPS {
+			st.mu.Lock()
+			st.psos[psoObj] = gp
+			st.mu.Unlock()
+		}
+	}
+	storeComputePSODesc := func(psoObj, desc uintptr) {
+		if desc < 0x10000 {
+			return
+		}
+		csPtr := *(*uintptr)(osPtr(desc + 0x08))
+		csLen := *(*uint64)(osPtr(desc + 0x10))
+		if h, ok := storeDXBCBlob(csPtr, csLen); ok {
+			st.mu.Lock()
+			st.psos[psoObj] = &guestPSO{csHash: h, hasCS: true}
+			st.mu.Unlock()
+		}
+	}
+	cbCreatePSO := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateGraphicsPSO")
+		psoObj := newPipelineState()
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = psoObj
+		}
+		storeGraphicsPSODesc(psoObj, desc)
+		inspectPSO("CreatePSO", desc)
+		return hresultOK
+	})
+	cbCreateComputePSO := syscall.NewCallback(func(this, desc, iid, outPtr uintptr) uintptr {
+		slog.Debug("D3D12DeviceX!CreateComputePSO")
+		psoObj := newPipelineState()
+		if outPtr != 0 {
+			*(*uintptr)(osPtr(outPtr)) = psoObj
+		}
+		storeComputePSODesc(psoObj, desc)
+		return hresultOK
+	})
 	cbCreatePSOStream := syscall.NewCallback(func(this, streamDesc, iid, outPtr uintptr) uintptr {
 		psoObj := newPipelineState()
 		if outPtr != 0 {
@@ -1408,17 +1455,21 @@ func newD3D12XDevice() uintptr {
 	})
 	cbCreateGraphicsPSOX := syscall.NewCallback(func(this, desc, extensions, extended, iid, outPtr uintptr) uintptr {
 		slog.Debug("D3D12DeviceX!CreateGraphicsPipelineStateX", "ext", extensions)
+		psoObj := newPipelineState()
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
+			*(*uintptr)(osPtr(outPtr)) = psoObj
 		}
+		storeGraphicsPSODesc(psoObj, desc)
 		inspectPSO("CreateGraphicsPSOX", desc)
 		return hresultOK
 	})
 	cbCreateComputePSOX := syscall.NewCallback(func(this, desc, extensions, extended, iid, outPtr uintptr) uintptr {
 		slog.Debug("D3D12DeviceX!CreateComputePipelineStateX", "ext", extensions)
+		psoObj := newPipelineState()
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newPipelineState()
+			*(*uintptr)(osPtr(outPtr)) = psoObj
 		}
+		storeComputePSODesc(psoObj, desc)
 		return hresultOK
 	})
 	cbCreateList := syscall.NewCallback(func(this, nodeMask, listType, alloc, pso, iid, outPtr uintptr) uintptr {
@@ -1966,7 +2017,7 @@ func newD3D12XDevice() uintptr {
 		8:   cbCreateQueue,
 		9:   cbCreateAllocator,
 		10:  cbCreatePSO,
-		11:  cbCreatePSO,
+		11:  cbCreateComputePSO,
 		12:  cbCreateList,
 		13:  cbCheckFeatureSupport,
 		14:  cbCreateDescHeap,

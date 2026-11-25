@@ -122,7 +122,7 @@ func TestEmitHLSLStructuredBranch(t *testing.T) {
 	if out.UnsupportedOps != 0 {
 		t.Fatalf("ops non supportés : %v", out.MissingOps)
 	}
-	if !strings.Contains(out.Source, "switch (_pc)") || !strings.Contains(out.Source, "_pc = (scc) ? 12u : 8u;") {
+	if !strings.Contains(out.Source, "[branch] if (_cur == 0u)") || !strings.Contains(out.Source, "_pc = (scc) ? 12u : 8u;") {
 		t.Fatalf("structure de branchement absente :\n%s", out.Source)
 	}
 }

@@ -3,7 +3,9 @@
 package hle
 
 import (
+	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -568,6 +570,70 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		}
 		return hresultOK
 	})
+	cbTaskQueueCreateComposite := syscall.NewCallback(func(this, workPort, compPort, outPtr uintptr) uintptr {
+		wq := getOrCreateTQ(workPort >> 1)
+		cq := getOrCreateTQ(compPort >> 1)
+		h := uintptr(nextHandle.Add(1))
+		tqMu.Lock()
+		tqQueues[h] = &tqQueue{workMode: wq.workMode, compMode: cq.compMode}
+		tqMu.Unlock()
+		if outPtr >= 0x10000 {
+			*(*uintptr)(osPtr(outPtr)) = h
+		}
+		return hresultOK
+	})
+	const hresultPending uintptr = 0x8000000A
+	dispatchAsyncCompletion := func(asyncBlock uintptr) {
+		if asyncBlock < 0x10000 {
+			return
+		}
+		cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
+		if cb < 0x10000 || cb >= 0x800000000000 {
+			return
+		}
+		qHandle := *(*uintptr)(osPtr(asyncBlock + 0x00))
+		q := getOrCreateTQ(qHandle)
+		if q.compMode == 0 { // Manual -> enqueue for XTaskQueueDispatch
+			q.mu.Lock()
+			q.compQ = append(q.compQ, tqTask{ctx: asyncBlock, cb: cb})
+			q.mu.Unlock()
+			return
+		}
+		_, _, _ = syscall.SyscallN(cb, asyncBlock)
+	}
+	cbXAsyncGetStatus := syscall.NewCallback(func(this, asyncBlock, wait uintptr) uintptr {
+		if asyncBlock < 0x10000 {
+			return hresultInvalidArg
+		}
+		stPtr := (*uint64)(osPtr(asyncBlock + 0x20))
+		for {
+			v := atomic.LoadUint64(stPtr)
+			if v != uint64(hresultPending) || wait == 0 {
+				return uintptr(v)
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	})
+	cbXAsyncRun := syscall.NewCallback(func(this, asyncBlock, work uintptr) uintptr {
+		if asyncBlock < 0x10000 || work < 0x10000 || work >= 0x800000000000 {
+			return hresultInvalidArg
+		}
+		atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), uint64(hresultPending))
+		atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x28)), 0)
+		qHandle := *(*uintptr)(osPtr(asyncBlock + 0x00))
+		q := getOrCreateTQ(qHandle)
+		runWork := func() {
+			hr, _, _ := syscall.SyscallN(work, asyncBlock)
+			atomic.StoreUint64((*uint64)(osPtr(asyncBlock+0x20)), uint64(uint32(hr)))
+			dispatchAsyncCompletion(asyncBlock)
+		}
+		if q.workMode == 3 { // Immediate
+			runWork()
+		} else {
+			go runWork()
+		}
+		return hresultOK
+	})
 	cbTaskQueueGetPort := syscall.NewCallback(func(this, q, port, outPort uintptr) uintptr {
 		if q == 0 {
 			q = processTQHandle
@@ -736,29 +802,47 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		}),
 	}
 
+	gdkTrace := os.Getenv("ASTRAL_GDK_TRACE") == "1"
+	traceGDK := func(name string, fn uintptr) uintptr {
+		if !gdkTrace {
+			return fn
+		}
+		var seen atomic.Int32
+		return syscall.NewCallback(func(a0, a1, a2, a3, a4, a5 uintptr) uintptr {
+			if seen.Add(1) <= 8 {
+				slog.Info("GDK_TRACE", "op", name, "a1", fmt.Sprintf("0x%X", a1), "a2", fmt.Sprintf("0x%X", a2), "a3", fmt.Sprintf("0x%X", a3))
+			}
+			r, _, _ := syscall.SyscallN(fn, a0, a1, a2, a3, a4, a5)
+			return r
+		})
+	}
 	gdkProviders := map[string]uintptr{
 		"{073B7DCB-1FCF-4030-94BE-E3C9EB623428}": NewCOMObject("xasync", 32, map[int]uintptr{
-			3: cbGISuccess, // 0x18 XAsyncGetStatus -> S_OK
-			4: syscall.NewCallback(func(this, block, outSize uintptr) uintptr { // 0x20 XAsyncGetResultSize
+			3: traceGDK("XAsyncGetStatus", cbXAsyncGetStatus), // 0x18 XAsyncGetStatus
+			4: traceGDK("XAsyncGetResultSize", syscall.NewCallback(func(this, block, outSize uintptr) uintptr { // 0x20 XAsyncGetResultSize
 				if outSize >= 0x10000 {
-					*(*uintptr)(osPtr(outSize)) = 0
+					var sz uintptr
+					if block >= 0x10000 {
+						sz = uintptr(atomic.LoadUint64((*uint64)(osPtr(block + 0x28))))
+					}
+					*(*uintptr)(osPtr(outSize)) = sz
 				}
 				return hresultOK
-			}),
-			5:  cbGISuccess,              // 0x28 XAsyncCancel
-			6:  cbGISuccess,              // 0x30 XAsyncRun
-			7:  cbGISuccess,              // 0x38 XAsyncBegin
-			9:  cbGISuccess,              // 0x48 XAsyncSchedule
-			10: cbGISuccess,              // 0x50 XAsyncComplete
-			11: cbGISuccess,              // 0x58 XAsyncGetResult
-			12: cbTaskQueueCreate,        // 0x60 XTaskQueueCreate
-			13: cbTaskQueueCreate,        // 0x68 XTaskQueueCreateComposite
+			})),
+			5:  traceGDK("XAsyncCancel", cbGISuccess),                 // 0x28 XAsyncCancel
+			6:  traceGDK("XAsyncRun", cbXAsyncRun),                    // 0x30 XAsyncRun
+			7:  traceGDK("XAsyncBegin", cbGISuccess),                  // 0x38 XAsyncBegin
+			9:  traceGDK("XAsyncSchedule", cbGISuccess),               // 0x48 XAsyncSchedule
+			10: traceGDK("XAsyncComplete", cbGISuccess),               // 0x50 XAsyncComplete
+			11: traceGDK("XAsyncGetResult", cbGISuccess),              // 0x58 XAsyncGetResult
+			12: traceGDK("XTaskQueueCreate", cbTaskQueueCreate),       // 0x60 XTaskQueueCreate
+			13: traceGDK("XTaskQueueCreateComposite", cbTaskQueueCreateComposite), // 0x68 XTaskQueueCreateComposite
 			14: cbTaskQueueGetPort,       // 0x70 XTaskQueueGetPort
 			15: cbTaskQueueDuplicate,     // 0x78 XTaskQueueDuplicateHandle
 			16: cbTaskQueueDispatch,      // 0x80 XTaskQueueDispatch
 			17: cbGISuccess,              // 0x88 XTaskQueueCloseHandle
-			18: cbTaskQueueSubmit,        // 0x90 XTaskQueueSubmitCallback
-			19: cbTaskQueueSubmitDelayed, // 0x98 XTaskQueueSubmitDelayedCallback
+			18: traceGDK("XTaskQueueSubmit", cbTaskQueueSubmit),        // 0x90 XTaskQueueSubmitCallback
+			19: traceGDK("XTaskQueueSubmitDelayed", cbTaskQueueSubmitDelayed), // 0x98 XTaskQueueSubmitDelayedCallback
 			22: cbTaskQueueTerminate,     // 0xB0 XTaskQueueTerminate
 			23: cbRegisterToken5,         // 0xB8 XTaskQueueRegisterMonitor
 			24: cbGISuccess,              // 0xC0 XTaskQueueUnregisterMonitor
@@ -981,6 +1065,86 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			4: syscall.NewCallback(func(this, pref, info uintptr) uintptr { // XDisplayTryEnableHdrMode -> 2 (Disabled / SDR)
 				return 2
 			}),
+		}),
+		// XStore ({0DD112AC-7C24-448C-B92B-3960FB5BD30C}) : licence locale active hors-ligne, boutique réseau en erreur propre
+		"{0DD112AC-7C24-448C-B92B-3960FB5BD30C}": NewCOMObject("xstore", 80, map[int]uintptr{
+			3: syscall.NewCallback(func(this, user, outCtx uintptr) uintptr { // 0x18 XStoreCreateContext
+				if outCtx >= 0x10000 {
+					*(*uintptr)(osPtr(outCtx)) = uintptr(nextHandle.Add(1))
+				}
+				return hresultOK
+			}),
+			4:  cbGISuccess, // 0x20 XStoreCloseContextHandle
+			5:  cbCompleteAsync5, // 0x28 XStoreQueryAssociatedProductsAsync
+			6:  syscall.NewCallback(func(this, asyncBlock, outQuery uintptr) uintptr { // 0x30 QueryResult -> requête vide
+				if outQuery >= 0x10000 {
+					*(*uintptr)(osPtr(outQuery)) = uintptr(nextHandle.Add(1))
+				}
+				return hresultOK
+			}),
+			9:  cbCompleteAsync4, // 0x48 XStoreQueryEntitledProductsAsync
+			10: syscall.NewCallback(func(this, asyncBlock, outQuery uintptr) uintptr { // 0x50 QueryResult
+				if outQuery >= 0x10000 {
+					*(*uintptr)(osPtr(outQuery)) = uintptr(nextHandle.Add(1))
+				}
+				return hresultOK
+			}),
+			15: cbGISuccess,                                                 // 0x78 XStoreEnumerateProductsQuery
+			16: syscall.NewCallback(func() uintptr { return 0 }),            // 0x80 XStoreProductsQueryHasMorePages -> false
+			19: cbGISuccess,                                                 // 0x98 XStoreCloseProductsQueryHandle
+			20: cbCompleteAsync4,                                            // 0xA0 XStoreAcquireLicenseForPackageAsync
+			21: syscall.NewCallback(func(this, asyncBlock, outLic uintptr) uintptr { // 0xA8 XStoreAcquireLicenseForPackageResult
+				if outLic >= 0x10000 {
+					*(*uintptr)(osPtr(outLic)) = 0x0000A57A00001001
+				}
+				return hresultOK
+			}),
+			22: cbReturnTrue, // 0xB0 XStoreIsLicenseValid -> true
+			23: cbGISuccess,  // 0xB8 XStoreCloseLicenseHandle
+			28: syscall.NewCallback(func(this, ctx, asyncBlock uintptr) uintptr { // 0xE0 XStoreQueryGameLicenseAsync
+				slog.Info("xstore!XStoreQueryGameLicenseAsync -> licence locale active hors-ligne")
+				if asyncBlock >= 0x10000 {
+					cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
+					if cb >= 0x10000 && cb < 0x800000000000 {
+						go func() {
+							time.Sleep(2 * time.Millisecond)
+							_, _, _ = syscall.SyscallN(cb, asyncBlock)
+						}()
+					}
+				}
+				return hresultOK
+			}),
+			29: syscall.NewCallback(func(this, asyncBlock, outLic uintptr) uintptr { // 0xE8 XStoreQueryGameLicenseResult (104 octets)
+				if outLic >= 0x10000 {
+					b := unsafe.Slice((*byte)(osPtr(outLic)), 104)
+					clear(b)
+					copy(b[0:14], "9P0000000/0010")
+					b[18] = 1 // isActive = true (isTrial = false)
+				}
+				return hresultOK
+			}),
+			55: cbCompleteAsync4,                                                // 0x1B8 XStoreQueryGameAndDlcPackageUpdatesAsync
+			56: syscall.NewCallback(func() uintptr { return 0x89245301 }),       // 0x1C0 NETWORK_ERROR
+			57: syscall.NewCallback(func() uintptr { return 0x89245301 }),       // 0x1C8 NETWORK_ERROR
+			66: cbRegisterToken5,                                                // 0x210 RegisterGameLicenseChanged
+			67: cbReturnTrue,                                                    // 0x218 Unregister
+			68: cbRegisterToken5,                                                // 0x220 RegisterPackageLicenseLost
+			69: cbReturnTrue,                                                    // 0x228 Unregister
+			71: cbCompleteAsync4,                                                // 0x238 AcquireLicenseForDurablesAsync
+			72: syscall.NewCallback(func(this, asyncBlock, outLic uintptr) uintptr { // 0x240 Result
+				if outLic >= 0x10000 {
+					*(*uintptr)(osPtr(outLic)) = 0
+				}
+				return hresultOK
+			}),
+		}),
+		// XGameUi ({DFCD4649-4FF8-4043-BA07-35D607DF98B0}) : boîtes de dialogue système hors-ligne
+		"{DFCD4649-4FF8-4043-BA07-35D607DF98B0}": NewCOMObject("xgameui", 32, map[int]uintptr{
+			7:  cbCompleteAsync4,                                          // 0x38 XGameUiShowPlayerProfileCardAsync
+			8:  cbGISuccess,                                               // 0x40 XGameUiShowPlayerProfileCardResult
+			17: cbCompleteAsync4,                                          // 0x88 XGameUiShowTextEntryAsync
+			18: syscall.NewCallback(func() uintptr { return 0x80004004 }), // 0x90 E_ABORT (annulé)
+			19: syscall.NewCallback(func() uintptr { return 0x80004004 }), // 0x98 E_ABORT
 		}),
 	}
 

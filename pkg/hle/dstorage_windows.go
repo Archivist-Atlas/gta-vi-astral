@@ -184,7 +184,19 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			return 0
 		}),
 		4:  cbOK, // EnqueueStatus (0x20)
-		5:  cbOK, // EnqueueSignal (0x28)
+		5: syscall.NewCallback(func(this, fence, val uintptr) uintptr { // EnqueueSignal (0x28)
+			if fence >= 0x10000 {
+				vtbl := *(*uintptr)(osPtr(fence))
+				if vtbl >= 0x10000 {
+					fn := *(*uintptr)(osPtr(vtbl + 10*8)) // ID3D12Fence::Signal (slot 10)
+					if fn >= 0x10000 {
+						_, _, _ = syscall.SyscallN(fn, fence, val)
+					}
+				}
+			}
+			slog.Info("IDStorageQueueX!EnqueueSignal", "fence", fence, "val", uint64(val))
+			return hresultOK
+		}),
 		6:  cbOK, // Submit (0x30)
 		8:  cbOK, // Close (0x40)
 		10: cbOK, // Submit / ErrorRecord fallback
