@@ -5,6 +5,7 @@ package hle
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -23,7 +24,7 @@ var (
 
 const (
 	giKindGamepad      uint32 = 0x00040000 // GameInputKindGamepad (1 << 18 = 262144)
-	giDeviceConnected  uint32 = 0x00000001
+	giDeviceConnected  uint32 = 0x00000003 // GameInputDeviceConnected (0x1) | GameInputDeviceInputEnabled (0x2)
 	giBtnMenu          uint32 = 0x00000001
 	giBtnView          uint32 = 0x00000002
 	giBtnA             uint32 = 0x00000004
@@ -386,7 +387,6 @@ func pollLiveGamepad() gameInputGamepadState {
 // connecté au clavier Windows et à XInput (manette Xbox/PC).
 func bindGameInput(t *LiveTable) {
 	startTime := time.Now()
-	var seqNum atomic.Uint64
 	var nextToken atomic.Uint64
 	nextToken.Store(1)
 
@@ -428,26 +428,37 @@ func bindGameInput(t *LiveTable) {
 	})
 
 	var gamepadPolls atomic.Uint64
+	// Layout natif d'un objet IGameInputReading (64 octets en mémoire OS, GC-safe) :
+	//   +0x00 : vtable (uintptr)
+	//   +0x08 : seq (uint64)
+	//   +0x10 : timestamp (uint64)
+	//   +0x18 : state (gameInputGamepadState, 28 octets)
 	cbGetGamepadState := syscall.NewCallback(func(this, outState uintptr) uintptr { // GetGamepadState (slot 22, 0xB0)
-		if outState >= 0x10000 {
-			st := pollLiveGamepad()
+		if this >= 0x10000 && outState >= 0x10000 {
+			st := *(*gameInputGamepadState)(osPtr(this + 0x18))
 			*(*gameInputGamepadState)(osPtr(outState)) = st
 			if n := gamepadPolls.Add(1); n == 1 {
-				slog.Info("IGameInputReading!GetGamepadState actif (manette XInput + clavier Windows connectés)")
+				slog.Info("IGameInputReading!GetGamepadState actif (manette XInput/HID + clavier Windows connectés)")
 			}
 			return 1
 		}
 		return 0
 	})
-	// IGameInputReading (28 slots, ABI GDK)
-	readingObj := NewCOMObject("IGameInputReading", 28, map[int]uintptr{
+	// Vtable partagée IGameInputReading (28 slots, ABI GDK)
+	readingProto := NewCOMObjectWithHeader("IGameInputReading", 28, 64, map[int]uintptr{
 		3: syscall.NewCallback(func(this uintptr) uintptr { // GetInputKind
 			return uintptr(giKindGamepad)
 		}),
 		4: syscall.NewCallback(func(this, kind uintptr) uintptr { // GetSequenceNumber
-			return uintptr(seqNum.Add(1))
+			if this >= 0x10000 {
+				return uintptr(*(*uint64)(osPtr(this + 0x08)))
+			}
+			return 0
 		}),
 		5: syscall.NewCallback(func(this uintptr) uintptr { // GetTimestamp
+			if this >= 0x10000 {
+				return uintptr(*(*uint64)(osPtr(this + 0x10)))
+			}
 			return uintptr(nowUS())
 		}),
 		6: syscall.NewCallback(func(this, outDev uintptr) uintptr { // GetDevice
@@ -458,6 +469,58 @@ func bindGameInput(t *LiveTable) {
 		}),
 		22: cbGetGamepadState, // GetGamepadState (0xB0)
 	})
+	readingVtable := *(*uintptr)(osPtr(readingProto))
+
+	// Ring buffer de 64 objets IGameInputReading distincts en mémoire native (snapshots figés
+	// pour que la détection de front montant cur.Buttons & ~prev.Buttons fonctionne à 100 %).
+	const ringCap = 64
+	ringMem, _, _ := k32VirtualAlloc.Call(0, ringCap*64, 0x3000, 0x04)
+	var (
+		ringMu      sync.Mutex
+		latestSeq   uint64
+		lastState   gameInputGamepadState
+		readingCbs  []struct{ tok uint64; ctx, cb uintptr }
+	)
+	slotPtr := func(seq uint64) uintptr {
+		return ringMem + uintptr((seq-1)%ringCap)*64
+	}
+	pushReadingLocked := func(st gameInputGamepadState) uintptr {
+		latestSeq++
+		p := slotPtr(latestSeq)
+		*(*uintptr)(osPtr(p + 0x00)) = readingVtable
+		*(*uint64)(osPtr(p + 0x08)) = latestSeq
+		*(*uint64)(osPtr(p + 0x10)) = nowUS()
+		*(*gameInputGamepadState)(osPtr(p + 0x18)) = st
+		lastState = st
+		return p
+	}
+	sampleIfChanged := func() (uintptr, bool) {
+		st := pollLiveGamepad()
+		ringMu.Lock()
+		if latestSeq == 0 || st != lastState {
+			p := pushReadingLocked(st)
+			cbs := append([]struct{ tok uint64; ctx, cb uintptr }(nil), readingCbs...)
+			ringMu.Unlock()
+			for _, c := range cbs {
+				if c.cb >= 0x10000 && c.cb < 0x800000000000 {
+					_, _, _ = syscall.SyscallN(c.cb, uintptr(c.tok), c.ctx, p)
+				}
+			}
+			return p, true
+		}
+		p := slotPtr(latestSeq)
+		ringMu.Unlock()
+		return p, false
+	}
+	// Initialise le tout premier reading (état neutre) puis poll toutes les 8 ms en arrière-plan
+	_, _ = sampleIfChanged()
+	go func() {
+		tk := time.NewTicker(8 * time.Millisecond)
+		defer tk.Stop()
+		for range tk.C {
+			_, _ = sampleIfChanged()
+		}
+	}()
 
 	cbGetTimestamp := syscall.NewCallback(func(this uintptr) uintptr {
 		return uintptr(nowUS())
@@ -466,15 +529,61 @@ func bindGameInput(t *LiveTable) {
 		kind := uint32(inputKind)
 		if kind == 0 || kind&giKindGamepad != 0 {
 			if outReading >= 0x10000 {
-				*(*uintptr)(osPtr(outReading)) = readingObj
+				p, _ := sampleIfChanged()
+				*(*uintptr)(osPtr(outReading)) = p
 				return hresultOK
 			}
 		}
 		return giReadingNotFound
 	})
+	cbGetNextReading := syscall.NewCallback(func(this, refReading, inputKind, device, outReading uintptr) uintptr {
+		kind := uint32(inputKind)
+		if (kind != 0 && kind&giKindGamepad == 0) || refReading < 0x10000 || outReading < 0x10000 {
+			return giReadingNotFound
+		}
+		_, _ = sampleIfChanged()
+		refSeq := *(*uint64)(osPtr(refReading + 0x08))
+		ringMu.Lock()
+		curLatest := latestSeq
+		if refSeq >= curLatest || curLatest == 0 {
+			ringMu.Unlock()
+			return giReadingNotFound
+		}
+		nextSeq := refSeq + 1
+		if curLatest-refSeq >= ringCap {
+			nextSeq = curLatest - ringCap + 1
+		}
+		p := slotPtr(nextSeq)
+		ringMu.Unlock()
+		*(*uintptr)(osPtr(outReading)) = p
+		return hresultOK
+	})
+	cbGetPrevReading := syscall.NewCallback(func(this, refReading, inputKind, device, outReading uintptr) uintptr {
+		kind := uint32(inputKind)
+		if (kind != 0 && kind&giKindGamepad == 0) || refReading < 0x10000 || outReading < 0x10000 {
+			return giReadingNotFound
+		}
+		refSeq := *(*uint64)(osPtr(refReading + 0x08))
+		ringMu.Lock()
+		curLatest := latestSeq
+		if refSeq <= 1 || curLatest-refSeq+1 >= ringCap {
+			ringMu.Unlock()
+			return giReadingNotFound
+		}
+		p := slotPtr(refSeq - 1)
+		ringMu.Unlock()
+		*(*uintptr)(osPtr(outReading)) = p
+		return hresultOK
+	})
 	cbRegReading := syscall.NewCallback(func(this, dev, kind, thresh, ctx, cb, outToken uintptr) uintptr {
+		tok := nextToken.Add(1)
 		if outToken >= 0x10000 {
-			*(*uint64)(osPtr(outToken)) = nextToken.Add(1)
+			*(*uint64)(osPtr(outToken)) = tok
+		}
+		if (uint32(kind) == 0 || uint32(kind)&giKindGamepad != 0) && cb >= 0x10000 && cb < 0x800000000000 {
+			ringMu.Lock()
+			readingCbs = append(readingCbs, struct{ tok uint64; ctx, cb uintptr }{tok: tok, ctx: ctx, cb: cb})
+			ringMu.Unlock()
 		}
 		return hresultOK
 	})
@@ -505,9 +614,9 @@ func bindGameInput(t *LiveTable) {
 
 	gameInputObj := NewCOMObject("IGameInput", 22, map[int]uintptr{
 		3:  cbGetTimestamp,      // GetCurrentTimestamp
-		4:  cbGetCurrentReading, // GetCurrentReading (XInput + Clavier live)
-		5:  cbNotFound,          // GetNextReading
-		6:  cbNotFound,          // GetPreviousReading
+		4:  cbGetCurrentReading, // GetCurrentReading (XInput/HID + Clavier live, snapshots ring-buffer)
+		5:  cbGetNextReading,    // GetNextReading
+		6:  cbGetPrevReading,    // GetPreviousReading
 		7:  cbNotFound,          // GetTemporalReading
 		8:  cbRegReading,        // RegisterReadingCallback (7 args)
 		9:  cbRegDevice,         // RegisterDeviceCallback (8 args)
