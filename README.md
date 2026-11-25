@@ -8,24 +8,25 @@ Système modulaire en **Go** pour l'analyse, la recompilation de shaders et l'ex
 > **Projet expérimental en cours de développement — NON JOUABLE actuellement.**
 > Le moteur démarre, charge toutes ses archives (`.rpf` + TTDB + licences), connecte l'utilisateur hors-ligne (`XUser` + `XGameSave`) et tourne en boucle continue **780+ frames `PresentX` sur 45 s (0 crash, 0 `WARN`)** avec recompilation live de ses shaders RDNA2 sur GPU Windows, mais le rendu 3D complet et l'audio ne sont **pas encore fonctionnels**.
 
-## Avancement global : ~87 %
+## Avancement global : ~45 %
 
 ```text
-Progression globale : [█████████████████░░░] 87 %
+Progression globale : [█████████░░░░░░░░░░░] 45 %
 ```
 
-- **Boot natif continu + `XUser` + `XGameSave` + `XAsyncRun` + `XStore` + GPU Compute (1 500+ frames, 0 crash)** : ✅ Terminé (`100 %`)
-- **Premiers vrais pixels / écrans d'intro (UI Scaleform + textures BC3 streamées via `CopyPageMappingsBatchX` rendues à 100 % sur D3D12)** : ✅ Terminé (`100 %`)
-- **Menus de configuration initiale (`ASTRALPLAYER (A)` -> `EXPÉRIENCE DE NAVIGATION` / `Boussole (dynamique)` / `CONTINUER (A)`, 17 500+ requêtes DirectStorage + `PAGE_DESTINATION`)** : ✅ Atteints (`100 %`)
-- **Monde ouvert 3D jouable (audio XMA2, BCPack, rendu 3D, ray tracing)** : 🔄 En cours (`~58 %`)
+- **Boot natif continu + `XUser` + `XGameSave` + `XAsyncRun` + `XStore` + DirectStorage (`story000.rpf`)** : ✅ Opérationnel (`90 %`)
+- **Interfaces 2D / menus de configuration (`ASTRALPLAYER (A)` -> `EXPÉRIENCE DE NAVIGATION` -> `TERMINER LA CONFIGURATION ?`)** : 🔄 En cours (`~75 %` — navigation fonctionnelle, affichage UI encore imparfait)
+- **Audio console (`xapu` Opus + `AcpHal` XMA2 vers WASAPI)** : 🔄 Début (`~20 %` — sortie WASAPI active, décodage Opus/XMA2 non implémenté)
+- **Rendu 3D temps réel & monde ouvert jouable (shaders 3D bindless, G-Buffer, Depth-Stencil, BCPack, ray tracing)** : ⏳ Début (`~15 %`)
 
 | Sous-système | Avancement | État actuel | Reste à faire |
 | :--- | :---: | :--- | :--- |
-| **Chargeur PE / Mémoire / CPU x64** | `96 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, **VEH + émulation complète AMD Zen 2 sur CPU Intel (`CLZERO`, `MONITORX`, `MWAITX`, `RDPRU`, `CLWB` et SSE4a `INSERTQ`/`EXTRQ` sur `XMM0..15`)**, pools physiques 64 KiB (`xmem` 6,2 Go) + aliasing `xmemMapAlias` + écriture directe pages physiques `xmemWritePhysical`. | Ajustements ponctuels sur de nouveaux chemins CPU en jeu. |
-| **Stockage & Streaming (`VirtualFS` / `DirectStorage`)** | `91 %` | 14+ `.rpf` (`core_restofworld`, `core_bvh4`, `core_licenses_data`) et toutes les archives TTDB (`ttdb_ui`, `ttdb_peds`, `ttdb_props`, `ttdb_vfx`, `textures_loose`) ouverts ; **17 500+ requêtes `ReadAt` + `zlib`**, `EnqueueSignal` -> `ID3D12Fence::Signal`, et **streaming `PAGE_DESTINATION` (écriture directe dans les pages physiques 64 KiB XMem au `Submit`)**. | Décompression matérielle **BCPack** (BC1–BC7). |
-| **OS Console / HLE (`xgameruntime`, `GameInput`, Audio)** | `99 %` | **`xasync`/`XTaskQueue` complet avec ports partagés `XTaskQueueCreateComposite` (`XAsyncRun`, `XAsyncGetStatus` + complétions unifiées `XUser`/`XGameSave`/`XStore`)**, `xuser` complet (`AstralPlayer`, `E_GAMEUSER_FAILED_TO_GET_TOKEN = 0x89245111`), `xgamesave` 30 slots sur disque (`GetContainerInfo` -> `S_OK`, `EnumerateContainerInfo`), `xstore` & `xgameui` hors-ligne, `OEM\ConsoleMode`, `RegisterAppStateChangeNotification` / `AppConstrained`, `xnetworking` 18 slots + proxy `MFPlat.DLL!MFCreateSourceResolver`, `IAcpHal` + `xapu` (`XApuEnqueueCommand` actif), et **`GameInput` complet** (DualSense PS5 `0x054C:0x0CE6` / XInput / HID + clavier). | Décodage audio PCM réel (`xapu` Opus / `XMA2` vers WASAPI). |
-| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `69 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10 (littéraux 32-bit `VOP2`/`VOP3` 12 octets), IR SSA, `ISG1`/`OSG1`, recompilation live RDNA2 -> HLSL **VS/PS (6+ PSOs compilés jusqu'à `50/50` VS / `73/76` PS) & Compute (`cs_5_0` : 5+ Compute PSOs compilés en matériel D3D12 jusqu'à `1 871/1 928 ins`)**, détection auto du slot CBV (`vsCBSlot=0..5`), `MUBUF` indexé dynamique, `v_med3_f32` et `RootConst[1024]`. | Masque `EXEC` par lane, descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), compilation asynchrone. |
-| **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `82 %` | Fenêtre Win32 unique 1280×720 centré (focus natif, zéro flash « Americas »), vtables COM partagées O(1), `ID3D12Device` + `SwapChain3`, `PresentX` à 30 fps, slots Xbox 2026 (`+2`), **liaisons Compute Root (`#35` DescriptorTable, `#41` CBV, `#43` SRV) + héritage `CreateDerivedPipelineStateX` + scan complet `PSOStream`**, `CopyPageMappingsBatchX` (#31) + `CreatePlacedShaderResourceView`, 5+ RenderTargets offscreen matériels (`RTV -> SRV t0`), tables mixtes `SRV2`+`CBV1`, `RECTLIST` généralisé, détuilage RDNA2/GFX10 bit-exact. | G-Buffer / Depth-Stencil (`DSV`), `ExecuteIndirect`, BVH4. |
+| **Chargeur PE / Mémoire / CPU x64** | `90 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, VEH + émulation AMD Zen 2 (`CLZERO`, `MONITORX`, `MWAITX`, `RDPRU`, `CLWB`, SSE4a `INSERTQ`/`EXTRQ`), pools physiques 64 KiB (`xmem` 6,2 Go) + `xmemMapAlias` + `xmemWritePhysical`. | Cas limites CPU/mémoire en monde ouvert. |
+| **Stockage & Streaming (`VirtualFS` / `DirectStorage`)** | `75 %` | 20+ `.rpf` (jusqu'à `story000.rpf` / `story000_script.rpf`) et TTDB `.ttpf` ouverts ; 23 000+ requêtes `ReadAt` + `zlib`, `EnqueueSignal`, et `PAGE_DESTINATION` (pages physiques 64 KiB). | Décompression **BCPack** (textures 3D BC1–BC7) et exécution **asynchrone** multi-thread (pour ne plus bloquer l'audio). |
+| **OS Console / HLE (`xgameruntime`, `GameInput`)** | `88 %` | `xasync`/`XTaskQueue` (ports partagés composites), `xuser` (`AstralPlayer`), `xgamesave` 30 slots sur disque, `xstore`/`xgameui`/`xnetworking` hors-ligne, `OEM\ConsoleMode`, `GameInput` complet (DualSense PS5 / XInput / clavier). | APIs secondaires rencontrées en jeu. |
+| **Audio (`AcpHal` / `xapu` / `chad`)** | `20 %` | Allocation APU, canal `IAcpHal`, `XApuConnect` / `ApuResult` 72 octets, sortie WASAPI active. | Décodage réel **Opus** (`xapu.dll`) et **XMA2** (`AcpHal`), suppression des saccades au chargement. |
+| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `30 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10 partiel, recompilation live HLSL SM 5.0 suffisante pour l'UI 2D Scaleform et quelques Compute Shaders simples. | Masque `EXEC` par lane, descripteurs **bindless**, `LDS`/`FLAT`, émulation wave64, **DXIL SM 6.6**, Mesh/Amplification Shaders (indispensables pour la 3D). |
+| **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `35 %` | Fenêtre Win32 unique 1280×720, `PresentX` à 30 fps, rejeu de passes 2D/UI, RenderTargets offscreen, rafraîchissement dynamique de l'atlas de police, détuilage RDNA2, Compute root bindings de base. | **G-Buffer / MRT**, **Depth-Stencil (`DSV`)**, tas de descripteurs bindless, `ExecuteIndirect`, synchronisation inter-files (`Wait64BitValueX`), rendu 3D complet. |
 
 ## Captures d'avancement
 
