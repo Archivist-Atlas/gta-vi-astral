@@ -50,7 +50,7 @@ type d3d12xState struct {
 	activeVBSize    uint32
 	activeVBStride  uint32
 	activeRootVA    uintptr
-	activeSRVRes    uintptr
+	activeSRVTex    *gpu.HostTextureUpload
 	frameDraws      []gpu.HostDrawPass
 	lastClearColor  [4]float32
 	hasClearColor   bool
@@ -392,21 +392,15 @@ func newD3D12XDevice() uintptr {
 				pass.CBData = make([]byte, 256)
 				copy(pass.CBData, unsafe.Slice((*byte)(osPtr(st.activeRootVA)), 256))
 			}
-			if st.activeSRVRes != 0 {
-				if d, ok := st.resDescs[st.activeSRVRes]; ok && d.Dimension == 3 && d.Width > 0 && d.Height > 0 && d.Width <= 4096 && d.Height <= 4096 {
-					if va := st.resGPUAddrs[st.activeSRVRes]; va >= 0x10000 {
-						sz := d.Width * uint64(d.Height) * 4
-						if sz > 0 && sz <= (16<<20) {
-							pix := make([]byte, sz)
-							copy(pix, unsafe.Slice((*byte)(osPtr(uintptr(va))), sz))
-							pass.SRVTex = &gpu.HostTextureUpload{
-								GuestVA: va,
-								Width:   uint32(d.Width),
-								Height:  d.Height,
-								Format:  d.Format,
-								Pixels:  pix,
-							}
-						}
+			if st.activeSRVTex != nil {
+				tx := *st.activeSRVTex
+				if tx.GuestVA >= 0x10000 && tx.Width > 0 && tx.Height > 0 && tx.Width <= 4096 && tx.Height <= 4096 {
+					sz := uint64(tx.Width) * uint64(tx.Height) * 4
+					if sz > 0 && sz <= (16<<20) {
+						pix := make([]byte, sz)
+						copy(pix, unsafe.Slice((*byte)(osPtr(uintptr(tx.GuestVA))), sz))
+						tx.Pixels = pix
+						pass.SRVTex = &tx
 					}
 				}
 			}
@@ -565,17 +559,34 @@ func newD3D12XDevice() uintptr {
 		return 0
 	})
 	cbListSetRootTable := syscall.NewCallback(func(this, rootIdx, baseDesc uintptr) uintptr {
-		c := listSlotHits[36].Add(1)
+		listSlotHits[36].Add(1)
 		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
+			tag := *(*uint32)(osPtr(baseDesc))
 			st.mu.Lock()
-			st.activeRootVA = baseDesc
-			if *(*uint32)(osPtr(baseDesc)) == 0x53525631 { // "SRV1" créé par CreateSRV
-				st.activeSRVRes = *(*uintptr)(osPtr(baseDesc + 8))
+			switch tag {
+			case 0x43425631: // "CBV1" : { tag u32, _pad u32, BufferLocation u64 (+8), SizeInBytes u32 (+16) }
+				cbVA := *(*uintptr)(osPtr(baseDesc + 8))
+				if cbVA >= 0x10000 && cbVA < 0x800000000000 {
+					st.activeRootVA = cbVA
+				}
+			case 0x53525632: // "SRV2" : { tag u32, fmt u32 (+4), gpuVA u64 (+8), w u32 (+16), h u32 (+20), dim u32 (+24) }
+				dim := *(*uint32)(osPtr(baseDesc + 24))
+				va := *(*uint64)(osPtr(baseDesc + 8))
+				w := *(*uint32)(osPtr(baseDesc + 16))
+				h := *(*uint32)(osPtr(baseDesc + 20))
+				fmtID := *(*uint32)(osPtr(baseDesc + 4))
+				if dim == 3 && va >= 0x10000 && va < 0x800000000000 && w > 0 && h > 0 {
+					st.activeSRVTex = &gpu.HostTextureUpload{
+						GuestVA: va,
+						Width:   w,
+						Height:  h,
+						Format:  fmtID,
+					}
+				}
+			default:
+				st.activeRootVA = baseDesc
 			}
 			st.mu.Unlock()
-		}
-		if gpuTrace && c <= 8 {
-			slog.Info("GPU_TRACE SetGraphicsRootDescriptorTable", "n", c, "rootIdx", uint32(rootIdx), "gpuHandle", fmt.Sprintf("0x%X", baseDesc))
 		}
 		return 0
 	})
@@ -1360,13 +1371,43 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
-	cbCreateSRV := syscall.NewCallback(func(this, res, descPtr, handle uintptr) uintptr {
-		slog.Debug("D3D12DeviceX!CreateSRV", "res", fmt.Sprintf("0x%X", res), "handle", fmt.Sprintf("0x%X", handle))
-		if handle >= 0x10000 {
-			*(*uint32)(osPtr(handle + 0)) = 0x53525631 // "SRV1"
-			*(*uint32)(osPtr(handle + 4)) = 1
-			*(*uintptr)(osPtr(handle + 8)) = res
+	writeSRV2 := func(handle uintptr, gpuVA uint64, w, h, fmtID, dim uint32) {
+		if handle < 0x10000 {
+			return
 		}
+		*(*uint32)(osPtr(handle + 0)) = 0x53525632 // "SRV2"
+		*(*uint32)(osPtr(handle + 4)) = fmtID
+		*(*uint64)(osPtr(handle + 8)) = gpuVA
+		*(*uint32)(osPtr(handle + 16)) = w
+		*(*uint32)(osPtr(handle + 20)) = h
+		*(*uint32)(osPtr(handle + 24)) = dim
+		*(*uint32)(osPtr(handle + 28)) = 0
+	}
+	var srvCount, placedSRVCount atomic.Uint64
+	cbCreateSRV := syscall.NewCallback(func(this, res, descPtr, handle uintptr) uintptr {
+		srvCount.Add(1)
+		var va uint64
+		var d xgResourceDesc
+		if res != 0 {
+			st.mu.Lock()
+			va = st.resGPUAddrs[res]
+			d = st.resDescs[res]
+			st.mu.Unlock()
+		}
+		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension)
+		return 0
+	})
+	cbCreatePlacedSRV := syscall.NewCallback(func(this, resDescPtr, srvDescPtr, handle, gpuVA uintptr) uintptr {
+		n := placedSRVCount.Add(1)
+		var d xgResourceDesc
+		if resDescPtr >= 0x10000 {
+			d = *(*xgResourceDesc)(osPtr(resDescPtr))
+		}
+		va := uint64(gpuVA)
+		if gpuTrace && n <= 6 && d.Dimension == 3 {
+			slog.Info("GPU_TRACE CreatePlacedSRV(Tex2D)", "n", n, "va", fmt.Sprintf("0x%X", va), "w", d.Width, "h", d.Height, "fmt", d.Format)
+		}
+		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension)
 		return 0
 	})
 	cbCreateUAV := syscall.NewCallback(func(this, res, counter, descPtr, handle uintptr) uintptr {
@@ -1521,7 +1562,7 @@ func newD3D12XDevice() uintptr {
 		66:  cbSerializePSOX,     // SerializeComputePipelineStateX
 		67:  cbDeserializePSOX,   // DeserializeComputePipelineStateX
 		69:  cbOK,          // Debug filter
-		70:  logOK("CreatePlacedSRV"),
+		70:  cbCreatePlacedSRV,
 		71:  logOK("CreatePlacedUAV"),
 		73:  cbCreateListX, // CreateCommandListX
 		74:  cbRegisterPagePool,
