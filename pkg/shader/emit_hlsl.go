@@ -9,15 +9,16 @@ import (
 // HLSLOutput contient le source HLSL SM 5.0 généré depuis un programme RDNA2 (GFX10)
 // ainsi que les statistiques de couverture d'instructions.
 type HLSLOutput struct {
-	Stage          HwStage
-	EntryPoint     string
-	Target         string // "vs_5_0" ou "ps_5_0"
-	Source         string
-	InputElements  []SigElement // éléments non-SV_* de ISG1 pour D3D12_INPUT_LAYOUT_DESC
-	MissingOps     []string     // encodages/mots non encore abaissés (diagnostic)
-	TotalInsts     int
-	LoweredInsts   int
-	UnsupportedOps int
+	Stage            HwStage
+	EntryPoint       string
+	Target           string // "vs_5_0" ou "ps_5_0"
+	Source           string
+	InputElements    []SigElement // éléments non-SV_* de ISG1 pour D3D12_INPUT_LAYOUT_DESC
+	CBDescriptorSlot uint32       // slot CBV (0..7) dans la DescriptorTable racine chargé par s_load_dwordx4
+	MissingOps       []string     // encodages/mots non encore abaissés (diagnostic)
+	TotalInsts       int
+	LoweredInsts     int
+	UnsupportedOps   int
 }
 
 // EmitHLSL traduit un programme natif RDNA2 (GFX10) + ses signatures DXBC (ISG1/OSG1)
@@ -178,6 +179,38 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 				out.InputElements = append(out.InputElements, el)
 			}
 		}
+	}
+
+	// Détection du slot CBV dans la DescriptorTable racine (s_load_dwordx4 -> s_buffer_load_dword*)
+	descSlotByReg := map[uint32]uint32{}
+	var fallbackCBSlot uint32
+	var hasMatchedCBSlot bool
+	for _, gi := range insts {
+		if gi.Encoding != EncSMEM {
+			continue
+		}
+		op := (gi.Word0 >> 18) & 0xFF
+		sdata := (gi.Word0 >> 6) & 0x7F
+		sbase := (gi.Word0 & 0x3F) * 2
+		off := gi.Word1 & 0x1FFFFF
+		if op == 0x02 && off <= 256 && off%16 == 0 {
+			slot := off / 32
+			if off%32 != 0 {
+				slot = off / 16
+			}
+			descSlotByReg[sdata] = slot
+			if fallbackCBSlot == 0 && slot > 0 {
+				fallbackCBSlot = slot
+			}
+		} else if op >= 0x08 && op <= 0x0C && !hasMatchedCBSlot {
+			if slot, ok := descSlotByReg[sbase]; ok {
+				out.CBDescriptorSlot = slot
+				hasMatchedCBSlot = true
+			}
+		}
+	}
+	if !hasMatchedCBSlot && fallbackCBSlot > 0 {
+		out.CBDescriptorSlot = fallbackCBSlot
 	}
 
 	// Détection de la présence de branches SOPP pour choisir entre émission linéaire ou CFG switch/loop

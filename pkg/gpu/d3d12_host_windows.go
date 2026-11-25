@@ -679,34 +679,70 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						// ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView (slot 38)
 						_ = comCall(h.CmdList, 38, 0, uintptr(h.UploadCBGPU+cbSlot))
 					}
-					// Expansion Xbox RECTLIST (topo=17, 3 sommets par rectangle -> 2 triangles = 6 sommets)
+					// Expansion Xbox RECTLIST (topo=17, 3 sommets par rectangle -> 2 triangles = 6 sommets, tout stride >= 12)
+					// Détecte automatiquement le sommet d'angle droit (V0, V1 ou V2) via produit scalaire pour supporter tous les ordres Xbox.
 					drawVB := d.VBData
 					drawCnt := d.VertexCount
-					if !d.Indexed && (d.Topology == 17 || d.Topology >= 32) && d.VertexCount >= 3 && d.VertexCount%3 == 0 && d.VBStride == 24 && uint32(len(d.VBData)) >= d.VertexCount*24 {
+					if !d.Indexed && (d.Topology == 17 || d.Topology >= 32) && d.VertexCount >= 3 && d.VertexCount%3 == 0 && d.VBStride >= 12 && d.VBStride%4 == 0 && uint32(len(d.VBData)) >= d.VertexCount*d.VBStride {
+						st := d.VBStride
 						numRects := d.VertexCount / 3
-						expanded := make([]byte, numRects*6*24)
+						expanded := make([]byte, numRects*6*st)
+						v3 := make([]byte, st)
+						absF := func(x float32) float32 {
+							if x < 0 {
+								return -x
+							}
+							return x
+						}
 						for r := uint32(0); r < numRects; r++ {
-							v0 := d.VBData[(r*3+0)*24 : (r*3+1)*24]
-							v1 := d.VBData[(r*3+1)*24 : (r*3+2)*24]
-							v2 := d.VBData[(r*3+2)*24 : (r*3+3)*24]
-							var v3 [24]byte
-							copy(v3[:], v2)
-							f0 := unsafe.Slice((*float32)(unsafe.Pointer(&v0[0])), 6)
-							f1 := unsafe.Slice((*float32)(unsafe.Pointer(&v1[0])), 6)
-							f2 := unsafe.Slice((*float32)(unsafe.Pointer(&v2[0])), 6)
-							f3 := unsafe.Slice((*float32)(unsafe.Pointer(&v3[0])), 6)
-							f3[0] = f1[0] + f2[0] - f0[0]
-							f3[1] = f1[1] + f2[1] - f0[1]
-							f3[2] = f1[2] + f2[2] - f0[2]
-							f3[4] = f1[4] + f2[4] - f0[4]
-							f3[5] = f1[5] + f2[5] - f0[5]
-							base := r * 6 * 24
-							copy(expanded[base+0*24:], v0)
-							copy(expanded[base+1*24:], v1)
-							copy(expanded[base+2*24:], v2)
-							copy(expanded[base+3*24:], v1)
-							copy(expanded[base+4*24:], v3[:])
-							copy(expanded[base+5*24:], v2)
+							v0 := d.VBData[(r*3+0)*st : (r*3+1)*st]
+							v1 := d.VBData[(r*3+1)*st : (r*3+2)*st]
+							v2 := d.VBData[(r*3+2)*st : (r*3+3)*st]
+							f0 := unsafe.Slice((*float32)(unsafe.Pointer(&v0[0])), st/4)
+							f1 := unsafe.Slice((*float32)(unsafe.Pointer(&v1[0])), st/4)
+							f2 := unsafe.Slice((*float32)(unsafe.Pointer(&v2[0])), st/4)
+							px, py := 0, 1
+							if st == 12 {
+								px, py = 1, 2
+							}
+							// Produit scalaire des 2 arêtes à chaque sommet : le plus proche de 0 est l'angle droit
+							d0 := absF((f1[px]-f0[px])*(f2[px]-f0[px]) + (f1[py]-f0[py])*(f2[py]-f0[py]))
+							d1 := absF((f0[px]-f1[px])*(f2[px]-f1[px]) + (f0[py]-f1[py])*(f2[py]-f1[py]))
+							d2 := absF((f0[px]-f2[px])*(f1[px]-f2[px]) + (f0[py]-f2[py])*(f1[py]-f2[py]))
+							// a, b = les 2 sommets de la diagonale, c = le sommet d'angle droit -> V3 = a + b - c
+							va, vb, vc := v1, v2, v0
+							fa, fb, fc := f1, f2, f0
+							if d1 <= d0 && d1 <= d2 {
+								va, vb, vc = v0, v2, v1
+								fa, fb, fc = f0, f2, f1
+							} else if d2 <= d0 && d2 <= d1 {
+								va, vb, vc = v0, v1, v2
+								fa, fb, fc = f0, f1, f2
+							}
+							copy(v3, vb)
+							f3 := unsafe.Slice((*float32)(unsafe.Pointer(&v3[0])), st/4)
+							if st == 12 {
+								f3[1] = fa[1] + fb[1] - fc[1]
+								f3[2] = fa[2] + fb[2] - fc[2]
+							} else {
+								f3[0] = fa[0] + fb[0] - fc[0]
+								f3[1] = fa[1] + fb[1] - fc[1]
+								f3[2] = fa[2] + fb[2] - fc[2]
+								if st == 24 {
+									f3[4] = fa[4] + fb[4] - fc[4]
+									f3[5] = fa[5] + fb[5] - fc[5]
+								} else if st == 20 {
+									f3[3] = fa[3] + fb[3] - fc[3]
+									f3[4] = fa[4] + fb[4] - fc[4]
+								}
+							}
+							base := r * 6 * st
+							copy(expanded[base+0*st:], vc)
+							copy(expanded[base+1*st:], va)
+							copy(expanded[base+2*st:], vb)
+							copy(expanded[base+3*st:], va)
+							copy(expanded[base+4*st:], v3)
+							copy(expanded[base+5*st:], vb)
 						}
 						drawVB = expanded
 						drawCnt = numRects * 6
@@ -714,8 +750,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					// Upload Vertex Buffer si fourni par le titre
 					if len(drawVB) > 0 && d.VBStride > 0 && h.UploadVBPtr != 0 && h.UploadVBGPU != 0 {
 						nBytes := uint64(len(drawVB))
-						if vbOff+nBytes <= (4 << 20) {
-							dstVB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadVBPtr))), 4<<20)[vbOff : vbOff+nBytes]
+						if vbOff+nBytes <= (8 << 20) {
+							dstVB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadVBPtr))), 8<<20)[vbOff : vbOff+nBytes]
 							copy(dstVB, drawVB)
 							vbv := d3d12VertexBufferView{
 								BufferLocation: h.UploadVBGPU + vbOff,
@@ -729,8 +765,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					}
 					if d.Indexed && len(d.IBData) > 0 && h.UploadIBPtr != 0 && h.UploadIBGPU != 0 {
 						nBytes := uint64(len(d.IBData))
-						if ibOff+nBytes <= (4 << 20) {
-							dstIB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadIBPtr))), 4<<20)[ibOff : ibOff+nBytes]
+						if ibOff+nBytes <= (8 << 20) {
+							dstIB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadIBPtr))), 8<<20)[ibOff : ibOff+nBytes]
 							copy(dstIB, d.IBData)
 							ibFmt := d.IBFormat
 							if ibFmt != 57 && ibFmt != 42 {
@@ -754,9 +790,9 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 			}
 
 			wantSnap := false
-			if h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && len(draws) >= 8 {
+			if h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && h.introReached {
 				h.introFrameCount++
-				if h.introFrameCount == 1 || h.introFrameCount == 45 {
+				if h.introFrameCount == 1 || h.introFrameCount == 90 {
 					wantSnap = true
 					bSnap1 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x4 /* RENDER_TARGET */, StateAfter: 0x800 /* COPY_SOURCE */}
 					_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&bSnap1)))
@@ -793,7 +829,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 			slog.Error("Host D3D12 SwapChain::Present échoué", "hr", fmt.Sprintf("0x%08X", uint32(hrPres)), "removedReason", fmt.Sprintf("0x%08X", h.DeviceRemovedReason()))
 		}
 		h.waitGPU()
-		if h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && (h.introFrameCount == 1 || h.introFrameCount == 45) && len(draws) >= 8 {
+		if h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && (h.introFrameCount == 1 || h.introFrameCount == 90) && h.introReached {
 			h.saveReadbackPNG(fmt.Sprintf("%s\\astral_intro_%d.png", os.TempDir(), h.introFrameCount))
 		}
 		return

@@ -23,6 +23,7 @@ type guestPSO struct {
 	hasVS    bool
 	hasPS    bool
 	hasCS    bool
+	vsCBSlot uint32
 	hostPSO  uintptr
 	compiled atomic.Bool
 }
@@ -60,6 +61,11 @@ type d3d12xState struct {
 	activeRTVVA     uint64
 	activeRootVA    uintptr
 	activeRootSize  uint32
+	activeCBSlot    uint32
+	activeCBVSlots  [8]struct {
+		va   uintptr
+		size uint32
+	}
 	activeSRVVA     uint64
 	activeSRVTex    *gpu.HostTextureUpload
 	frameDispatches []gpu.HostDispatchPass
@@ -95,6 +101,7 @@ func newD3D12XDevice() uintptr {
 	gpuTrace := os.Getenv("ASTRAL_GPU_TRACE") == "1"
 	dumpFrame := os.Getenv("ASTRAL_DUMP_FRAME") == "1"
 	var introDumped atomic.Bool
+	var nextScreenDumped atomic.Bool
 	var listSlotHits [160]atomic.Uint64
 
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
@@ -311,29 +318,77 @@ func newD3D12XDevice() uintptr {
 				slog.Info("GPU_TRACE CommandListX slots @ frame 60", "slots", summary, "psos", st.psoCreated.Load(), "heaps", st.heapsCreated.Load(), "res", st.resCreated.Load())
 			}
 		}
-		if dumpFrame && len(draws) >= 8 && introDumped.CompareAndSwap(false, true) {
+		if dumpFrame && ((len(draws) >= 8 && introDumped.CompareAndSwap(false, true)) || (introDumped.Load() && len(draws) == 5 && nextScreenDumped.CompareAndSwap(false, true))) {
 			var sb string
-			sb += fmt.Sprintf("=== INTRO FRAME %d: %d draws, %d dispatches, clear=%v ===\n", n, len(draws), len(dispatches), clr)
+			sb += fmt.Sprintf("=== FRAME %d: %d draws, %d dispatches, presentVA=0x%X clear=%v ===\n", n, len(draws), len(dispatches), presentVA, clr)
 			for i, d := range draws {
-				var vbPreview string
-				if len(d.VBData) >= 16 {
-					c0 := *(*uint32)(unsafe.Pointer(&d.VBData[0]))
-					c1 := *(*uint32)(unsafe.Pointer(&d.VBData[4]))
-					px := *(*float32)(unsafe.Pointer(&d.VBData[8]))
-					py := *(*float32)(unsafe.Pointer(&d.VBData[12]))
-					vbPreview = fmt.Sprintf("c0=0x%08X c1=0x%08X pos=(%.1f,%.1f)", c0, c1, px, py)
+				var texStr string
+				if d.SRVTex != nil {
+					texStr = fmt.Sprintf("tex=%dx%d fmt=%d swz=0x%X", d.SRVTex.Width, d.SRVTex.Height, d.SRVTex.Format, d.SRVTex.Swizzle)
 				}
-				var cbPreview string
-				if len(d.CBData) >= 64 {
-					cf := unsafe.Slice((*float32)(unsafe.Pointer(&d.CBData[0])), 16)
-					cbPreview = fmt.Sprintf("cxM=(%.2f,%.2f,%.2f,%.2f) cxA=(%.2f,%.2f,%.2f,%.2f) m0=(%.5f,%.5f,%.2f,%.2f) m1=(%.5f,%.5f,%.2f,%.2f)",
+				sb += fmt.Sprintf("  draw[%d]: idx=%v topo=%d cnt=%d start=%d baseVtx=%d pso=0x%X stride=%d ibFmt=%d vb=%d ib=%d cb=%d tgt=0x%X srv=0x%X %s\n",
+					i, d.Indexed, d.Topology, d.VertexCount, d.StartVertex, d.BaseVertex, d.HostPSO, d.VBStride, d.IBFormat, len(d.VBData), len(d.IBData), len(d.CBData), d.TargetVA, d.SRVGuestVA, texStr)
+				if len(d.CBData) >= 96 {
+					cf := unsafe.Slice((*float32)(unsafe.Pointer(&d.CBData[0])), 24)
+					sb += fmt.Sprintf("    CB[0..15]:  (%.4f,%.4f,%.4f,%.4f) (%.4f,%.4f,%.4f,%.4f) (%.5f,%.5f,%.5f,%.5f) (%.5f,%.5f,%.5f,%.5f)\n",
 						cf[0], cf[1], cf[2], cf[3], cf[4], cf[5], cf[6], cf[7], cf[8], cf[9], cf[10], cf[11], cf[12], cf[13], cf[14], cf[15])
+					sb += fmt.Sprintf("    CB[16..23]: (%.5f,%.5f,%.5f,%.5f) (%.5f,%.5f,%.5f,%.5f)\n",
+						cf[16], cf[17], cf[18], cf[19], cf[20], cf[21], cf[22], cf[23])
 				}
-				sb += fmt.Sprintf("  draw[%d]: idx=%v topo=%d cnt=%d start=%d baseVtx=%d pso=0x%X stride=%d vb=%d ib=%d cb=%d %s | %s\n",
-					i, d.Indexed, d.Topology, d.VertexCount, d.StartVertex, d.BaseVertex, d.HostPSO, d.VBStride, len(d.VBData), len(d.IBData), len(d.CBData), vbPreview, cbPreview)
+				if !d.Indexed && d.VBStride >= 12 && d.VBStride%4 == 0 && len(d.VBData) >= int(d.VBStride) {
+					nV := int(d.VertexCount)
+					if nV > 6 {
+						nV = 6
+					}
+					for v := 0; v < nV; v++ {
+						off := (int(d.StartVertex) + v) * int(d.VBStride)
+						if off+int(d.VBStride) > len(d.VBData) {
+							break
+						}
+						fl := unsafe.Slice((*float32)(unsafe.Pointer(&d.VBData[off])), d.VBStride/4)
+						sb += fmt.Sprintf("    VB[%d]: %v\n", v, fl)
+					}
+				}
+				if d.Indexed && len(d.IBData) > 0 && d.VBStride >= 12 {
+					elemSz := 2
+					if d.IBFormat == 42 {
+						elemSz = 4
+					}
+					nIdx := int(d.VertexCount)
+					if nIdx > 30 {
+						nIdx = 30
+					}
+					var idxs []uint32
+					for k := 0; k < nIdx; k++ {
+						ioff := (int(d.StartVertex) + k) * elemSz
+						if ioff+elemSz > len(d.IBData) {
+							break
+						}
+						if elemSz == 2 {
+							idxs = append(idxs, uint32(*(*uint16)(unsafe.Pointer(&d.IBData[ioff]))))
+						} else {
+							idxs = append(idxs, *(*uint32)(unsafe.Pointer(&d.IBData[ioff])))
+						}
+					}
+					sb += fmt.Sprintf("    IB[%d..]: %v\n", d.StartVertex, idxs)
+					seen := map[uint32]bool{}
+					for _, vi := range idxs {
+						if seen[vi] || len(seen) >= 8 {
+							continue
+						}
+						seen[vi] = true
+						vIdx := int(vi) + int(d.BaseVertex)
+						off := vIdx * int(d.VBStride)
+						if off >= 0 && off+int(d.VBStride) <= len(d.VBData) {
+							u0 := *(*uint32)(unsafe.Pointer(&d.VBData[off]))
+							fl := unsafe.Slice((*float32)(unsafe.Pointer(&d.VBData[off])), d.VBStride/4)
+							sb += fmt.Sprintf("    V[%d]: u0=0x%08X f=%v\n", vIdx, u0, fl)
+						}
+					}
+				}
 			}
 			_ = os.WriteFile(os.TempDir()+"\\astral_intro_frame.txt", []byte(sb), 0o644)
-			slog.Info("ASTRAL_DUMP_FRAME intro capturée", "frame", n, "draws", len(draws), "dispatches", len(dispatches))
+			slog.Info("ASTRAL_DUMP_FRAME capturée", "frame", n, "draws", len(draws), "dispatches", len(dispatches))
 		}
 		gpu.PresentHostFrame(0, clr, presentVA, nil, 0, 0, 0, dispatches, draws...)
 		return hresultOK
@@ -441,22 +496,28 @@ func newD3D12XDevice() uintptr {
 			}
 			if st.activeVBVA >= 0x10000 && st.activeVBSize > 0 {
 				cpLen := st.activeVBSize
-				if cpLen > (256 << 10) {
-					cpLen = 256 << 10
+				if cpLen > (1 << 20) {
+					cpLen = 1 << 20
 				}
 				pass.VBData = make([]byte, cpLen)
 				copy(pass.VBData, unsafe.Slice((*byte)(osPtr(st.activeVBVA)), cpLen))
 			}
 			if indexed && st.activeIBVA >= 0x10000 && st.activeIBSize > 0 {
 				cpLen := st.activeIBSize
-				if cpLen > (256 << 10) {
-					cpLen = 256 << 10
+				if cpLen > (1 << 20) {
+					cpLen = 1 << 20
 				}
 				pass.IBData = make([]byte, cpLen)
 				copy(pass.IBData, unsafe.Slice((*byte)(osPtr(st.activeIBVA)), cpLen))
 			}
-			if st.activeRootVA >= 0x10000 {
-				cbLen := st.activeRootSize
+			cbVA := st.activeRootVA
+			cbSz := st.activeRootSize
+			if st.activeCBSlot < 8 && st.activeCBVSlots[st.activeCBSlot].va >= 0x10000 {
+				cbVA = st.activeCBVSlots[st.activeCBSlot].va
+				cbSz = st.activeCBVSlots[st.activeCBSlot].size
+			}
+			if cbVA >= 0x10000 {
+				cbLen := cbSz
 				if cbLen < 1024 {
 					cbLen = 1024
 				}
@@ -464,7 +525,7 @@ func newD3D12XDevice() uintptr {
 					cbLen = 16384
 				}
 				pass.CBData = make([]byte, cbLen)
-				copy(pass.CBData, unsafe.Slice((*byte)(osPtr(st.activeRootVA)), cbLen))
+				copy(pass.CBData, unsafe.Slice((*byte)(osPtr(cbVA)), cbLen))
 			}
 			if st.activeSRVTex != nil {
 				tx := *st.activeSRVTex
@@ -666,12 +727,14 @@ func newD3D12XDevice() uintptr {
 		}
 		st.mu.Lock()
 		gp.hostPSO = hPSO
+		gp.vsCBSlot = vsOut.CBDescriptorSlot
 		st.mu.Unlock()
 		slog.Info("PSO RDNA2 recompilé en ID3D12PipelineState matériel",
 			"guestPSO", fmt.Sprintf("0x%X", psoObj),
 			"hostPSO", fmt.Sprintf("0x%X", hPSO),
 			"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
 			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
+			"vsCBSlot", vsOut.CBDescriptorSlot,
 		)
 		if dumpFrame {
 			_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_vs.hlsl", os.TempDir(), hPSO), []byte(vsOut.Source), 0o644)
@@ -696,6 +759,7 @@ func newD3D12XDevice() uintptr {
 					st.activeHostCSPSO = gp.hostPSO
 				} else {
 					st.activeHostPSO = gp.hostPSO
+					st.activeCBSlot = gp.vsCBSlot
 				}
 				st.mu.Unlock()
 			}
@@ -705,44 +769,63 @@ func newD3D12XDevice() uintptr {
 	cbListSetRootTable := syscall.NewCallback(func(this, rootIdx, baseDesc uintptr) uintptr {
 		listSlotHits[36].Add(1)
 		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
-			tag := *(*uint32)(osPtr(baseDesc))
 			st.mu.Lock()
-			switch tag {
-			case 0x43425631: // "CBV1" : { tag u32, _pad u32, BufferLocation u64 (+8), SizeInBytes u32 (+16) }
-				cbVA := *(*uintptr)(osPtr(baseDesc + 8))
-				cbSz := *(*uint32)(osPtr(baseDesc + 16))
-				if cbVA >= 0x10000 && cbVA < 0x800000000000 {
-					st.activeRootVA = cbVA
-					st.activeRootSize = cbSz
-				}
-			case 0x53525632: // "SRV2" : scan jusqu'à 4 slots (32B chacun) pour trouver la première Texture2D
-				for s := uintptr(0); s < 4; s++ {
-					slotPtr := baseDesc + s*32
-					if *(*uint32)(osPtr(slotPtr)) != 0x53525632 {
-						break
-					}
-					dim := *(*uint32)(osPtr(slotPtr + 24))
-					va := *(*uint64)(osPtr(slotPtr + 8))
-					w := *(*uint32)(osPtr(slotPtr + 16))
-					h := *(*uint32)(osPtr(slotPtr + 20))
-					fmtID := *(*uint32)(osPtr(slotPtr + 4))
-					swz := *(*uint32)(osPtr(slotPtr + 28))
-					if dim == 3 && va >= 0x10000 && va < 0x800000000000 && w > 0 && h > 0 {
-						st.activeSRVVA = va
-						st.activeSRVTex = &gpu.HostTextureUpload{
-							GuestVA: va,
-							Width:   w,
-							Height:  h,
-							Format:  fmtID,
-							Swizzle: swz,
+			foundSRV := false
+			for s := uintptr(0); s < 8; s++ {
+				slotPtr := baseDesc + s*32
+				tag := *(*uint32)(osPtr(slotPtr))
+				switch tag {
+				case 0x43425631: // "CBV1" : { tag u32, _pad u32, BufferLocation u64 (+8), SizeInBytes u32 (+16) }
+					cbVA := *(*uintptr)(osPtr(slotPtr + 8))
+					cbSz := *(*uint32)(osPtr(slotPtr + 16))
+					if cbVA >= 0x10000 && cbVA < 0x800000000000 {
+						st.activeCBVSlots[s].va = cbVA
+						st.activeCBVSlots[s].size = cbSz
+						if s == 0 {
+							st.activeRootVA = cbVA
+							st.activeRootSize = cbSz
 						}
-						break
+					}
+				case 0x53525632: // "SRV2"
+					if !foundSRV {
+						dim := *(*uint32)(osPtr(slotPtr + 24))
+						va := *(*uint64)(osPtr(slotPtr + 8))
+						w := *(*uint32)(osPtr(slotPtr + 16))
+						h := *(*uint32)(osPtr(slotPtr + 20))
+						fmtID := *(*uint32)(osPtr(slotPtr + 4))
+						swz := *(*uint32)(osPtr(slotPtr + 28))
+						if dim == 3 && va >= 0x10000 && va < 0x800000000000 && w > 0 && h > 0 {
+							st.activeSRVVA = va
+							st.activeSRVTex = &gpu.HostTextureUpload{
+								GuestVA: va,
+								Width:   w,
+								Height:  h,
+								Format:  fmtID,
+								Swizzle: swz,
+							}
+							foundSRV = true
+						}
 					}
 				}
-			default:
-				st.activeRootVA = baseDesc
 			}
 			st.mu.Unlock()
+		}
+		return 0
+	})
+	cbListSetRootCBV := syscall.NewCallback(func(this, rootIdx, gpuVA uintptr) uintptr {
+		c := listSlotHits[42].Add(1)
+		if gpuVA >= 0x10000 && gpuVA < 0x800000000000 {
+			st.mu.Lock()
+			st.activeRootVA = gpuVA
+			st.activeRootSize = 4096
+			if rootIdx < 8 {
+				st.activeCBVSlots[rootIdx].va = gpuVA
+				st.activeCBVSlots[rootIdx].size = 4096
+			}
+			st.mu.Unlock()
+		}
+		if gpuTrace && c <= 8 {
+			slog.Info("GPU_TRACE SetGraphicsRootCBV", "n", c, "rootIdx", uint32(rootIdx), "gpuVA", fmt.Sprintf("0x%X", gpuVA))
 		}
 		return 0
 	})
@@ -833,6 +916,7 @@ func newD3D12XDevice() uintptr {
 	cmdListSlots[20] = cbListSetTopo      // IASetPrimitiveTopology
 	cmdListSlots[25] = cbListSetPSO       // SetPipelineState
 	cmdListSlots[36] = cbListSetRootTable // SetGraphicsRootDescriptorTable (Xbox #36 = PC #32)
+	cmdListSlots[42] = cbListSetRootCBV   // SetGraphicsRootConstantBufferView (Xbox #42 = PC #38)
 	cmdListSlots[44] = cbListSetRootSRV   // SetGraphicsRootShaderResourceView (Xbox #44 = PC #40)
 	cmdListSlots[47] = cbListSetIB        // IASetIndexBuffer (Xbox #47 = PC #43)
 	cmdListSlots[48] = cbListSetVB        // IASetVertexBuffers (Xbox #48 = PC #44)

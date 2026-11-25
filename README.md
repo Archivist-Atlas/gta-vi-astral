@@ -8,15 +8,15 @@ Système modulaire en **Go** pour l'analyse, la recompilation de shaders et l'ex
 > **Projet expérimental en cours de développement — NON JOUABLE actuellement.**
 > Le moteur démarre, charge toutes ses archives (`.rpf` + TTDB + licences), connecte l'utilisateur hors-ligne (`XUser` + `XGameSave`) et tourne en boucle continue **780+ frames `PresentX` sur 45 s (0 crash, 0 `WARN`)** avec recompilation live de ses shaders RDNA2 sur GPU Windows, mais le rendu 3D complet et l'audio ne sont **pas encore fonctionnels**.
 
-## Avancement global : ~66 %
+## Avancement global : ~68 %
 
 ```text
-Progression globale : [█████████████░░░░░░░] 66 %
+Progression globale : [██████████████░░░░░░] 68 %
 ```
 
 - **Boot natif continu + `XUser` + `XGameSave` + GPU Compute (1 080+ frames / 55 s, 0 crash)** : ✅ Terminé (`100 %`)
 - **Premiers vrais pixels / écrans d'intro (UI Scaleform rendue à 100 % sur D3D12 matériel)** : ✅ Terminé (`100 %`)
-- **Menus principaux navigables (`SÉLECTEUR DE PROFIL (Y)` + `ASTRALPLAYER (A)` actifs avec DualSense/Xbox/Clavier)** : 🔄 En cours (`~88 %`)
+- **Menus principaux navigables (`SÉLECTEUR DE PROFIL (Y)` + `ASTRALPLAYER (A)` + écran de chargement post-profil avec spinner texturé BC3)** : 🔄 En cours (`~92 %`)
 - **Monde ouvert 3D jouable (audio, contrôles, ray tracing)** : ⏳ À venir (`~45 %`)
 
 | Sous-système | Avancement | État actuel | Reste à faire |
@@ -24,8 +24,8 @@ Progression globale : [█████████████░░░░░░
 | **Chargeur PE / Mémoire / CPU x64** | `90 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, VEH + émulation `CLZERO`/`MONITORX`/`MWAITX`, pools physiques 64 KiB (`xmem` 6,2 Go sans aliasing). | Ajustements ponctuels sur de nouveaux chemins CPU en jeu. |
 | **Stockage & Streaming (`VirtualFS` / `DirectStorage`)** | `80 %` | 12 `.rpf`, `core_bvh4.rpf`, `core_licenses_data.rpf` et toutes les archives virtuelles TTDB `.ttpf` ouverts ; +9 500 requêtes `ReadAt` + `zlib` avec vtables COM partagées O(1). | Décompression matérielle **BCPack** (BC1–BC7) et `PAGE_DESTINATION` pour le streaming lourd du monde. |
 | **OS Console / HLE (`xgameruntime`, `GameInput`, Audio)** | `92 %` | `xasync`, `xuser` complet (`XUSER_GAMERTAG_IID`, `XUSER_DEVICE`/`XUserFindForDevice`, profil **`AstralPlayer`** affiché en jeu), **`xgamesave` 30 slots GDK exacts sur disque hors dépôt**, `xaccessibility`, `xnetworking` (hors-ligne), `AcpHal`/`xapu`/`chad`, et **`GameInput` universel live (`XInput 0..3` + `winmm` DualSense PS5 / DualShock 4 / Switch Pro / HID génériques + clavier Windows)**. | Décodage audio réel (`xapu` Opus / `chad` XDsp). |
-| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `58 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10 (littéraux 32-bit `VOP2`/`VOP3` 12 octets), IR SSA, `ISG1`/`OSG1`, recompilation live RDNA2 -> HLSL **VS/PS (100 % de couverture sur les PSOs UI Scaleform : `31/31`, `37/37`, `45/45` ins) & Compute (`cs_5_0`)** avec `MUBUF` indexé dynamique (`idxen`/`offen`), `v_med3_f32` (`0x157`), `RootConst[1024]` (16 KiB) et CFG `SOPP`. | Masque `EXEC` par lane, descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), compilation asynchrone. |
-| **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `64 %` | Fenêtre Win32 unique avec icône dédiée et **écran de chargement splash GTA VI Astral (logo + barre de progression néon pilotée par DirectStorage/XUser/XGameSave)**, vtables COM partagées O(1), `ID3D12Device` matériel + `SwapChain3`, `PresentX` à 30 fps (1 080+ frames, 8 900+ draws, 830+ `Dispatch`), RenderTargets offscreen matériels (`RTV -> SRV t0` sans copie CPU, 30 slots, 4 RTs actifs en live), `ASTRAL_D3D12_DEBUG=1`, readback PNG (`ASTRAL_SCREENSHOT=1`), buffers VB/IB 4 MiB + CB 1 MiB, alpha blending, `RECTLIST`, Compute `UAV`, `SRV2` + détuilage RDNA2. | G-Buffer / Depth-Stencil (`DSV`), `ExecuteIndirect`, BVH4. |
+| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `60 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10 (littéraux 32-bit `VOP2`/`VOP3` 12 octets), IR SSA, `ISG1`/`OSG1`, recompilation live RDNA2 -> HLSL **VS/PS (100 % de couverture sur les PSOs UI Scaleform : `31/31`, `35/35`, `37/37`, `45/45`, `54/54` ins) & Compute (`cs_5_0`)** avec détection automatique du slot CBV (`s_load_dwordx4` -> `s_buffer_load_dword*`), `MUBUF` indexé dynamique (`idxen`/`offen`), `v_med3_f32` (`0x157`), `RootConst[1024]` (16 KiB) et CFG `SOPP`. | Masque `EXEC` par lane, descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), compilation asynchrone. |
+| **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `68 %` | Fenêtre Win32 unique avec icône dédiée et **écran de chargement splash GTA VI Astral (logo + barre de progression néon pilotée par DirectStorage/XUser/XGameSave)**, vtables COM partagées O(1), `ID3D12Device` matériel + `SwapChain3`, `PresentX` à 30 fps (1 080+ frames, 8 900+ draws, 830+ `Dispatch`), RenderTargets offscreen matériels (`RTV -> SRV t0` sans copie CPU, 30 slots), tables de descripteurs mixtes `SRV2`+`CBV1` multi-slots (8 slots + `SetGraphicsRootCBV` slot 42), `ASTRAL_D3D12_DEBUG=1`, readback PNG (`ASTRAL_SCREENSHOT=1`), buffers VB/IB 8 MiB + CB 1 MiB, alpha blending, expansion `RECTLIST` généralisée, Compute `UAV`, détuilage RDNA2 (`BC3` 64×64 actif en live). | G-Buffer / Depth-Stencil (`DSV`), `ExecuteIndirect`, BVH4. |
 
 ## Captures d'avancement
 

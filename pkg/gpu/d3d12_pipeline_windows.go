@@ -606,9 +606,9 @@ float4 PSMain(VSOut i) : SV_Target {
 		return
 	}
 	h.ReplayPSO = pso
-	// Buffers dynamiques persistants UPLOAD pour VB (4 MiB), IB (4 MiB), CB (1 MiB = 64x16 KiB) et Staging Texture (16 MiB)
-	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(4 << 20)
-	h.UploadIB, h.UploadIBPtr, h.UploadIBGPU = h.createUploadBuffer(4 << 20)
+	// Buffers dynamiques persistants UPLOAD pour VB (8 MiB), IB (8 MiB), CB (1 MiB = 64x16 KiB) et Staging Texture (16 MiB)
+	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(8 << 20)
+	h.UploadIB, h.UploadIBPtr, h.UploadIBGPU = h.createUploadBuffer(8 << 20)
 	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(1 << 20)
 	h.UploadTex, h.UploadTexPtr, _ = h.createUploadBuffer(16 << 20)
 	h.initComputePipeline()
