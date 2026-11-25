@@ -296,16 +296,15 @@ func bindAcpHal(t *LiveTable) {
 		t.bind(dll, "AcpHalCreate", cbAcpHalCreate)
 	}
 
-	// --- xapu.dll (décodeur audio matériel Xbox Series) ---
+	// --- xapu.dll (décodeur audio matériel Xbox Series, ABI 72 octets ApuResult) ---
 	type xapuResult struct {
-		id  [24]byte // CommandId : { kind u32, stream u32, sequence u32, options u32, context u64 }
-		hr  uint32
-		pad uint32
+		raw [72]byte // CommandId(24) + state(4) + stateData(8) + usec(8) + error(4) + frames(4) + outLen(4) + outPtr(8) + pitch(4) + inLen(4) + inPtr(8)
 	}
 	type xapuConn struct {
 		mu      sync.Mutex
 		readyEv uintptr
 		results []xapuResult
+		since   time.Time
 	}
 	var (
 		nextXApuHandle atomic.Uint64
@@ -337,24 +336,41 @@ func bindAcpHal(t *LiveTable) {
 		*(*uintptr)(osPtr(outPtr + 8)) = readyEv
 		h := uintptr(nextXApuHandle.Add(1))
 		xapuMu.Lock()
-		xapuConns[h] = &xapuConn{readyEv: readyEv}
+		xapuConns[h] = &xapuConn{readyEv: readyEv, since: time.Now()}
 		xapuMu.Unlock()
 		*(*uintptr)(osPtr(handleOut)) = h
 		slog.Info("xapu!XApuConnect", "streams", streams, "dataBytes", dataBytes, "handle", h)
 		return hresultOK
 	})
-	cbXApuEnqueue := syscall.NewCallback(func(handle, cmdPtr, cmdSize uintptr) uintptr {
-		if xapuEnqLogged.CompareAndSwap(false, true) {
-			slog.Info("xapu!XApuEnqueueCommand actif", "handle", handle, "cmdSize", uint32(cmdSize))
-		}
+	cbXApuEnqueue := syscall.NewCallback(func(handle, cmdPtr uintptr) uintptr {
 		xapuMu.Lock()
 		c := xapuConns[handle]
 		xapuMu.Unlock()
-		if c != nil && cmdPtr >= 0x10000 && uint32(cmdSize) >= 24 {
-			var res xapuResult
-			copy(res.id[:], unsafe.Slice((*byte)(osPtr(cmdPtr)), 24))
-			res.hr = 0 // S_OK
+		if c != nil && cmdPtr >= 0x10000 {
+			kind := *(*uint32)(osPtr(cmdPtr + 0))
 			opts := *(*uint32)(osPtr(cmdPtr + 12))
+			if xapuEnqLogged.CompareAndSwap(false, true) {
+				slog.Info("xapu!XApuEnqueueCommand actif", "handle", handle, "kind", kind)
+			}
+			var res xapuResult
+			copy(res.raw[0:24], unsafe.Slice((*byte)(osPtr(cmdPtr)), 24))
+			binary.LittleEndian.PutUint64(res.raw[36:44], uint64(time.Since(c.since).Microseconds()))
+			if kind == 3 { // PROCESS : met le buffer de sortie PCM à zéro proprement (évite grésillements non initialisés)
+				frameCnt := *(*uint32)(osPtr(cmdPtr + 36))
+				inLen := *(*uint32)(osPtr(cmdPtr + 40))
+				inPtr := *(*uint64)(osPtr(cmdPtr + 44))
+				outLen := *(*uint32)(osPtr(cmdPtr + 52))
+				outPtr := *(*uint64)(osPtr(cmdPtr + 56))
+				if outPtr >= 0x10000 && outPtr < 0x800000000000 && outLen > 0 && outLen <= (1<<20) {
+					clear(unsafe.Slice((*byte)(osPtr(uintptr(outPtr))), outLen))
+				}
+				binary.LittleEndian.PutUint32(res.raw[48:52], frameCnt)
+				binary.LittleEndian.PutUint32(res.raw[52:56], outLen)
+				binary.LittleEndian.PutUint64(res.raw[56:64], outPtr)
+				binary.LittleEndian.PutUint32(res.raw[64:68], 0x3F800000) // pitch = 1.0f
+				binary.LittleEndian.PutUint32(res.raw[68:72], inLen)
+				_ = inPtr
+			}
 			c.mu.Lock()
 			c.results = append(c.results, res)
 			c.mu.Unlock()
@@ -395,10 +411,8 @@ func bindAcpHal(t *LiveTable) {
 		c.results = c.results[1:]
 		c.mu.Unlock()
 		if resPtr >= 0x10000 {
-			// XApuResult : CommandId (24B) + HRESULT (4B) + outputFrames/pad
-			dst := unsafe.Slice((*byte)(osPtr(resPtr)), 32)
-			clear(dst)
-			copy(dst[:24], res.id[:])
+			dst := unsafe.Slice((*byte)(osPtr(resPtr)), 72)
+			copy(dst, res.raw[:])
 		}
 		return hresultOK
 	})

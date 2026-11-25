@@ -380,6 +380,15 @@ func installVEH(sess *LiveSession) {
 				return 0
 			}
 			addr := ep.ExceptionRecord.ExceptionAddress
+			// Points d'arrêt debug non-fatals (INT 3 / 0xCC) émis par RAGE dans le binaire Master :
+			// sur console sans débogueur l'exécution reprend juste après 0xCC (bloc de reprise).
+			if code == 0x80000003 && ep.ContextRecord != 0 && addr > 0x10000 {
+				if *(*byte)(ptrFromAddr(addr)) == 0xCC {
+					ripPtr := (*uint64)(ptrFromAddr(ep.ContextRecord + 0xF8))
+					*ripPtr++
+					return ^uintptr(0) // EXCEPTION_CONTINUE_EXECUTION (-1)
+				}
+			}
 			// Émulation AMD Zen 2 sur CPU Intel (0xC000001D = STATUS_ILLEGAL_INSTRUCTION) :
 			// - CLZERO   (0F 01 FC) : met à zéro la ligne de cache 64 octets pointée par RAX
 			// - MONITORX (0F 01 FA) / MWAITX (0F 01 FB) : attente basse consommation (no-op sûr)

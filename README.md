@@ -8,10 +8,10 @@ Système modulaire en **Go** pour l'analyse, la recompilation de shaders et l'ex
 > **Projet expérimental en cours de développement — NON JOUABLE actuellement.**
 > Le moteur démarre, charge toutes ses archives (`.rpf` + TTDB + licences), connecte l'utilisateur hors-ligne (`XUser` + `XGameSave`) et tourne en boucle continue **780+ frames `PresentX` sur 45 s (0 crash, 0 `WARN`)** avec recompilation live de ses shaders RDNA2 sur GPU Windows, mais le rendu 3D complet et l'audio ne sont **pas encore fonctionnels**.
 
-## Avancement global : ~85 %
+## Avancement global : ~86 %
 
 ```text
-Progression globale : [█████████████████░░░] 85 %
+Progression globale : [█████████████████░░░] 86 %
 ```
 
 - **Boot natif continu + `XUser` + `XGameSave` + `XAsyncRun` + `XStore` + GPU Compute (1 500+ frames, 0 crash)** : ✅ Terminé (`100 %`)

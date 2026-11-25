@@ -846,8 +846,14 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 				continue
 			}
 			if pIdx == attr {
+				comps := el.ComponentCount()
 				if el.Mask&(1<<attrChan) != 0 {
-					return fmt.Sprintf("v[%d] = asuint(inp.in%d.%c);", vdst, idx, ch), true
+					if comps == 1 {
+						return fmt.Sprintf("v[%d] = asuint(inp.in%d);", vdst, idx), true
+					}
+					if int(attrChan) < comps {
+						return fmt.Sprintf("v[%d] = asuint(inp.in%d.%c);", vdst, idx, ch), true
+					}
 				}
 				return fmt.Sprintf("v[%d] = 0u;", vdst), true
 			}
