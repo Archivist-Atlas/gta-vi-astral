@@ -708,40 +708,7 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			33: cbRegisterToken5, // 0x108 XUserRegisterForChangeEvent
 			34: cbReturnTrue,     // 0x110 XUserUnregisterForChangeEvent
 		}),
-		"{704C3F58-E629-4CC2-B197-30511B996FE2}": NewCOMObject("xgamesave", 32, map[int]uintptr{
-			3: syscall.NewCallback(func(this, user, scid, syncOnDemand, outProv uintptr) uintptr { // XGameSaveInitializeProvider
-				slog.Info("xgamesave!XGameSaveInitializeProvider -> fournisseur hors-ligne")
-				if outProv >= 0x10000 {
-					*(*uintptr)(osPtr(outProv)) = uintptr(nextHandle.Add(1))
-				}
-				return hresultOK
-			}),
-			4: syscall.NewCallback(func(this, user, scid, syncOnDemand, asyncBlock uintptr) uintptr { // XGameSaveInitializeProviderAsync
-				slog.Info("xgamesave!XGameSaveInitializeProviderAsync -> fournisseur hors-ligne")
-				if asyncBlock >= 0x10000 {
-					cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
-					if cb >= 0x10000 && cb < 0x800000000000 {
-						_, _, _ = syscall.SyscallN(cb, asyncBlock)
-					}
-				}
-				return hresultOK
-			}),
-			5: syscall.NewCallback(func(this, asyncBlock, outProv uintptr) uintptr { // XGameSaveInitializeProviderResult
-				if outProv >= 0x10000 {
-					*(*uintptr)(osPtr(outProv)) = uintptr(nextHandle.Add(1))
-				}
-				return hresultOK
-			}),
-			6: cbGISuccess, // XGameSaveCloseProvider
-			7: syscall.NewCallback(func(this, prov, outQuota uintptr) uintptr { // XGameSaveGetRemainingQuota
-				if outQuota >= 0x10000 {
-					*(*int64)(osPtr(outQuota)) = 256 << 20 // 256 MiB
-				}
-				return hresultOK
-			}),
-			10: cbGISuccess, // XGameSaveEnumerateContainerInfo (0 conteneurs)
-			11: cbGISuccess, // XGameSaveEnumerateContainerInfoByName
-		}),
+		"{704C3F58-E629-4CC2-B197-30511B996FE2}": newXGameSaveProvider(vfs),
 		"{973A344E-24BF-4D0F-8457-56C534892B29}": NewCOMObject("xgame", 64, map[int]uintptr{
 			3: cbGameGetTitleID, // 0x18 XGameGetXboxTitleId
 		}),

@@ -8,23 +8,23 @@ Système modulaire en **Go** pour l'analyse, la recompilation de shaders et l'ex
 > **Projet expérimental en cours de développement — NON JOUABLE actuellement.**
 > Le moteur démarre, charge toutes ses archives (`.rpf` + TTDB + licences), connecte l'utilisateur hors-ligne (`XUser` + `XGameSave`) et tourne en boucle continue **780+ frames `PresentX` sur 45 s (0 crash, 0 `WARN`)** avec recompilation live de ses shaders RDNA2 sur GPU Windows, mais le rendu 3D complet et l'audio ne sont **pas encore fonctionnels**.
 
-## Avancement global : ~47 %
+## Avancement global : ~50 %
 
 ```text
-Progression globale : [█████████░░░░░░░░░░░] 47 %
+Progression globale : [██████████░░░░░░░░░░] 50 %
 ```
 
 - **Boot natif continu + `XUser` + `XGameSave` + GPU Compute (780+ frames / 45 s, 0 crash)** : ✅ Terminé (`100 %`)
 - **Premiers vrais pixels / écrans d'intro (boucle 12 draws/frame active)** : 🔄 En cours (`~88 %`)
-- **Menus principaux navigables** : 🔄 En cours (`~60 %`)
-- **Monde ouvert 3D jouable (audio, contrôles, ray tracing)** : ⏳ À venir (`~40 %`)
+- **Menus principaux navigables** : 🔄 En cours (`~62 %`)
+- **Monde ouvert 3D jouable (audio, contrôles, ray tracing)** : ⏳ À venir (`~42 %`)
 
 | Sous-système | Avancement | État actuel | Reste à faire |
 | :--- | :---: | :--- | :--- |
 | **Chargeur PE / Mémoire / CPU x64** | `90 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, VEH + émulation `CLZERO`/`MONITORX`/`MWAITX`, pools physiques 64 KiB (`xmem` 6,2 Go sans aliasing). | Ajustements ponctuels sur de nouveaux chemins CPU en jeu. |
 | **Stockage & Streaming (`VirtualFS` / `DirectStorage`)** | `80 %` | 12 `.rpf`, `core_bvh4.rpf`, `core_licenses_data.rpf` et toutes les archives virtuelles TTDB `.ttpf` ouverts ; +9 500 requêtes `ReadAt` + `zlib` avec vtables COM partagées O(1). | Décompression matérielle **BCPack** (BC1–BC7) et `PAGE_DESTINATION` pour le streaming lourd du monde. |
-| **OS Console / HLE (`xgameruntime`, `GameInput`, Audio)** | `75 %` | `xasync`, **`xuser` (connexion hors-ligne `AstralPlayer`)**, **`xgamesave` (fournisseur hors-ligne 256 Mo)**, **`xaccessibility`**, `xnetworking` (hors-ligne), `AcpHal`/`xapu`/`chad`, et **`GameInput` réel XInput + Clavier Windows**. | Persistance disque `XGameSave` et décodage audio réel (`xapu` Opus / `chad` XDsp). |
-| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `35 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10, IR SSA, `ISG1`/`OSG1`, et recompilation live RDNA2 -> HLSL **VS/PS (`vs_5_0`/`ps_5_0`, 5 PSOs boot+UI recompilés à 86–94 %) & Compute (`cs_5_0`, `numthreads`, `s_barrier`, `RWByteAddressBuffer`)**. | Flux de contrôle structuré (branches + masque `EXEC`), descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), compilation asynchrone. |
+| **OS Console / HLE (`xgameruntime`, `GameInput`, Audio)** | `82 %` | `xasync`, `xuser` (hors-ligne `AstralPlayer`), **`xgamesave` persistant sur disque hors dépôt (`pkg/hle/xgamesave_windows.go`)**, `xaccessibility`, `xnetworking` (hors-ligne), `AcpHal`/`xapu`/`chad`, et `GameInput` réel XInput + Clavier Windows. | Décodage audio réel (`xapu` Opus / `chad` XDsp). |
+| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `42 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10, IR SSA, `ISG1`/`OSG1`, recompilation live RDNA2 -> HLSL **VS/PS (`vs_5_0`/`ps_5_0`, 5 PSOs boot+UI recompilés) & Compute (`cs_5_0`)** avec **`VOPC`/`SOPC`/`s_cselect_b32`/`VOP3` étendus**. | Structuration complète des branches `SOPP` + masque `EXEC`, descripteurs bindless, `LDS`/`FLAT`, Mesh Shaders (`MS`/`AS`), compilation asynchrone. |
 | **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `46 %` | Fenêtre Win32 unique, vtables COM partagées O(1), `ID3D12Device` matériel + `SwapChain3`, `PresentX` à 30 fps (780+ frames, 5 185 draws, 525 `Dispatch`), rejeu **`DrawInstanced` + `DrawIndexedInstanced`** avec alpha blending, upload **VB + IB + `CBV1`**, pipeline Compute (`UAV` 1 Mo + `Dispatch`), `CreatePlacedSRV` (`SRV2`) + détuilage RDNA2 (`4KB`/`64KB` & `R8`/`RGBA`/`BC1–BC7`), `GetDeviceRemovedReason`. | Rendu multi-passes (G-Buffer/ombres/post-process), `ExecuteIndirect`, BVH4. |
 
 ## Pourquoi ASTRAL ?
@@ -94,7 +94,7 @@ Toute la documentation technique en français est disponible dans [`docs/README.
 
 ### Présentation
 
-**Archivist-Atlas — GTA VI Recompilation Project** est un projet indépendant de recherche et de développement logiciel consacré à l'étude des techniques de recompilation, de compatibilité multiplateforme et d'intégration de systèmes d'intelligence artificielle dans les environnements vidéoludiques.
+**GTA VI Astral** (développé par Archivist-Atlas) est un projet indépendant de recherche et de développement logiciel consacré à l'étude des techniques de recompilation, de compatibilité multiplateforme et d'intégration de systèmes d'intelligence artificielle dans les environnements vidéoludiques.
 
 L'objectif à long terme est d'explorer les possibilités offertes par la recompilation logicielle afin d'étudier l'intégration de fonctionnalités indépendantes qui ne sont pas nécessairement prévues dans l'environnement d'exécution d'origine.
 
@@ -104,7 +104,7 @@ GTA VI constitue une cible de recherche envisagée pour expérimenter ces techno
 
 L'une des ambitions principales du projet est d'étudier le développement d'un système indépendant d'intelligence artificielle destiné à enrichir les interactions entre les joueurs et les personnages non joueurs (PNJ).
 
-Les systèmes traditionnels reposent souvent sur des dialogues prédéfinis, des arbres de conversation et des comportements scriptés. Archivist-Atlas souhaite explorer des approches permettant de rendre ces interactions plus dynamiques, contextuelles et cohérentes.
+Les systèmes traditionnels reposent souvent sur des dialogues prédéfinis, des arbres de conversation et des comportements scriptés. **GTA VI Astral** souhaite explorer des approches permettant de rendre ces interactions plus dynamiques, contextuelles et cohérentes.
 
 Les axes de recherche envisagés comprennent :
 
@@ -146,7 +146,7 @@ L'exécution de ces composants pourra être étudiée localement sur PC ou au mo
 
 ### Indépendance du développement
 
-Archivist-Atlas développe ses propres outils et composants logiciels. Le projet distingue clairement les technologies développées indépendamment des logiciels tiers étudiés dans le cadre de ses recherches.
+**GTA VI Astral** (maintenu par Archivist-Atlas) développe ses propres outils et composants logiciels. Le projet distingue clairement les technologies développées indépendamment des logiciels tiers étudiés dans le cadre de ses recherches.
 
 Il n'a pas pour objectif de distribuer le code source propriétaire, les exécutables, les ressources graphiques, les fichiers audio ou les autres contenus protégés appartenant aux éditeurs des logiciels concernés. Toute utilisation de fichiers tiers reste soumise aux droits et autorisations applicables.
 
@@ -160,6 +160,6 @@ Le présent projet ne revendique aucune autorisation générale de décompilatio
 
 ### Indépendance et absence d'affiliation
 
-Archivist-Atlas est un projet indépendant, non officiel et sans affiliation avec Rockstar Games, Rockstar North ou Take-Two Interactive.
+**GTA VI Astral** est un projet indépendant, non officiel et sans affiliation avec Rockstar Games, Rockstar North ou Take-Two Interactive.
 
 Les noms de produits et marques éventuellement mentionnés sont utilisés uniquement à des fins descriptives et restent la propriété de leurs détenteurs respectifs.

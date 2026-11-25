@@ -70,3 +70,31 @@ func TestEmitHLSLComputeShader(t *testing.T) {
 		t.Fatalf("HLSL CS malformé :\n%s", out.Source)
 	}
 }
+
+func TestEmitHLSLComparisonsAndSelect(t *testing.T) {
+	code := make([]byte, 0, 16)
+	w := func(u uint32) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], u)
+		code = append(code, b[:]...)
+	}
+	// SOPC: s_cmp_eq_u32 s0, s1 (op=0x06)
+	w((0b101111110 << 23) | (0x06 << 16) | (1 << 8) | 0)
+	// SOP2: s_cselect_b32 s2, s0, s1 (op=0x0A)
+	w((0b10 << 30) | (0x0A << 23) | (2 << 16) | (1 << 8) | 0)
+	// VOPC: v_cmp_lt_f32 v0, v1 (op=0x11)
+	w((0x3E << 25) | (0x11 << 17) | (1 << 9) | 256)
+	// s_endpgm
+	w((0b101111111 << 23) | (0x01 << 16))
+
+	out, err := EmitHLSL(nil, NativeProgram{Stage: StageVS, Code: code})
+	if err != nil {
+		t.Fatalf("EmitHLSL cmp échoué : %v", err)
+	}
+	if out.UnsupportedOps != 0 {
+		t.Fatalf("ops non supportés : %v", out.MissingOps)
+	}
+	if !strings.Contains(out.Source, "scc = (s[0] == s[1]);") || !strings.Contains(out.Source, "vcc = (asfloat(v[0]) < asfloat(v[1]));") {
+		t.Fatalf("comparaisons absentes :\n%s", out.Source)
+	}
+}

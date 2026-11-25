@@ -459,10 +459,101 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 			return fmt.Sprintf("v[%d] = ((%s >> (%s & 31u)) & ((1u << (%s & 31u)) - 1u));", vdst, s0u, s1u, s2u), true
 		case 0x14A: // v_bfi_b32
 			return fmt.Sprintf("v[%d] = ((%s & %s) | (~%s & %s));", vdst, s0u, s1u, s0u, s2u), true
+		case 0x101: // v_cndmask_b32 (VOP3)
+			return fmt.Sprintf("v[%d] = vcc ? %s : %s;", vdst, s1u, s0u), true
 		case 0x103: // v_add_f32 (VOP3)
 			return fmt.Sprintf("v[%d] = asuint(%s + %s);", vdst, s0f, s1f), true
+		case 0x104: // v_sub_f32 (VOP3)
+			return fmt.Sprintf("v[%d] = asuint(%s - %s);", vdst, s0f, s1f), true
 		case 0x107, 0x108: // v_mul_f32 (VOP3)
 			return fmt.Sprintf("v[%d] = asuint(%s * %s);", vdst, s0f, s1f), true
+		case 0x10F: // v_min_f32 (VOP3)
+			return fmt.Sprintf("v[%d] = asuint(min(%s, %s));", vdst, s0f, s1f), true
+		case 0x110: // v_max_f32 (VOP3)
+			return fmt.Sprintf("v[%d] = asuint(max(%s, %s));", vdst, s0f, s1f), true
+		case 0x118: // v_lshrrev_b32 (VOP3)
+			return fmt.Sprintf("v[%d] = (%s >> (%s & 31u));", vdst, s1u, s0u), true
+		case 0x11A: // v_lshlrev_b32 (VOP3)
+			return fmt.Sprintf("v[%d] = (%s << (%s & 31u));", vdst, s1u, s0u), true
+		case 0x11B: // v_and_b32 (VOP3)
+			return fmt.Sprintf("v[%d] = (%s & %s);", vdst, s0u, s1u), true
+		case 0x11C: // v_or_b32 (VOP3)
+			return fmt.Sprintf("v[%d] = (%s | %s);", vdst, s0u, s1u), true
+		case 0x11D: // v_xor_b32 (VOP3)
+			return fmt.Sprintf("v[%d] = (%s ^ %s);", vdst, s0u, s1u), true
+		case 0x125, 0x20F: // v_add_nc_u32 / v_add_co_u32
+			return fmt.Sprintf("v[%d] = (%s + %s);", vdst, s0u, s1u), true
+		case 0x126, 0x210: // v_sub_nc_u32 / v_sub_co_u32
+			return fmt.Sprintf("v[%d] = (%s - %s);", vdst, s0u, s1u), true
+		case 0x150: // v_min3_f32
+			return fmt.Sprintf("v[%d] = asuint(min(min(%s, %s), %s));", vdst, s0f, s1f, s2f), true
+		case 0x153: // v_max3_f32
+			return fmt.Sprintf("v[%d] = asuint(max(max(%s, %s), %s));", vdst, s0f, s1f, s2f), true
+		case 0x156: // v_alignbit_b32
+			return fmt.Sprintf("v[%d] = ((%s << (32u - (%s & 31u))) | (%s >> (%s & 31u)));", vdst, s0u, s2u, s1u, s2u), true
+		case 0x36D: // v_add3_u32
+			return fmt.Sprintf("v[%d] = (%s + %s + %s);", vdst, s0u, s1u, s2u), true
+		case 0x36F: // v_lshl_or_b32
+			return fmt.Sprintf("v[%d] = ((%s << (%s & 31u)) | %s);", vdst, s0u, s1u, s2u), true
+		case 0x371: // v_and_or_b32
+			return fmt.Sprintf("v[%d] = ((%s & %s) | %s);", vdst, s0u, s1u, s2u), true
+		}
+
+	case EncVOPC:
+		src0 := w0 & 0x1FF
+		vsrc1 := (w0 >> 9) & 0xFF
+		op := (w0 >> 17) & 0xFF
+		if vsrc1 >= 64 {
+			return "", false
+		}
+		s0u := gfx10SrcU32(src0, gi.Literal, gi.HasLit)
+		s0f := fmt.Sprintf("asfloat(%s)", s0u)
+		s1u := fmt.Sprintf("v[%d]", vsrc1)
+		s1f := fmt.Sprintf("asfloat(v[%d])", vsrc1)
+		// v_cmp_*_f32 (0x10..0x1F), v_cmp_*_i32 (0x80..0x87), v_cmp_*_u32 (0xC0..0xC7)
+		cond := cmpCond(op&0x7)
+		if cond != "" {
+			switch {
+			case op >= 0x10 && op < 0x20:
+				return fmt.Sprintf("vcc = (%s %s %s);", s0f, cond, s1f), true
+			case op >= 0x80 && op < 0x88:
+				return fmt.Sprintf("vcc = (asint(%s) %s asint(%s));", s0u, cond, s1u), true
+			case op >= 0xC0 && op < 0xC8:
+				return fmt.Sprintf("vcc = (%s %s %s);", s0u, cond, s1u), true
+			}
+		}
+
+	case EncSOPC:
+		ssrc0 := w0 & 0xFF
+		ssrc1 := (w0 >> 8) & 0xFF
+		op := (w0 >> 16) & 0x7F
+		s0 := gfx10SrcU32(ssrc0, gi.Literal, gi.HasLit)
+		s1 := gfx10SrcU32(ssrc1, gi.Literal, gi.HasLit)
+		switch op {
+		case 0x00: // s_cmp_eq_i32
+			return fmt.Sprintf("scc = (asint(%s) == asint(%s));", s0, s1), true
+		case 0x01: // s_cmp_lg_i32
+			return fmt.Sprintf("scc = (asint(%s) != asint(%s));", s0, s1), true
+		case 0x02: // s_cmp_gt_i32
+			return fmt.Sprintf("scc = (asint(%s) > asint(%s));", s0, s1), true
+		case 0x03: // s_cmp_ge_i32
+			return fmt.Sprintf("scc = (asint(%s) >= asint(%s));", s0, s1), true
+		case 0x04: // s_cmp_lt_i32
+			return fmt.Sprintf("scc = (asint(%s) < asint(%s));", s0, s1), true
+		case 0x05: // s_cmp_le_i32
+			return fmt.Sprintf("scc = (asint(%s) <= asint(%s));", s0, s1), true
+		case 0x06: // s_cmp_eq_u32
+			return fmt.Sprintf("scc = (%s == %s);", s0, s1), true
+		case 0x07: // s_cmp_lg_u32
+			return fmt.Sprintf("scc = (%s != %s);", s0, s1), true
+		case 0x08: // s_cmp_gt_u32
+			return fmt.Sprintf("scc = (%s > %s);", s0, s1), true
+		case 0x09: // s_cmp_ge_u32
+			return fmt.Sprintf("scc = (%s >= %s);", s0, s1), true
+		case 0x0A: // s_cmp_lt_u32
+			return fmt.Sprintf("scc = (%s < %s);", s0, s1), true
+		case 0x0B: // s_cmp_le_u32
+			return fmt.Sprintf("scc = (%s <= %s);", s0, s1), true
 		}
 
 	case EncSOP1:
@@ -509,10 +600,20 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 		s0 := gfx10SrcU32(ssrc0, gi.Literal, gi.HasLit)
 		s1 := gfx10SrcU32(ssrc1, gi.Literal, gi.HasLit)
 		switch op {
-		case 0x00, 0x02: // s_add_u32 / s_add_i32
+		case 0x00, 0x02, 0x04: // s_add_u32 / s_add_i32 / s_addc_u32
 			return fmt.Sprintf("s[%d] = (%s + %s);", sdst, s0, s1), true
-		case 0x01, 0x03: // s_sub_u32 / s_sub_i32
+		case 0x01, 0x03, 0x05: // s_sub_u32 / s_sub_i32 / s_subb_u32
 			return fmt.Sprintf("s[%d] = (%s - %s);", sdst, s0, s1), true
+		case 0x06: // s_min_i32
+			return fmt.Sprintf("s[%d] = asuint(min(asint(%s), asint(%s)));", sdst, s0, s1), true
+		case 0x07: // s_min_u32
+			return fmt.Sprintf("s[%d] = min(%s, %s);", sdst, s0, s1), true
+		case 0x08: // s_max_i32
+			return fmt.Sprintf("s[%d] = asuint(max(asint(%s), asint(%s)));", sdst, s0, s1), true
+		case 0x09: // s_max_u32
+			return fmt.Sprintf("s[%d] = max(%s, %s);", sdst, s0, s1), true
+		case 0x0A, 0x2E: // s_cselect_b32
+			return fmt.Sprintf("s[%d] = scc ? %s : %s;", sdst, s0, s1), true
 		case 0x0E: // s_and_b32
 			return fmt.Sprintf("s[%d] = (%s & %s);", sdst, s0, s1), true
 		case 0x10: // s_or_b32
@@ -523,6 +624,8 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 			return fmt.Sprintf("s[%d] = (%s << (%s & 31u));", sdst, s0, s1), true
 		case 0x1E: // s_lshr_b32
 			return fmt.Sprintf("s[%d] = (%s >> (%s & 31u));", sdst, s0, s1), true
+		case 0x20: // s_ashr_i32
+			return fmt.Sprintf("s[%d] = asuint(asint(%s) >> (%s & 31u));", sdst, s0, s1), true
 		case 0x2C: // s_mul_i32
 			return fmt.Sprintf("s[%d] = asuint(asint(%s) * asint(%s));", sdst, s0, s1), true
 		}
@@ -670,4 +773,23 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 		return strings.Join(parts, " "), true
 	}
 	return "", false
+}
+
+func cmpCond(sub uint32) string {
+	switch sub {
+	case 1:
+		return "<"
+	case 2:
+		return "=="
+	case 3:
+		return "<="
+	case 4:
+		return ">"
+	case 5:
+		return "!="
+	case 6:
+		return ">="
+	default:
+		return ""
+	}
 }
