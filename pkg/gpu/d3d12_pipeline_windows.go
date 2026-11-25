@@ -36,19 +36,29 @@ type HostTextureUpload struct {
 	Pixels  []byte
 }
 
-// HostDrawPass décrit un appel DrawInstanced rejoué sur le ID3D12Device matériel hôte.
+// HostDrawPass décrit un appel DrawInstanced ou DrawIndexedInstanced rejoué sur le GPU hôte.
 type HostDrawPass struct {
-	VertexCount   uint32
+	Indexed       bool
+	VertexCount   uint32 // VertexCountPerInstance ou IndexCountPerInstance
 	InstanceCount uint32
-	StartVertex   uint32
+	StartVertex   uint32 // StartVertexLocation ou StartIndexLocation
+	BaseVertex    int32
 	StartInstance uint32
 	PassIndex     uint32
 	FrameNumber   uint32
 	HostPSO       uintptr
 	VBData        []byte
 	VBStride      uint32
+	IBData        []byte
+	IBFormat      uint32 // 57 = R16_UINT, 42 = R32_UINT
 	CBData        []byte
 	SRVTex        *HostTextureUpload
+}
+
+type d3d12IndexBufferView struct {
+	BufferLocation uint64
+	SizeInBytes    uint32
+	Format         uint32
 }
 
 type hostTexEntry struct {
@@ -363,11 +373,12 @@ func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []Ho
 		SampleDesc:            d3d12SampleDesc{Count: 1, Quality: 0},
 	}
 	psoDesc.BlendState.RenderTarget[0] = d3d12RenderTargetBlendDesc{
-		SrcBlend:              2, // ONE
-		DestBlend:             1, // ZERO
+		BlendEnable:           1, // Alpha blending standard (SRC_ALPHA / INV_SRC_ALPHA) pour les passes UI/intro
+		SrcBlend:              5, // D3D12_BLEND_SRC_ALPHA
+		DestBlend:             6, // D3D12_BLEND_INV_SRC_ALPHA
 		BlendOp:               1, // ADD
 		SrcBlendAlpha:         2, // ONE
-		DestBlendAlpha:        1, // ZERO
+		DestBlendAlpha:        6, // INV_SRC_ALPHA
 		BlendOpAlpha:          1, // ADD
 		RenderTargetWriteMask: 0x0F,
 	}
@@ -573,12 +584,13 @@ float4 PSMain(VSOut i) : SV_Target {
 		return
 	}
 	h.ReplayPSO = pso
-	// Buffers dynamiques persistants UPLOAD pour VB (256 KiB), CB (64 KiB) et Staging Texture (16 MiB)
+	// Buffers dynamiques persistants UPLOAD pour VB (256 KiB), IB (256 KiB), CB (64 KiB) et Staging Texture (16 MiB)
 	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(256 << 10)
+	h.UploadIB, h.UploadIBPtr, h.UploadIBGPU = h.createUploadBuffer(256 << 10)
 	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(64 << 10)
 	h.UploadTex, h.UploadTexPtr, _ = h.createUploadBuffer(16 << 20)
 	h.initComputePipeline()
-	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS+CS DXBC, RootCBV b0 + SRV t0x64 + UAV u0 + VB)",
+	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS+CS DXBC, RootCBV b0 + SRV t0x64 + UAV u0 + VB/IB)",
 		"rootSig", fmt.Sprintf("0x%X", rootSig), "pso", fmt.Sprintf("0x%X", pso))
 }
 

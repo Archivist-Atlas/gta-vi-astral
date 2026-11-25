@@ -94,6 +94,9 @@ type HostD3D12 struct {
 	UploadVB      uintptr
 	UploadVBPtr   uintptr
 	UploadVBGPU   uint64
+	UploadIB      uintptr
+	UploadIBPtr   uintptr
+	UploadIBGPU   uint64
 	UploadCB      uintptr
 	UploadCBPtr   uintptr
 	UploadCBGPU   uint64
@@ -502,6 +505,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 				}
 				total := uint32(len(draws))
 				vbOff := uint64(0)
+				ibOff := uint64(0)
 				for idxPass, d := range draws {
 					if d.VertexCount == 0 || d.InstanceCount == 0 {
 						continue
@@ -548,6 +552,28 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 							// ID3D12GraphicsCommandList::IASetVertexBuffers (slot 44)
 							_ = comCall(h.CmdList, 44, 0, 1, uintptr(unsafe.Pointer(&vbv)))
 							vbOff = (vbOff + nBytes + 255) &^ 255
+						}
+					}
+					if d.Indexed && len(d.IBData) > 0 && h.UploadIBPtr != 0 && h.UploadIBGPU != 0 {
+						nBytes := uint64(len(d.IBData))
+						if ibOff+nBytes <= (256 << 10) {
+							dstIB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadIBPtr))), 256<<10)[ibOff : ibOff+nBytes]
+							copy(dstIB, d.IBData)
+							ibFmt := d.IBFormat
+							if ibFmt != 57 && ibFmt != 42 {
+								ibFmt = 57 // DXGI_FORMAT_R16_UINT
+							}
+							ibv := d3d12IndexBufferView{
+								BufferLocation: h.UploadIBGPU + ibOff,
+								SizeInBytes:    uint32(nBytes),
+								Format:         ibFmt,
+							}
+							// ID3D12GraphicsCommandList::IASetIndexBuffer (slot 43)
+							_ = comCall(h.CmdList, 43, uintptr(unsafe.Pointer(&ibv)))
+							ibOff = (ibOff + nBytes + 255) &^ 255
+							// ID3D12GraphicsCommandList::DrawIndexedInstanced (slot 13)
+							_ = comCall(h.CmdList, 13, uintptr(d.VertexCount), uintptr(d.InstanceCount), uintptr(d.StartVertex), uintptr(d.BaseVertex), uintptr(d.StartInstance))
+							continue
 						}
 					}
 					_ = comCall(h.CmdList, 12, uintptr(d.VertexCount), uintptr(d.InstanceCount), uintptr(d.StartVertex), uintptr(d.StartInstance))

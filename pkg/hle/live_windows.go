@@ -610,6 +610,7 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				}
 				return hresultOK
 			}),
+			9: syscall.NewCallback(func() uintptr { return hresultNotImpl }), // XSpeechSynthesizerCreate (silencieux)
 		}),
 		"{01ACD177-91F9-4763-A38E-CCBB55CE32E0}": NewCOMObject("xuser", 64, map[int]uintptr{
 			3: syscall.NewCallback(func(this, user, outPtr uintptr) uintptr { // XUserDuplicateHandle

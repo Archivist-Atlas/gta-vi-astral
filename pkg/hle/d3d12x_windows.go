@@ -52,6 +52,9 @@ type d3d12xState struct {
 	activeVBVA      uintptr
 	activeVBSize    uint32
 	activeVBStride  uint32
+	activeIBVA      uintptr
+	activeIBSize    uint32
+	activeIBFormat  uint32
 	activeRootVA    uintptr
 	activeSRVTex    *gpu.HostTextureUpload
 	frameDispatches []gpu.HostDispatchPass
@@ -386,18 +389,19 @@ func newD3D12XDevice() uintptr {
 			return hresultOK
 		})
 	}
-	cbListDrawInst := syscall.NewCallback(func(this, vtxCount, instCount, startVtx, startInst uintptr) uintptr {
-		listSlotHits[12].Add(1)
-		n := st.drawCalls.Add(1)
+	recordDrawPass := func(indexed bool, count, instCount, startLoc uint32, baseVtx int32, startInst uint32) {
 		st.mu.Lock()
 		if len(st.frameDraws) < 64 {
 			pass := gpu.HostDrawPass{
-				VertexCount:   uint32(vtxCount),
-				InstanceCount: uint32(instCount),
-				StartVertex:   uint32(startVtx),
-				StartInstance: uint32(startInst),
+				Indexed:       indexed,
+				VertexCount:   count,
+				InstanceCount: instCount,
+				StartVertex:   startLoc,
+				BaseVertex:    baseVtx,
+				StartInstance: startInst,
 				HostPSO:       st.activeHostPSO,
 				VBStride:      st.activeVBStride,
+				IBFormat:      st.activeIBFormat,
 			}
 			if st.activeVBVA >= 0x10000 && st.activeVBSize > 0 {
 				cpLen := st.activeVBSize
@@ -406,6 +410,14 @@ func newD3D12XDevice() uintptr {
 				}
 				pass.VBData = make([]byte, cpLen)
 				copy(pass.VBData, unsafe.Slice((*byte)(osPtr(st.activeVBVA)), cpLen))
+			}
+			if indexed && st.activeIBVA >= 0x10000 && st.activeIBSize > 0 {
+				cpLen := st.activeIBSize
+				if cpLen > 4096 {
+					cpLen = 4096
+				}
+				pass.IBData = make([]byte, cpLen)
+				copy(pass.IBData, unsafe.Slice((*byte)(osPtr(st.activeIBVA)), cpLen))
 			}
 			if st.activeRootVA >= 0x10000 {
 				pass.CBData = make([]byte, 256)
@@ -432,6 +444,11 @@ func newD3D12XDevice() uintptr {
 			st.frameDraws = append(st.frameDraws, pass)
 		}
 		st.mu.Unlock()
+	}
+	cbListDrawInst := syscall.NewCallback(func(this, vtxCount, instCount, startVtx, startInst uintptr) uintptr {
+		listSlotHits[12].Add(1)
+		n := st.drawCalls.Add(1)
+		recordDrawPass(false, uint32(vtxCount), uint32(instCount), uint32(startVtx), 0, uint32(startInst))
 		if gpuTrace && n <= 12 {
 			slog.Info("GPU_TRACE DrawInstanced", "n", n, "vtx", uint32(vtxCount), "inst", uint32(instCount), "startVtx", uint32(startVtx), "startInst", uint32(startInst))
 		}
@@ -440,6 +457,7 @@ func newD3D12XDevice() uintptr {
 	cbListDrawIdx := syscall.NewCallback(func(this, idxCount, instCount, startIdx, baseVtx, startInst uintptr) uintptr {
 		listSlotHits[13].Add(1)
 		n := st.drawCalls.Add(1)
+		recordDrawPass(true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
 		if gpuTrace && n <= 12 {
 			slog.Info("GPU_TRACE DrawIndexedInstanced", "n", n, "idx", uint32(idxCount), "inst", uint32(instCount), "startIdx", uint32(startIdx), "baseVtx", int32(baseVtx))
 		}
@@ -448,6 +466,7 @@ func newD3D12XDevice() uintptr {
 	cbListDrawIdxX := syscall.NewCallback(func(this, idxCount, instCount, startIdx, baseVtx, startInst uintptr) uintptr {
 		listSlotHits[81].Add(1)
 		n := st.drawCalls.Add(1)
+		recordDrawPass(true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
 		if gpuTrace && n <= 12 {
 			slog.Info("GPU_TRACE DrawIndexedX", "n", n, "idx", uint32(idxCount), "inst", uint32(instCount), "startIdx", uint32(startIdx))
 		}
@@ -702,12 +721,29 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
+	cbListSetIB := syscall.NewCallback(func(this, viewPtr uintptr) uintptr {
+		listSlotHits[47].Add(1)
+		if viewPtr >= 0x10000 {
+			loc := *(*uint64)(osPtr(viewPtr + 0))
+			sz := *(*uint32)(osPtr(viewPtr + 8))
+			ibFmt := *(*uint32)(osPtr(viewPtr + 12))
+			if loc >= 0x10000 && loc < 0x800000000000 && sz > 0 {
+				st.mu.Lock()
+				st.activeIBVA = uintptr(loc)
+				st.activeIBSize = sz
+				st.activeIBFormat = ibFmt
+				st.mu.Unlock()
+			}
+		}
+		return 0
+	})
 	cmdListSlots[12] = cbListDrawInst     // DrawInstanced
 	cmdListSlots[13] = cbListDrawIdx      // DrawIndexedInstanced
 	cmdListSlots[14] = cbListDispatch     // Dispatch
 	cmdListSlots[25] = cbListSetPSO       // SetPipelineState
 	cmdListSlots[36] = cbListSetRootTable // SetGraphicsRootDescriptorTable (Xbox #36 = PC #32)
 	cmdListSlots[44] = cbListSetRootSRV   // SetGraphicsRootShaderResourceView (Xbox #44 = PC #40)
+	cmdListSlots[47] = cbListSetIB        // IASetIndexBuffer (Xbox #47 = PC #43)
 	cmdListSlots[48] = cbListSetVB        // IASetVertexBuffers (Xbox #48 = PC #44)
 	cmdListSlots[52] = cbListClearRTV     // ClearRenderTargetView (Xbox slot 52 = PC slot 48)
 	cmdListSlots[60] = cbListCopyMem      // CopyMemoryToMemoryX (0x1E0)
