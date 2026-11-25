@@ -17,11 +17,12 @@ import (
 )
 
 type guestPSO struct {
-	vsPtr  uintptr
-	vsLen  uint64
-	psPtr  uintptr
-	psLen  uint64
-	logged atomic.Bool
+	vsHash   [16]byte
+	psHash   [16]byte
+	hasVS    bool
+	hasPS    bool
+	hostPSO  uintptr
+	compiled atomic.Bool
 }
 
 type fenceWaiter struct {
@@ -43,6 +44,8 @@ type d3d12xState struct {
 	resDescs        map[uintptr]xgResourceDesc
 	rtvResources    map[uintptr]uintptr
 	psos            map[uintptr]*guestPSO
+	dxbcBlobs       map[[16]byte][]byte
+	activeHostPSO   uintptr
 	frameDraws      []gpu.HostDrawPass
 	lastClearColor  [4]float32
 	hasClearColor   bool
@@ -66,6 +69,7 @@ func newD3D12XDevice() uintptr {
 		resDescs:       make(map[uintptr]xgResourceDesc),
 		rtvResources:   make(map[uintptr]uintptr),
 		psos:           make(map[uintptr]*guestPSO),
+		dxbcBlobs:      make(map[[16]byte][]byte),
 		lastClearColor: [4]float32{0.04, 0.05, 0.09, 1.0},
 	}
 	st.nextHeapBase.Store(0x0000100000000000)
@@ -368,6 +372,7 @@ func newD3D12XDevice() uintptr {
 				InstanceCount: uint32(instCount),
 				StartVertex:   uint32(startVtx),
 				StartInstance: uint32(startInst),
+				HostPSO:       st.activeHostPSO,
 			})
 		}
 		st.mu.Unlock()
@@ -412,14 +417,13 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
-	describeDXBC := func(p uintptr, l uint64) string {
-		if p < 0x10000 || l < 32 || l > (16<<20) {
+	describeDXBCBytes := func(data []byte) string {
+		if len(data) < 32 {
 			return "none"
 		}
-		data := unsafe.Slice((*byte)(osPtr(p)), l)
 		c, err := shader.ParseDXBC(data)
 		if err != nil {
-			return fmt.Sprintf("len=%d err=%v", l, err)
+			return fmt.Sprintf("len=%d err=%v", len(data), err)
 		}
 		var parts string
 		for _, pt := range c.Parts {
@@ -427,27 +431,95 @@ func newD3D12XDevice() uintptr {
 		}
 		progs, perr := shader.ExtractNativePrograms(c)
 		if perr != nil || len(progs) == 0 {
-			return fmt.Sprintf("len=%d parts=[%s] nativeErr=%v", l, parts, perr)
+			return fmt.Sprintf("len=%d parts=[%s] nativeErr=%v", len(data), parts, perr)
 		}
 		var nat string
 		for _, pr := range progs {
 			insts := shader.DecodeGFX10(pr.Code)
 			nat += fmt.Sprintf("%s(%dB/%dins/w64=%v/v%d/s%d/res=%d) ", pr.Stage, len(pr.Code), len(insts), pr.Wave64, pr.VGPRs, pr.SGPRs, len(pr.UsedResources))
 		}
-		return fmt.Sprintf("len=%d parts=[%s] native=[%s]", l, parts, nat)
+		return fmt.Sprintf("len=%d parts=[%s] native=[%s]", len(data), parts, nat)
+	}
+	compileGuestPSO := func(psoObj uintptr, gp *guestPSO) {
+		if !gp.hasVS || !gp.hasPS {
+			return
+		}
+		st.mu.Lock()
+		vsData := st.dxbcBlobs[gp.vsHash]
+		psData := st.dxbcBlobs[gp.psHash]
+		st.mu.Unlock()
+		if len(vsData) < 32 || len(psData) < 32 {
+			return
+		}
+		if gpuTrace {
+			slog.Info("GPU_TRACE Active PSO bound",
+				"pso", fmt.Sprintf("0x%X", psoObj),
+				"vs", describeDXBCBytes(vsData),
+				"ps", describeDXBCBytes(psData),
+			)
+		}
+		vsC, err := shader.ParseDXBC(vsData)
+		if err != nil {
+			slog.Warn("ParseDXBC VS échoué", "pso", fmt.Sprintf("0x%X", psoObj), "err", err)
+			return
+		}
+		psC, err := shader.ParseDXBC(psData)
+		if err != nil {
+			slog.Warn("ParseDXBC PS échoué", "pso", fmt.Sprintf("0x%X", psoObj), "err", err)
+			return
+		}
+		vsProgs, err := shader.ExtractNativePrograms(vsC)
+		if err != nil || len(vsProgs) == 0 {
+			return
+		}
+		psProgs, err := shader.ExtractNativePrograms(psC)
+		if err != nil || len(psProgs) == 0 {
+			return
+		}
+		vsOut, err := shader.EmitHLSL(vsC, vsProgs[0])
+		if err != nil {
+			return
+		}
+		psOut, err := shader.EmitHLSL(psC, psProgs[0])
+		if err != nil {
+			return
+		}
+		var inElems []gpu.HostInputElement
+		for _, el := range vsOut.InputElements {
+			inElems = append(inElems, gpu.HostInputElement{
+				SemanticName:  el.SemanticName,
+				SemanticIndex: el.SemanticIndex,
+				Format:        2, // DXGI_FORMAT_R32G32B32A32_FLOAT
+			})
+		}
+		hPSO, cerr := gpu.CompileHostPSO(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems)
+		if cerr != nil {
+			slog.Warn("Recompilation PSO RDNA2->HLSL->D3D12 échouée (repli actif)", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
+			return
+		}
+		st.mu.Lock()
+		gp.hostPSO = hPSO
+		st.mu.Unlock()
+		slog.Info("PSO RDNA2 recompilé en ID3D12PipelineState matériel",
+			"guestPSO", fmt.Sprintf("0x%X", psoObj),
+			"hostPSO", fmt.Sprintf("0x%X", hPSO),
+			"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
+			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
+		)
 	}
 	cbListSetPSO := syscall.NewCallback(func(this, pso uintptr) uintptr {
 		listSlotHits[25].Add(1)
-		if gpuTrace && pso != 0 {
+		if pso != 0 {
 			st.mu.Lock()
 			gp := st.psos[pso]
 			st.mu.Unlock()
-			if gp != nil && gp.logged.CompareAndSwap(false, true) {
-				slog.Info("GPU_TRACE Active PSO bound",
-					"pso", fmt.Sprintf("0x%X", pso),
-					"vs", describeDXBC(gp.vsPtr, gp.vsLen),
-					"ps", describeDXBC(gp.psPtr, gp.psLen),
-				)
+			if gp != nil {
+				if gp.compiled.CompareAndSwap(false, true) {
+					compileGuestPSO(pso, gp)
+				}
+				st.mu.Lock()
+				st.activeHostPSO = gp.hostPSO
+				st.mu.Unlock()
 			}
 		}
 		return 0
@@ -735,6 +807,25 @@ func newD3D12XDevice() uintptr {
 		inspectPSO("CreatePSO", desc)
 		return hresultOK
 	})
+	storeDXBCBlob := func(p uintptr, l uint64) ([16]byte, bool) {
+		var h [16]byte
+		if p < 0x10000 || l < 32 || l > (16<<20) {
+			return h, false
+		}
+		src := unsafe.Slice((*byte)(osPtr(p)), l)
+		if src[0] != 'D' || src[1] != 'X' || src[2] != 'B' || src[3] != 'C' {
+			return h, false
+		}
+		copy(h[:], src[4:20])
+		st.mu.Lock()
+		if _, exists := st.dxbcBlobs[h]; !exists {
+			cp := make([]byte, l)
+			copy(cp, src)
+			st.dxbcBlobs[h] = cp
+		}
+		st.mu.Unlock()
+		return h, true
+	}
 	cbCreatePSOStream := syscall.NewCallback(func(this, streamDesc, iid, outPtr uintptr) uintptr {
 		psoObj := newPipelineState()
 		if outPtr != 0 {
@@ -748,17 +839,16 @@ func newD3D12XDevice() uintptr {
 				gp := &guestPSO{}
 				for i := 0; i < len(q) && i < 32; i++ {
 					if q[i] >= 0x10000 && q[i] < 0x800000000000 && i+1 < len(q) && q[i+1] >= 32 && q[i+1] <= (16<<20) {
-						b := unsafe.Slice((*byte)(osPtr(uintptr(q[i]))), 4)
-						if b[0] == 'D' && b[1] == 'X' && b[2] == 'B' && b[3] == 'C' {
-							if gp.vsPtr == 0 {
-								gp.vsPtr, gp.vsLen = uintptr(q[i]), q[i+1]
-							} else if gp.psPtr == 0 {
-								gp.psPtr, gp.psLen = uintptr(q[i]), q[i+1]
+						if h, ok := storeDXBCBlob(uintptr(q[i]), q[i+1]); ok {
+							if !gp.hasVS {
+								gp.vsHash, gp.hasVS = h, true
+							} else if !gp.hasPS {
+								gp.psHash, gp.hasPS = h, true
 							}
 						}
 					}
 				}
-				if gp.vsPtr != 0 || gp.psPtr != 0 {
+				if gp.hasVS || gp.hasPS {
 					st.mu.Lock()
 					st.psos[psoObj] = gp
 					st.mu.Unlock()

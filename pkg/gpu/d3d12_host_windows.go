@@ -93,6 +93,8 @@ type HostD3D12 struct {
 	UploadPitch   uint32
 	ReplayRootSig uintptr
 	ReplayPSO     uintptr
+	SRVHeap       uintptr
+	SRVGPUStart   uintptr
 	Ready         bool
 }
 
@@ -431,15 +433,26 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 				_ = comCall(h.CmdList, 21, 1, uintptr(unsafe.Pointer(&vp)))        // RSSetViewports
 				_ = comCall(h.CmdList, 22, 1, uintptr(unsafe.Pointer(&sc)))        // RSSetScissorRects
 				_ = comCall(h.CmdList, 20, 4)                                      // IASetPrimitiveTopology(TRIANGLELIST)
-				_ = comCall(h.CmdList, 30, h.ReplayRootSig)                        // SetGraphicsRootSignature
-				_ = comCall(h.CmdList, 25, h.ReplayPSO)                            // SetPipelineState
+				if h.SRVHeap != 0 {
+					heaps := [1]uintptr{h.SRVHeap}
+					_ = comCall(h.CmdList, 28, 1, uintptr(unsafe.Pointer(&heaps[0]))) // SetDescriptorHeaps
+				}
+				_ = comCall(h.CmdList, 30, h.ReplayRootSig) // SetGraphicsRootSignature
+				if h.SRVGPUStart != 0 {
+					_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart) // SetGraphicsRootDescriptorTable(param=1, t0)
+				}
 				total := uint32(len(draws))
 				for _, d := range draws {
 					if d.VertexCount == 0 || d.InstanceCount == 0 {
 						continue
 					}
-					consts := [4]uint32{d.FrameNumber, d.PassIndex, total, 0}
-					_ = comCall(h.CmdList, 36, 0, 4, uintptr(unsafe.Pointer(&consts[0])), 0) // SetGraphicsRoot32BitConstants
+					pso := d.HostPSO
+					if pso == 0 {
+						pso = h.ReplayPSO
+					}
+					_ = comCall(h.CmdList, 25, pso) // SetPipelineState
+					consts := [16]uint32{d.FrameNumber, d.PassIndex, total, 0}
+					_ = comCall(h.CmdList, 36, 0, 16, uintptr(unsafe.Pointer(&consts[0])), 0) // SetGraphicsRoot32BitConstants
 					_ = comCall(h.CmdList, 12, uintptr(d.VertexCount), uintptr(d.InstanceCount), uintptr(d.StartVertex), uintptr(d.StartInstance))
 				}
 			}

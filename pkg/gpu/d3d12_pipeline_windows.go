@@ -10,9 +10,9 @@ import (
 )
 
 var (
-	modD3DCompiler47             = syscall.NewLazyDLL("d3dcompiler_47.dll")
-	procD3DCompile               = modD3DCompiler47.NewProc("D3DCompile")
-	procD3D12SerializeRootSig    = modD3D12Host.NewProc("D3D12SerializeRootSignature")
+	modD3DCompiler47          = syscall.NewLazyDLL("d3dcompiler_47.dll")
+	procD3DCompile            = modD3DCompiler47.NewProc("D3DCompile")
+	procD3D12SerializeRootSig = modD3D12Host.NewProc("D3D12SerializeRootSignature")
 
 	// IID_ID3D12RootSignature = {c54a6b66-72df-4ee8-8be5-a946a1429214}
 	guidID3D12RootSignature = [16]byte{
@@ -34,6 +34,7 @@ type HostDrawPass struct {
 	StartInstance uint32
 	PassIndex     uint32
 	FrameNumber   uint32
+	HostPSO       uintptr
 }
 
 type d3d12ShaderBytecode struct {
@@ -138,19 +139,38 @@ type d3d12GraphicsPSODesc struct {
 	Flags                 uint32
 }
 
-type d3d12RootConstants struct {
-	ShaderRegister uint32
-	RegisterSpace  uint32
-	Num32BitValues uint32
+type d3d12DescriptorRange struct {
+	RangeType                         uint32 // 0 = SRV
+	NumDescriptors                    uint32
+	BaseShaderRegister                uint32
+	RegisterSpace                     uint32
+	OffsetInDescriptorsFromTableStart uint32
 }
 
+// d3d12RootParameter (32 octets sur x64 : Type u32, _pad u32, union 16B, Visibility u32, _pad u32)
 type d3d12RootParameter struct {
 	ParameterType    uint32
 	_pad             uint32
-	Constants        d3d12RootConstants
-	_padUnion        uint32
+	Union0           uint64 // NumDescriptorRanges / ShaderRegister|RegisterSpace
+	Union1           uint64 // pDescriptorRanges / Num32BitValues
 	ShaderVisibility uint32
 	_padTail         uint32
+}
+
+type d3d12StaticSamplerDesc struct {
+	Filter           uint32
+	AddressU         uint32
+	AddressV         uint32
+	AddressW         uint32
+	MipLODBias       float32
+	MaxAnisotropy    uint32
+	ComparisonFunc   uint32
+	BorderColor      uint32
+	MinLOD           float32
+	MaxLOD           float32
+	ShaderRegister   uint32
+	RegisterSpace    uint32
+	ShaderVisibility uint32
 }
 
 type d3d12RootSignatureDesc struct {
@@ -162,6 +182,16 @@ type d3d12RootSignatureDesc struct {
 	StaticSamplers    uintptr
 	Flags             uint32
 	_pad2             uint32
+}
+
+type d3d12SRVDesc struct {
+	Format                  uint32
+	ViewDimension           uint32 // 4 = TEXTURE2D
+	Shader4ComponentMapping uint32 // 0x1688 = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+	MostDetailedMip         uint32
+	MipLevels               uint32
+	PlaneSlice              uint32
+	ResourceMinLODClamp     float32
 }
 
 type d3d12Viewport struct {
@@ -221,93 +251,73 @@ func CompileHLSL(source, entryPoint, target string) ([]byte, error) {
 	return out, nil
 }
 
-// initReplayPipeline compile le pipeline plein écran matériel hôte (RootSignature + PSO)
-// permettant de rejouer les appels DrawInstanced(3, 1) directement sur le GPU Windows.
-func (h *HostD3D12) initReplayPipeline() {
-	if h.Device == 0 {
-		return
-	}
-	if err := procD3D12SerializeRootSig.Find(); err != nil {
-		return
-	}
-
-	// RootSignature avec 4 constantes 32-bit dans b0 (frame, passIndex, drawCount, reserved)
-	param := d3d12RootParameter{
-		ParameterType:    1, // D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS
-		Constants:        d3d12RootConstants{ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4},
-		ShaderVisibility: 0, // ALL
-	}
-	rsDesc := d3d12RootSignatureDesc{
-		NumParameters: 1,
-		Parameters:    uintptr(unsafe.Pointer(&param)),
-		Flags:         0,
-	}
-	var rsBlob, errBlob uintptr
-	hr, _, _ := procD3D12SerializeRootSig.Call(
-		uintptr(unsafe.Pointer(&rsDesc)),
-		1, // D3D_ROOT_SIGNATURE_VERSION_1
-		uintptr(unsafe.Pointer(&rsBlob)),
-		uintptr(unsafe.Pointer(&errBlob)),
-	)
-	if errBlob != 0 {
-		_ = comCall(errBlob, 2)
-	}
-	if int32(hr) < 0 || rsBlob == 0 {
-		slog.Warn("Host D3D12 SerializeRootSignature échoué", "hr", fmt.Sprintf("0x%08X", uint32(hr)))
-		return
-	}
-	defer comCall(rsBlob, 2)
-
-	rsPtr := comCall(rsBlob, 3)
-	rsSize := comCall(rsBlob, 4)
-	var rootSig uintptr
-	// ID3D12Device::CreateRootSignature = slot 16
-	hr = comCall(h.Device, 16, 0, rsPtr, rsSize, uintptr(unsafe.Pointer(&guidID3D12RootSignature[0])), uintptr(unsafe.Pointer(&rootSig)))
-	if int32(hr) < 0 || rootSig == 0 {
-		slog.Warn("Host D3D12 CreateRootSignature échoué", "hr", fmt.Sprintf("0x%08X", uint32(hr)))
-		return
-	}
-
-	const hlslSrc = `
-cbuffer PassData : register(b0) {
-    uint FrameNum;
-    uint PassIndex;
-    uint TotalPasses;
-    uint Pad0;
-};
-struct VSOut {
-    float4 pos : SV_Position;
-    float2 uv  : TEXCOORD0;
-};
-VSOut VSMain(uint id : SV_VertexID) {
-    VSOut o;
-    o.uv = float2((id << 1) & 2, id & 2);
-    o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-    return o;
+// HostInputElement décrit un attribut vertex pour D3D12_INPUT_ELEMENT_DESC.
+type HostInputElement struct {
+	SemanticName  string
+	SemanticIndex uint32
+	Format        uint32 // DXGI_FORMAT (ex. 2 = R32G32B32A32_FLOAT)
 }
-float4 PSMain(VSOut i) : SV_Target {
-    float t = float(FrameNum) * 0.03;
-    float pulse = 0.08 + 0.04 * sin(t + float(PassIndex) * 1.1);
-    float3 base = float3(0.04 + pulse * 0.4, 0.05 + pulse * 0.5, 0.10 + pulse);
-    float vign = 1.0 - 0.35 * dot(i.uv - 0.5, i.uv - 0.5);
-    return float4(base * vign, 1.0);
-}
-`
-	vsBC, err := CompileHLSL(hlslSrc, "VSMain", "vs_5_0")
-	if err != nil {
-		slog.Warn("Host D3D12 CompileHLSL VS échoué", "err", err)
-		return
-	}
-	psBC, err := CompileHLSL(hlslSrc, "PSMain", "ps_5_0")
-	if err != nil {
-		slog.Warn("Host D3D12 CompileHLSL PS échoué", "err", err)
-		return
-	}
 
+type d3d12InputElementDesc struct {
+	SemanticName         uintptr
+	SemanticIndex        uint32
+	Format               uint32
+	InputSlot            uint32
+	AlignedByteOffset    uint32
+	InputSlotClass       uint32
+	InstanceDataStepRate uint32
+}
+
+// CompileGraphicsPSO compile une paire HLSL (VS + PS) et crée un ID3D12PipelineState matériel sur h.Device.
+func (h *HostD3D12) CompileGraphicsPSO(vsHLSL, vsEntry, psHLSL, psEntry string, inputElems []HostInputElement) (uintptr, error) {
+	if h == nil || h.Device == 0 || h.ReplayRootSig == 0 {
+		return 0, fmt.Errorf("HostD3D12 non initialisé")
+	}
+	vsBC, err := CompileHLSL(vsHLSL, vsEntry, "vs_5_0")
+	if err != nil {
+		return 0, err
+	}
+	psBC, err := CompileHLSL(psHLSL, psEntry, "ps_5_0")
+	if err != nil {
+		return 0, err
+	}
+	return h.createGraphicsPSOFromDXBC(vsBC, psBC, inputElems)
+}
+
+func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []HostInputElement) (uintptr, error) {
+	var rawDescs []d3d12InputElementDesc
+	var nameBufs [][]byte
+	if len(inputElems) > 0 {
+		rawDescs = make([]d3d12InputElementDesc, len(inputElems))
+		nameBufs = make([][]byte, len(inputElems))
+		for i, el := range inputElems {
+			nb := append([]byte(el.SemanticName), 0)
+			nameBufs[i] = nb
+			fmtID := el.Format
+			if fmtID == 0 {
+				fmtID = 2 // DXGI_FORMAT_R32G32B32A32_FLOAT
+			}
+			rawDescs[i] = d3d12InputElementDesc{
+				SemanticName:      uintptr(unsafe.Pointer(&nb[0])),
+				SemanticIndex:     el.SemanticIndex,
+				Format:            fmtID,
+				InputSlot:         0,
+				AlignedByteOffset: 0xFFFFFFFF, // D3D12_APPEND_ALIGNED_ELEMENT
+			}
+		}
+	}
+	var ilDesc d3d12InputLayoutDesc
+	if len(rawDescs) > 0 {
+		ilDesc = d3d12InputLayoutDesc{
+			Elements:    uintptr(unsafe.Pointer(&rawDescs[0])),
+			NumElements: uint32(len(rawDescs)),
+		}
+	}
 	psoDesc := d3d12GraphicsPSODesc{
-		RootSignature: rootSig,
+		RootSignature: h.ReplayRootSig,
 		VS:            d3d12ShaderBytecode{Ptr: uintptr(unsafe.Pointer(&vsBC[0])), Len: uintptr(len(vsBC))},
 		PS:            d3d12ShaderBytecode{Ptr: uintptr(unsafe.Pointer(&psBC[0])), Len: uintptr(len(psBC))},
+		InputLayout:   ilDesc,
 		SampleMask:    0xFFFFFFFF,
 		RasterizerState: d3d12RasterizerDesc{
 			FillMode:        3, // SOLID
@@ -336,13 +346,147 @@ float4 PSMain(VSOut i) : SV_Target {
 
 	var pso uintptr
 	// ID3D12Device::CreateGraphicsPipelineState = slot 10
-	hr = comCall(h.Device, 10, uintptr(unsafe.Pointer(&psoDesc)), uintptr(unsafe.Pointer(&guidID3D12PipelineState[0])), uintptr(unsafe.Pointer(&pso)))
+	hr := comCall(h.Device, 10, uintptr(unsafe.Pointer(&psoDesc)), uintptr(unsafe.Pointer(&guidID3D12PipelineState[0])), uintptr(unsafe.Pointer(&pso)))
+	_ = nameBufs
 	if int32(hr) < 0 || pso == 0 {
-		slog.Warn("Host D3D12 CreateGraphicsPipelineState échoué", "hr", fmt.Sprintf("0x%08X", uint32(hr)))
+		return 0, fmt.Errorf("CreateGraphicsPipelineState échoué (0x%08X)", uint32(hr))
+	}
+	return pso, nil
+}
+
+// CompileHostPSO compile une paire HLSL (VS+PS) en ID3D12PipelineState sur l'instance HostD3D12 globale.
+func CompileHostPSO(vsHLSL, vsEntry, psHLSL, psEntry string, inputElems []HostInputElement) (uintptr, error) {
+	hostMu.Lock()
+	h := hostInstance
+	hostMu.Unlock()
+	if h == nil {
+		return 0, fmt.Errorf("HostD3D12 inactif")
+	}
+	return h.CompileGraphicsPSO(vsHLSL, vsEntry, psHLSL, psEntry, inputElems)
+}
+
+// initReplayPipeline crée la RootSignature hôte (b0 16 uints + t0 SRV + s0 static sampler),
+// un heap SRV shader-visible avec descripteur 2D par défaut, et le PSO plein écran de repli.
+func (h *HostD3D12) initReplayPipeline() {
+	if h.Device == 0 {
+		return
+	}
+	if err := procD3D12SerializeRootSig.Find(); err != nil {
 		return
 	}
 
+	// Param 0 : 16 constantes 32-bit dans b0 (uint4 RootConst[4])
+	// Param 1 : DescriptorTable 1 SRV dans t0 (Texture2D<float4> Tex0)
+	srvRange := d3d12DescriptorRange{
+		RangeType:                         0, // SRV
+		NumDescriptors:                    1,
+		BaseShaderRegister:                0,
+		RegisterSpace:                     0,
+		OffsetInDescriptorsFromTableStart: 0,
+	}
+	params := [2]d3d12RootParameter{
+		{
+			ParameterType:    1, // 32BIT_CONSTANTS
+			Union0:           0, // ShaderRegister=0, RegisterSpace=0
+			Union1:           16, // Num32BitValues=16
+			ShaderVisibility: 0, // ALL
+		},
+		{
+			ParameterType:    0, // DESCRIPTOR_TABLE
+			Union0:           1, // NumDescriptorRanges=1
+			Union1:           uint64(uintptr(unsafe.Pointer(&srvRange))),
+			ShaderVisibility: 0, // ALL
+		},
+	}
+	sampler := d3d12StaticSamplerDesc{
+		Filter:           0x15, // MIN_MAG_MIP_LINEAR
+		AddressU:         3,    // CLAMP
+		AddressV:         3,    // CLAMP
+		AddressW:         3,    // CLAMP
+		MaxAnisotropy:    1,
+		ComparisonFunc:   8, // ALWAYS
+		MaxLOD:           3.402823466e+38,
+		ShaderRegister:   0,
+		RegisterSpace:    0,
+		ShaderVisibility: 0, // ALL
+	}
+	rsDesc := d3d12RootSignatureDesc{
+		NumParameters:     2,
+		Parameters:        uintptr(unsafe.Pointer(&params[0])),
+		NumStaticSamplers: 1,
+		StaticSamplers:    uintptr(unsafe.Pointer(&sampler)),
+		Flags:             1, // D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+	}
+	var rsBlob, errBlob uintptr
+	hr, _, _ := procD3D12SerializeRootSig.Call(
+		uintptr(unsafe.Pointer(&rsDesc)),
+		1, // D3D_ROOT_SIGNATURE_VERSION_1
+		uintptr(unsafe.Pointer(&rsBlob)),
+		uintptr(unsafe.Pointer(&errBlob)),
+	)
+	if errBlob != 0 {
+		_ = comCall(errBlob, 2)
+	}
+	if int32(hr) < 0 || rsBlob == 0 {
+		slog.Warn("Host D3D12 SerializeRootSignature échoué", "hr", fmt.Sprintf("0x%08X", uint32(hr)))
+		return
+	}
+	defer comCall(rsBlob, 2)
+
+	rsPtr := comCall(rsBlob, 3)
+	rsSize := comCall(rsBlob, 4)
+	var rootSig uintptr
+	hr = comCall(h.Device, 16, 0, rsPtr, rsSize, uintptr(unsafe.Pointer(&guidID3D12RootSignature[0])), uintptr(unsafe.Pointer(&rootSig)))
+	if int32(hr) < 0 || rootSig == 0 {
+		slog.Warn("Host D3D12 CreateRootSignature échoué", "hr", fmt.Sprintf("0x%08X", uint32(hr)))
+		return
+	}
 	h.ReplayRootSig = rootSig
+
+	// Heap SRV shader-visible (1 descripteur Texture2D null-descriptor valide pour t0)
+	srvHeapDesc := d3d12DescriptorHeapDesc{Type: 0 /* CBV_SRV_UAV */, NumDescriptors: 1, Flags: 1 /* SHADER_VISIBLE */}
+	if int32(comCall(h.Device, 14, uintptr(unsafe.Pointer(&srvHeapDesc)), uintptr(unsafe.Pointer(&guidID3D12DescriptorHeap[0])), uintptr(unsafe.Pointer(&h.SRVHeap)))) >= 0 && h.SRVHeap != 0 {
+		var cpuStart, gpuStart uintptr
+		_ = comCall(h.SRVHeap, 9, uintptr(unsafe.Pointer(&cpuStart)))  // GetCPUDescriptorHandleForHeapStart
+		_ = comCall(h.SRVHeap, 10, uintptr(unsafe.Pointer(&gpuStart))) // GetGPUDescriptorHandleForHeapStart
+		h.SRVGPUStart = gpuStart
+		srvDesc := d3d12SRVDesc{
+			Format:                  28,     // R8G8B8A8_UNORM
+			ViewDimension:           4,      // TEXTURE2D
+			Shader4ComponentMapping: 0x1688, // DEFAULT
+			MipLevels:               1,
+		}
+		// ID3D12Device::CreateShaderResourceView (slot 18) avec pResource=NULL (null descriptor D3D12 légal)
+		_ = comCall(h.Device, 18, 0, uintptr(unsafe.Pointer(&srvDesc)), cpuStart)
+	}
+
+	const hlslSrc = `
+cbuffer RootData : register(b0) {
+    uint4 RootConst[4];
+};
+struct VSOut {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+VSOut VSMain(uint id : SV_VertexID) {
+    VSOut o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+float4 PSMain(VSOut i) : SV_Target {
+    float t = float(RootConst[0].x) * 0.03;
+    float pulse = 0.08 + 0.04 * sin(t + float(RootConst[0].y) * 1.1);
+    float3 base = float3(0.04 + pulse * 0.4, 0.05 + pulse * 0.5, 0.10 + pulse);
+    float vign = 1.0 - 0.35 * dot(i.uv - 0.5, i.uv - 0.5);
+    return float4(base * vign, 1.0);
+}
+`
+	pso, err := h.CompileGraphicsPSO(hlslSrc, "VSMain", hlslSrc, "PSMain", nil)
+	if err != nil {
+		slog.Warn("Host D3D12 PSO de repli échoué", "err", err)
+		return
+	}
 	h.ReplayPSO = pso
-	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS DXBC)", "rootSig", fmt.Sprintf("0x%X", rootSig), "pso", fmt.Sprintf("0x%X", pso))
+	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS DXBC, b0+t0+s0)", "rootSig", fmt.Sprintf("0x%X", rootSig), "pso", fmt.Sprintf("0x%X", pso))
 }
