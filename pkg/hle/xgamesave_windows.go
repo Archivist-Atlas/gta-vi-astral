@@ -3,6 +3,7 @@
 package hle
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/gpu"
@@ -64,12 +66,27 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 	}
 	gs.nextHandle.Store(0x00005A7E00000001)
 
+	gdkTrace := os.Getenv("ASTRAL_GDK_TRACE") == "1"
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
+	traceSlot := func(name string, fn uintptr) uintptr {
+		if !gdkTrace {
+			return fn
+		}
+		return syscall.NewCallback(func(a0, a1, a2, a3, a4, a5 uintptr) uintptr {
+			slog.Info("GDK_TRACE xgamesave", "op", name, "a1", fmt.Sprintf("0x%X", a1), "a2", fmt.Sprintf("0x%X", a2))
+			r, _, _ := syscall.SyscallN(fn, a0, a1, a2, a3, a4, a5)
+			return r
+		})
+	}
+	_ = traceSlot
 	completeAsync := func(asyncBlock uintptr) {
 		if asyncBlock >= 0x10000 {
 			cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
 			if cb >= 0x10000 && cb < 0x800000000000 {
-				_, _, _ = syscall.SyscallN(cb, asyncBlock)
+				go func() {
+					time.Sleep(5 * time.Millisecond)
+					_, _, _ = syscall.SyscallN(cb, asyncBlock)
+				}()
 			}
 		}
 	}
@@ -118,12 +135,12 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 			return hresultOK
 		}),
 		12: cbOK, // 0x60 XGameSaveDeleteContainerResult
-		13: syscall.NewCallback(func(this, prov, namePtr, ctx, cb uintptr) uintptr { // 0x68 XGameSaveGetContainerInfo
+		13: traceSlot("GetContainerInfo", syscall.NewCallback(func(this, prov, namePtr, ctx, cb uintptr) uintptr { // 0x68 XGameSaveGetContainerInfo
 			return 0x80830008 // E_GS_BLOB_NOT_FOUND / container non encore créé
-		}),
-		14: cbOK, // 0x70 XGameSaveEnumerateContainerInfo
-		15: cbOK, // 0x78 XGameSaveEnumerateContainerInfoByName
-		16: syscall.NewCallback(func(this, prov, namePtr, outCont uintptr) uintptr { // 0x80 XGameSaveCreateContainer
+		})),
+		14: traceSlot("EnumerateContainerInfo", cbOK),       // 0x70 XGameSaveEnumerateContainerInfo
+		15: traceSlot("EnumerateContainerInfoByName", cbOK), // 0x78 XGameSaveEnumerateContainerInfoByName
+		16: traceSlot("CreateContainer", syscall.NewCallback(func(this, prov, namePtr, outCont uintptr) uintptr { // 0x80 XGameSaveCreateContainer
 			name := sanitizeSaveName(readSaveCStr(namePtr))
 			dir := filepath.Join(gs.rootDir, name)
 			_ = os.MkdirAll(dir, 0o755)
@@ -135,27 +152,27 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 				*(*uintptr)(osPtr(outCont)) = h
 			}
 			return hresultOK
-		}),
-		17: syscall.NewCallback(func(this, cont uintptr) uintptr { // 0x88 XGameSaveCloseContainer
+		})),
+		17: traceSlot("CloseContainer", syscall.NewCallback(func(this, cont uintptr) uintptr { // 0x88 XGameSaveCloseContainer
 			gs.mu.Lock()
 			delete(gs.containers, cont)
 			gs.mu.Unlock()
 			return hresultOK
-		}),
-		18: cbOK, // 0x90 XGameSaveEnumerateBlobInfo
-		19: cbOK, // 0x98 XGameSaveEnumerateBlobInfoByName
-		20: cbOK, // 0xA0 XGameSaveReadBlobData
-		21: syscall.NewCallback(func(this, cont, blobNames, count, asyncBlock uintptr) uintptr { // 0xA8 XGameSaveReadBlobDataAsync
+		})),
+		18: traceSlot("EnumerateBlobInfo", cbOK),       // 0x90 XGameSaveEnumerateBlobInfo
+		19: traceSlot("EnumerateBlobInfoByName", cbOK), // 0x98 XGameSaveEnumerateBlobInfoByName
+		20: traceSlot("ReadBlobData", cbOK),            // 0xA0 XGameSaveReadBlobData
+		21: traceSlot("ReadBlobDataAsync", syscall.NewCallback(func(this, cont, blobNames, count, asyncBlock uintptr) uintptr { // 0xA8 XGameSaveReadBlobDataAsync
 			completeAsync(asyncBlock)
 			return hresultOK
-		}),
-		22: syscall.NewCallback(func(this, asyncBlock, blobsSize, blobsBuf, outCount uintptr) uintptr { // 0xB0 XGameSaveReadBlobDataResult
+		})),
+		22: traceSlot("ReadBlobDataResult", syscall.NewCallback(func(this, asyncBlock, blobsSize, blobsBuf, outCount uintptr) uintptr { // 0xB0 XGameSaveReadBlobDataResult
 			if outCount >= 0x10000 {
 				*(*uint32)(osPtr(outCount)) = 0
 			}
 			return hresultOK
-		}),
-		23: syscall.NewCallback(func(this, cont, displayNamePtr, outUpd uintptr) uintptr { // 0xB8 XGameSaveCreateUpdate
+		})),
+		23: traceSlot("CreateUpdate", syscall.NewCallback(func(this, cont, displayNamePtr, outUpd uintptr) uintptr { // 0xB8 XGameSaveCreateUpdate
 			gs.mu.Lock()
 			dir := gs.containers[cont]
 			if dir == "" {
@@ -169,14 +186,14 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 				*(*uintptr)(osPtr(outUpd)) = h
 			}
 			return hresultOK
-		}),
-		24: syscall.NewCallback(func(this, upd uintptr) uintptr { // 0xC0 XGameSaveCloseUpdate
+		})),
+		24: traceSlot("CloseUpdate", syscall.NewCallback(func(this, upd uintptr) uintptr { // 0xC0 XGameSaveCloseUpdate
 			gs.mu.Lock()
 			delete(gs.updates, upd)
 			gs.mu.Unlock()
 			return hresultOK
-		}),
-		25: syscall.NewCallback(func(this, upd, blobNamePtr, dataPtr, byteCount uintptr) uintptr { // 0xC8 XGameSaveSubmitBlobWrite
+		})),
+		25: traceSlot("SubmitBlobWrite", syscall.NewCallback(func(this, upd, blobNamePtr, dataPtr, byteCount uintptr) uintptr { // 0xC8 XGameSaveSubmitBlobWrite
 			gs.mu.Lock()
 			dir := gs.updates[upd]
 			gs.mu.Unlock()
@@ -186,13 +203,13 @@ func newXGameSaveProvider(vfs *VirtualFS) uintptr {
 				_ = os.WriteFile(filepath.Join(dir, bname+".bin"), data, 0o644)
 			}
 			return hresultOK
-		}),
-		26: cbOK, // 0xD0 XGameSaveSubmitBlobDelete
-		27: cbOK, // 0xD8 XGameSaveSubmitUpdate
-		28: syscall.NewCallback(func(this, upd, asyncBlock uintptr) uintptr { // 0xE0 XGameSaveSubmitUpdateAsync
+		})),
+		26: traceSlot("SubmitBlobDelete", cbOK), // 0xD0 XGameSaveSubmitBlobDelete
+		27: traceSlot("SubmitUpdate", cbOK),     // 0xD8 XGameSaveSubmitUpdate
+		28: traceSlot("SubmitUpdateAsync", syscall.NewCallback(func(this, upd, asyncBlock uintptr) uintptr { // 0xE0 XGameSaveSubmitUpdateAsync
 			completeAsync(asyncBlock)
 			return hresultOK
-		}),
-		29: cbOK, // 0xE8 XGameSaveSubmitUpdateResult
+		})),
+		29: traceSlot("SubmitUpdateResult", cbOK), // 0xE8 XGameSaveSubmitUpdateResult
 	})
 }

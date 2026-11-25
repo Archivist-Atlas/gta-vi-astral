@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/core"
@@ -526,11 +527,145 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		return hresultOK
 	}
 
+	type tqTask struct {
+		ctx uintptr
+		cb  uintptr
+	}
+	type tqQueue struct {
+		workMode uint32
+		compMode uint32
+		mu       sync.Mutex
+		workQ    []tqTask
+		compQ    []tqTask
+	}
+	var (
+		tqMu            sync.Mutex
+		tqQueues        = map[uintptr]*tqQueue{}
+		processTQHandle = uintptr(0x00007A5C00000001)
+	)
+	tqQueues[processTQHandle] = &tqQueue{workMode: 1 /* ThreadPool */, compMode: 1 /* ThreadPool */}
+
+	getOrCreateTQ := func(h uintptr) *tqQueue {
+		if h == 0 {
+			h = processTQHandle
+		}
+		tqMu.Lock()
+		q := tqQueues[h]
+		if q == nil {
+			q = &tqQueue{workMode: 1, compMode: 1}
+			tqQueues[h] = q
+		}
+		tqMu.Unlock()
+		return q
+	}
 	cbTaskQueueCreate := syscall.NewCallback(func(this, workMode, compMode, outPtr uintptr) uintptr {
-		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = uintptr(nextHandle.Add(1))
+		h := uintptr(nextHandle.Add(1))
+		tqMu.Lock()
+		tqQueues[h] = &tqQueue{workMode: uint32(workMode), compMode: uint32(compMode)}
+		tqMu.Unlock()
+		if outPtr >= 0x10000 {
+			*(*uintptr)(osPtr(outPtr)) = h
 		}
 		return hresultOK
+	})
+	cbTaskQueueGetPort := syscall.NewCallback(func(this, q, port, outPort uintptr) uintptr {
+		if q == 0 {
+			q = processTQHandle
+		}
+		if outPort >= 0x10000 {
+			*(*uintptr)(osPtr(outPort)) = (q << 1) | (port & 1)
+		}
+		return hresultOK
+	})
+	cbTaskQueueDuplicate := syscall.NewCallback(func(this, q, outPtr uintptr) uintptr {
+		if q == 0 {
+			q = processTQHandle
+		}
+		if outPtr >= 0x10000 {
+			*(*uintptr)(osPtr(outPtr)) = q
+		}
+		return hresultOK
+	})
+	cbTaskQueueDispatch := syscall.NewCallback(func(this, qHandle, port, timeoutMs uintptr) uintptr {
+		q := getOrCreateTQ(qHandle)
+		q.mu.Lock()
+		var item tqTask
+		var ok bool
+		if uint32(port) == 0 {
+			if len(q.workQ) > 0 {
+				item, q.workQ, ok = q.workQ[0], q.workQ[1:], true
+			}
+		} else {
+			if len(q.compQ) > 0 {
+				item, q.compQ, ok = q.compQ[0], q.compQ[1:], true
+			}
+		}
+		q.mu.Unlock()
+		if ok && item.cb >= 0x10000 && item.cb < 0x800000000000 {
+			_, _, _ = syscall.SyscallN(item.cb, item.ctx, 0)
+			return 1
+		}
+		return 0
+	})
+	submitTQ := func(qHandle, port, ctx, cb uintptr) uintptr {
+		if cb < 0x10000 || cb >= 0x800000000000 {
+			return hresultOK
+		}
+		q := getOrCreateTQ(qHandle)
+		mode := q.compMode
+		if uint32(port) == 0 {
+			mode = q.workMode
+		}
+		if mode == 0 { // Manual -> mis en file pour XTaskQueueDispatch
+			q.mu.Lock()
+			if uint32(port) == 0 {
+				q.workQ = append(q.workQ, tqTask{ctx: ctx, cb: cb})
+			} else {
+				q.compQ = append(q.compQ, tqTask{ctx: ctx, cb: cb})
+			}
+			q.mu.Unlock()
+			return hresultOK
+		}
+		if mode == 3 { // Immediate
+			_, _, _ = syscall.SyscallN(cb, ctx, 0)
+			return hresultOK
+		}
+		go func() {
+			_, _, _ = syscall.SyscallN(cb, ctx, 0)
+		}()
+		return hresultOK
+	}
+	cbTaskQueueSubmit := syscall.NewCallback(func(this, qHandle, port, ctx, cb uintptr) uintptr {
+		return submitTQ(qHandle, port, ctx, cb)
+	})
+	cbTaskQueueSubmitDelayed := syscall.NewCallback(func(this, qHandle, port, delayMs, ctx, cb uintptr) uintptr {
+		d := time.Duration(uint32(delayMs)) * time.Millisecond
+		if d == 0 {
+			return submitTQ(qHandle, port, ctx, cb)
+		}
+		go func() {
+			time.Sleep(d)
+			submitTQ(qHandle, port, ctx, cb)
+		}()
+		return hresultOK
+	})
+	cbTaskQueueTerminate := syscall.NewCallback(func(this, qHandle, wait, ctx, cb uintptr) uintptr {
+		if cb >= 0x10000 && cb < 0x800000000000 {
+			_, _, _ = syscall.SyscallN(cb, ctx)
+		}
+		return hresultOK
+	})
+	cbTaskQueueGetProcess := syscall.NewCallback(func(this, outPtr uintptr) uintptr {
+		if outPtr >= 0x10000 {
+			*(*uintptr)(osPtr(outPtr)) = processTQHandle
+		}
+		return 1 // bool true
+	})
+	cbTaskQueueSetProcess := syscall.NewCallback(func(this, qHandle uintptr) uintptr {
+		if qHandle != 0 {
+			processTQHandle = qHandle
+		}
+		return 0
 	})
 	cbRegisterToken5 := syscall.NewCallback(func(this, a1, a2, a3, outToken uintptr) uintptr {
 		if outToken != 0 {
@@ -602,27 +737,34 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 	}
 
 	gdkProviders := map[string]uintptr{
-		"{073B7DCB-1FCF-4030-94BE-E3C9EB623428}": NewCOMObject("xasync", 64, map[int]uintptr{
-			3:  cbGISuccess,       // 0x18 XAsyncGetStatus -> S_OK
-			4:  syscall.NewCallback(func(this, block, outSize uintptr) uintptr { // 0x20 XAsyncGetResultSize
+		"{073B7DCB-1FCF-4030-94BE-E3C9EB623428}": NewCOMObject("xasync", 32, map[int]uintptr{
+			3: cbGISuccess, // 0x18 XAsyncGetStatus -> S_OK
+			4: syscall.NewCallback(func(this, block, outSize uintptr) uintptr { // 0x20 XAsyncGetResultSize
 				if outSize >= 0x10000 {
 					*(*uintptr)(osPtr(outSize)) = 0
 				}
 				return hresultOK
 			}),
-			5:  cbGISuccess,       // 0x28 XAsyncCancel
-			6:  cbGISuccess,       // 0x30 XAsyncWait / XAsyncBegin (déjà complété)
-			12: cbTaskQueueCreate, // 0x60 XTaskQueueCreate
-			13: cbTaskQueueCreate, // 0x68 XTaskQueueCreateComposite
-			14: syscall.NewCallback(func(this, q, outPtr uintptr) uintptr { // 0x70 XTaskQueueDuplicateHandle
-				if outPtr != 0 {
-					*(*uintptr)(osPtr(outPtr)) = q
-				}
-				return hresultOK
-			}),
-			15: cbGISuccess, // 0x78 XTaskQueueCloseHandle
-			25: cbGISuccess, // 0xC8 XTaskQueueTerminate
-			29: cbGISuccess, // 0xE8 CheckThread
+			5:  cbGISuccess,              // 0x28 XAsyncCancel
+			6:  cbGISuccess,              // 0x30 XAsyncRun
+			7:  cbGISuccess,              // 0x38 XAsyncBegin
+			9:  cbGISuccess,              // 0x48 XAsyncSchedule
+			10: cbGISuccess,              // 0x50 XAsyncComplete
+			11: cbGISuccess,              // 0x58 XAsyncGetResult
+			12: cbTaskQueueCreate,        // 0x60 XTaskQueueCreate
+			13: cbTaskQueueCreate,        // 0x68 XTaskQueueCreateComposite
+			14: cbTaskQueueGetPort,       // 0x70 XTaskQueueGetPort
+			15: cbTaskQueueDuplicate,     // 0x78 XTaskQueueDuplicateHandle
+			16: cbTaskQueueDispatch,      // 0x80 XTaskQueueDispatch
+			17: cbGISuccess,              // 0x88 XTaskQueueCloseHandle
+			18: cbTaskQueueSubmit,        // 0x90 XTaskQueueSubmitCallback
+			19: cbTaskQueueSubmitDelayed, // 0x98 XTaskQueueSubmitDelayedCallback
+			22: cbTaskQueueTerminate,     // 0xB0 XTaskQueueTerminate
+			23: cbRegisterToken5,         // 0xB8 XTaskQueueRegisterMonitor
+			24: cbGISuccess,              // 0xC0 XTaskQueueUnregisterMonitor
+			25: cbTaskQueueGetProcess,    // 0xC8 XTaskQueueGetCurrentProcessTaskQueue
+			26: cbTaskQueueSetProcess,    // 0xD0 XTaskQueueSetCurrentProcessTaskQueue
+			29: cbGISuccess,              // 0xE8 XTaskQueueCheckThread
 		}),
 		"{37E56907-2F10-41E8-B72F-36EDB185331A}": NewCOMObject("xnetworking", 64, map[int]uintptr{
 			15: cbNetConnectivityHint, // 0x78 GetConnectivityHint
@@ -737,10 +879,26 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 				}
 				return hresultOK
 			}),
-			21: cbCompleteAsync5, // XUserResolvePrivilegeWithUiAsync
-			22: cbGISuccess,      // XUserResolvePrivilegeWithUiResult
-			29: cbCompleteAsync4, // XUserResolveIssueWithUiAsync
-			30: cbGISuccess,      // XUserResolveIssueWithUiResult
+			21: cbCompleteAsync5, // 0xA8 XUserResolvePrivilegeWithUiAsync
+			22: cbGISuccess,      // 0xB0 XUserResolvePrivilegeWithUiResult
+			23: syscall.NewCallback(func(this, user, opts, method, url, hdrCount, hdrs, bodySz, body, asyncBlock uintptr) uintptr { // 0xB8 XUserGetTokenAndSignatureAsync (hors-ligne)
+				if asyncBlock >= 0x10000 {
+					cb := *(*uintptr)(osPtr(asyncBlock + 0x10))
+					if cb >= 0x10000 && cb < 0x800000000000 {
+						_, _, _ = syscall.SyscallN(cb, asyncBlock)
+					}
+				}
+				return hresultOK
+			}),
+			24: syscall.NewCallback(func(this, asyncBlock, outSize uintptr) uintptr { // 0xC0 XUserGetTokenAndSignatureResultSize
+				if outSize >= 0x10000 {
+					*(*uintptr)(osPtr(outSize)) = 0
+				}
+				return 0x89245102 // E_GAMEUSER_FAILED_TO_GET_TOKEN (hors-ligne)
+			}),
+			25: syscall.NewCallback(func() uintptr { return 0x89245102 }), // 0xC8 XUserGetTokenAndSignatureResult
+			29: cbCompleteAsync4,                                          // 0xE8 XUserResolveIssueWithUiAsync
+			30: cbGISuccess,                                               // 0xF0 XUserResolveIssueWithUiResult
 			33: cbRegisterToken5, // 0x108 XUserRegisterForChangeEvent
 			34: cbReturnTrue,     // 0x110 XUserUnregisterForChangeEvent
 		}),

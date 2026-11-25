@@ -39,22 +39,105 @@ func DXGIFormatMetrics(dxgiFmt uint32) (bpe uint32, block uint32, hostFmt uint32
 	}
 }
 
-// morton2D entrelace les bits bas de (x, y) pour l'adressage micro-tuile Z-order RDNA2.
-func morton2D(x, y uint32) uint32 {
-	x = (x | (x << 8)) & 0x00FF00FF
-	x = (x | (x << 4)) & 0x0F0F0F0F
-	x = (x | (x << 2)) & 0x33333333
-	x = (x | (x << 1)) & 0x55555555
-
-	y = (y | (y << 8)) & 0x00FF00FF
-	y = (y | (y << 4)) & 0x0F0F0F0F
-	y = (y | (y << 2)) & 0x33333333
-	y = (y | (y << 1)) & 0x55555555
-
-	return x | (y << 1)
+// microTilePatterns reprend les équations micro-tuile 256 octets GFX10/RDNA2 (addrlib RBPLUS)
+// indexées par [kind: 0=SW_S, 1=SW_D][log2(bpe): 0..4 (1B..16B)].
+// Chaque paire de caractères donne l'axe et le bit de coordonnée pour les bits d'adresse 0..7.
+var microTilePatterns = [2][5]string{
+	{ // Thin Standard Swizzle (SW_*_S : 1=256B_S, 5=4KB_S, 9=64KB_S, 21=4KB_S_X, 25=64KB_S_X)
+		"x0x1x2x3y0y1y2y3", // 1 BPP
+		"--x0x1x2y0y1y2x3", // 2 BPP
+		"----x0x1y0y1y2x2", // 4 BPP (RGBA8)
+		"------x0y0y1x1x2", // 8 BPP (BC1/BC4)
+		"--------y0y1x0x1", // 16 BPP (BC2/BC3/BC5/BC6H/BC7)
+	},
+	{ // Thin Display Swizzle (SW_*_D : 2=256B_D, 6=4KB_D, 10=64KB_D, 22=4KB_D_X, 26=64KB_D_X)
+		"x0x1x2y1y0y2x3y3", // 1 BPP
+		"--x0x1x2y0y1y2x3", // 2 BPP
+		"----x0x1y0y1x2y2", // 4 BPP
+		"------x0y0x1x2y1", // 8 BPP
+		"--------x0y0x1y1", // 16 BPP
+	},
 }
 
-// DetileRDNA2 convertit une texture 2D Xbox Series (linéaire ou tuilée RDNA2 SW_4KB_S / SW_64KB_*)
+func rdna2SwizzleInfo(swz uint32) (kind int, blockLog2 uint32, tiled bool) {
+	switch swz & 0xFF {
+	case 0:
+		return 0, 0, false // LINEAR
+	case 1:
+		return 0, 8, true // SW_256B_S
+	case 2, 3:
+		return 1, 8, true // SW_256B_D / R
+	case 5, 21:
+		return 0, 12, true // SW_4KB_S / SW_4KB_S_X
+	case 6, 7, 22, 23:
+		return 1, 12, true // SW_4KB_D / R
+	case 9, 25:
+		return 0, 16, true // SW_64KB_S / SW_64KB_S_X
+	case 10, 11, 26, 27:
+		return 1, 16, true // SW_64KB_D / R
+	default:
+		if swz&0xFF >= 9 {
+			return 0, 16, true
+		}
+		return 0, 12, true
+	}
+}
+
+func buildAxisLUT(kind int, bpeLog2, blockLog2 uint32) (xLUT, yLUT []uint32, tileW, tileH uint32) {
+	pat := microTilePatterns[kind][bpeLog2]
+	var xBits, yBits []uint32
+	for bit := uint32(0); bit < 8; bit++ {
+		ax := pat[2*bit]
+		if ax != 'x' && ax != 'y' {
+			continue
+		}
+		idx := int(pat[2*bit+1] - '0')
+		if ax == 'x' {
+			for len(xBits) <= idx {
+				xBits = append(xBits, 0)
+			}
+			xBits[idx] = bit
+		} else {
+			for len(yBits) <= idx {
+				yBits = append(yBits, 0)
+			}
+			yBits[idx] = bit
+		}
+	}
+	// Au-delà des 256 octets de micro-tuile, GFX10 alterne Y puis X jusqu'à blockLog2
+	for bit := uint32(8); bit < blockLog2; bit++ {
+		if (bit-8)%2 == 0 {
+			yBits = append(yBits, bit)
+		} else {
+			xBits = append(xBits, bit)
+		}
+	}
+	tileW = 1 << len(xBits)
+	tileH = 1 << len(yBits)
+	xLUT = make([]uint32, tileW)
+	for c := uint32(0); c < tileW; c++ {
+		var off uint32
+		for i, to := range xBits {
+			if (c>>uint(i))&1 != 0 {
+				off |= 1 << to
+			}
+		}
+		xLUT[c] = off
+	}
+	yLUT = make([]uint32, tileH)
+	for c := uint32(0); c < tileH; c++ {
+		var off uint32
+		for i, to := range yBits {
+			if (c>>uint(i))&1 != 0 {
+				off |= 1 << to
+			}
+		}
+		yLUT[c] = off
+	}
+	return xLUT, yLUT, tileW, tileH
+}
+
+// DetileRDNA2 convertit une texture 2D Xbox Series (linéaire ou tuilée RDNA2 SW_256B/4KB/64KB S/D)
 // en disposition linéaire rangée par rangée prête pour CopyTextureRegion sur le GPU hôte.
 func DetileRDNA2(src []byte, width, height, bpe, block, swizzle uint32) []byte {
 	if width == 0 || height == 0 || bpe == 0 || block == 0 {
@@ -69,42 +152,29 @@ func DetileRDNA2(src []byte, width, height, bpe, block, swizzle uint32) []byte {
 	}
 	dst := make([]byte, totalBytes)
 
-	swz := swizzle & 0xFF
-	// Mode linéaire (0) ou petite texture (< 16 blocs) : copie directe
-	if swz == 0 || (bw <= 4 && bh <= 4) {
+	kind, blockLog2, tiled := rdna2SwizzleInfo(swizzle)
+	if !tiled {
 		copy(dst, src)
 		return dst
 	}
-
-	// Dimensions d'une tuile en blocs selon le mode RDNA2 (4 KiB vs 64 KiB)
-	tileBytes := uint32(4096)
-	if swz >= 9 {
-		tileBytes = 65536
+	var bpeLog2 uint32
+	for (uint32(1) << bpeLog2) < bpe && bpeLog2 < 4 {
+		bpeLog2++
 	}
-	elemsPerTile := tileBytes / bpe
-	tileW := uint32(1)
-	tileH := uint32(1)
-	for tileW*tileH < elemsPerTile {
-		if tileW <= tileH {
-			tileW <<= 1
-		} else {
-			tileH <<= 1
-		}
-	}
+	xLUT, yLUT, tileW, tileH := buildAxisLUT(kind, bpeLog2, blockLog2)
+	tileBytes := uint64(1) << blockLog2
 	tilesX := (bw + tileW - 1) / tileW
 	tileMaskX := tileW - 1
 	tileMaskY := tileH - 1
 
 	for by := uint32(0); by < bh; by++ {
 		ty := by / tileH
-		ly := by & tileMaskY
+		yOff := uint64(yLUT[by&tileMaskY])
 		dstRowOff := uint64(by) * uint64(linearRow)
 		for bx := uint32(0); bx < bw; bx++ {
 			tx := bx / tileW
-			lx := bx & tileMaskX
 			tileIdx := uint64(ty)*uint64(tilesX) + uint64(tx)
-			localIdx := uint64(morton2D(lx, ly))
-			srcOff := (tileIdx*uint64(elemsPerTile) + localIdx) * uint64(bpe)
+			srcOff := tileIdx*tileBytes + yOff + uint64(xLUT[bx&tileMaskX])
 			dstOff := dstRowOff + uint64(bx)*uint64(bpe)
 			if srcOff+uint64(bpe) <= uint64(len(src)) && dstOff+uint64(bpe) <= totalBytes {
 				copy(dst[dstOff:dstOff+uint64(bpe)], src[srcOff:srcOff+uint64(bpe)])

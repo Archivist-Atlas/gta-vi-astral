@@ -193,7 +193,23 @@ func bindAcpHal(t *LiveTable) {
 	}
 
 	// --- xapu.dll (décodeur audio matériel Xbox Series) ---
-	var nextXApuHandle atomic.Uint64
+	type xapuResult struct {
+		id  [24]byte // CommandId : { kind u32, stream u32, sequence u32, options u32, context u64 }
+		hr  uint32
+		pad uint32
+	}
+	type xapuConn struct {
+		mu      sync.Mutex
+		readyEv uintptr
+		results []xapuResult
+	}
+	var (
+		nextXApuHandle atomic.Uint64
+		xapuMu         sync.Mutex
+		xapuConns      = map[uintptr]*xapuConn{}
+		xapuEnqLogged  atomic.Bool
+		xdspActLogged  atomic.Bool
+	)
 	nextXApuHandle.Store(0x880000)
 
 	cbXApuConnect := syscall.NewCallback(func(inPtr, outPtr, handleOut uintptr) uintptr {
@@ -216,18 +232,71 @@ func bindAcpHal(t *LiveTable) {
 		*(*uintptr)(osPtr(outPtr + 0)) = dataMem
 		*(*uintptr)(osPtr(outPtr + 8)) = readyEv
 		h := uintptr(nextXApuHandle.Add(1))
+		xapuMu.Lock()
+		xapuConns[h] = &xapuConn{readyEv: readyEv}
+		xapuMu.Unlock()
 		*(*uintptr)(osPtr(handleOut)) = h
 		slog.Info("xapu!XApuConnect", "streams", streams, "dataBytes", dataBytes, "handle", h)
 		return hresultOK
 	})
-	cbXApuGetResultCount := syscall.NewCallback(func(handle, totalPtr uintptr) uintptr {
-		if totalPtr != 0 {
-			*(*uint32)(osPtr(totalPtr)) = 0
+	cbXApuEnqueue := syscall.NewCallback(func(handle, cmdPtr, cmdSize uintptr) uintptr {
+		if xapuEnqLogged.CompareAndSwap(false, true) {
+			slog.Info("xapu!XApuEnqueueCommand actif", "handle", handle, "cmdSize", uint32(cmdSize))
 		}
-		return 0
+		xapuMu.Lock()
+		c := xapuConns[handle]
+		xapuMu.Unlock()
+		if c != nil && cmdPtr >= 0x10000 && uint32(cmdSize) >= 24 {
+			var res xapuResult
+			copy(res.id[:], unsafe.Slice((*byte)(osPtr(cmdPtr)), 24))
+			res.hr = 0 // S_OK
+			opts := *(*uint32)(osPtr(cmdPtr + 12))
+			c.mu.Lock()
+			c.results = append(c.results, res)
+			c.mu.Unlock()
+			if opts&1 != 0 && c.readyEv != 0 {
+				_, _, _ = k32SetEvent.Call(c.readyEv)
+			}
+		}
+		return hresultOK
+	})
+	cbXApuGetResultCount := syscall.NewCallback(func(handle, totalPtr uintptr) uintptr {
+		var n uint32
+		xapuMu.Lock()
+		c := xapuConns[handle]
+		xapuMu.Unlock()
+		if c != nil {
+			c.mu.Lock()
+			n = uint32(len(c.results))
+			c.mu.Unlock()
+		}
+		if totalPtr != 0 {
+			*(*uint32)(osPtr(totalPtr)) = n
+		}
+		return hresultOK
 	})
 	cbXApuDequeueResult := syscall.NewCallback(func(handle, resPtr uintptr) uintptr {
-		return 0x8000000A // E_PENDING (aucun résultat en attente)
+		xapuMu.Lock()
+		c := xapuConns[handle]
+		xapuMu.Unlock()
+		if c == nil {
+			return 0x8AC81001 // XAPU_E_PENDING_RESULTS
+		}
+		c.mu.Lock()
+		if len(c.results) == 0 {
+			c.mu.Unlock()
+			return 0x8AC81001 // XAPU_E_PENDING_RESULTS
+		}
+		res := c.results[0]
+		c.results = c.results[1:]
+		c.mu.Unlock()
+		if resPtr >= 0x10000 {
+			// XApuResult : CommandId (24B) + HRESULT (4B) + outputFrames/pad
+			dst := unsafe.Slice((*byte)(osPtr(resPtr)), 32)
+			clear(dst)
+			copy(dst[:24], res.id[:])
+		}
+		return hresultOK
 	})
 	cbXApuGetUtilization := syscall.NewCallback(func(a, b, outPtr uintptr) uintptr {
 		if outPtr != 0 {
@@ -237,12 +306,19 @@ func bindAcpHal(t *LiveTable) {
 	})
 	t.bind("xapu.dll", "XApuConnect", cbXApuConnect)
 	t.bind("xapu.dll", "XApuDisconnect", cbOK)
-	t.bind("xapu.dll", "XApuEnqueueCommand", cbOK)
+	t.bind("xapu.dll", "XApuEnqueueCommand", cbXApuEnqueue)
 	t.bind("xapu.dll", "XApuDequeueResult", cbXApuDequeueResult)
 	t.bind("xapu.dll", "XApuGetResultCount", cbXApuGetResultCount)
 	t.bind("xapu.dll", "XApuGetUtilization", cbXApuGetUtilization)
 
 	// --- chad.dll (XDsp processeur audio DSP console) ---
+	type xdspStream struct {
+		statusPtr uintptr // { submitted u32, completed u32, reserved u32, result i32 }
+	}
+	var (
+		xdspMu      sync.Mutex
+		xdspStreams = map[uintptr]*xdspStream{}
+	)
 	cbXDspConnect := syscall.NewCallback(func(a, b, c, streams, flags, handleOut uintptr) uintptr {
 		if handleOut == 0 {
 			return hresultInvalidArg
@@ -252,9 +328,38 @@ func bindAcpHal(t *LiveTable) {
 		slog.Info("chad!XDspConnectWithMaximumStreamLimit", "streams", uint32(streams), "handle", h)
 		return hresultOK
 	})
+	cbXDspActivate := syscall.NewCallback(func(dsp, descPtr, statusOut, streamOut uintptr) uintptr {
+		if xdspActLogged.CompareAndSwap(false, true) {
+			slog.Info("chad!XDspActivate actif", "dsp", dsp)
+		}
+		stMem, _, _ := k32VirtualAlloc.Call(0, 64, 0x3000, 0x04)
+		h := uintptr(nextXApuHandle.Add(1))
+		xdspMu.Lock()
+		xdspStreams[h] = &xdspStream{statusPtr: stMem}
+		xdspMu.Unlock()
+		if statusOut >= 0x10000 {
+			*(*uintptr)(osPtr(statusOut)) = stMem
+		}
+		if streamOut >= 0x10000 {
+			*(*uintptr)(osPtr(streamOut)) = h
+		}
+		return hresultOK
+	})
+	cbXDspSubmit := syscall.NewCallback(func(stream, cmdPtr uintptr) uintptr {
+		xdspMu.Lock()
+		s := xdspStreams[stream]
+		xdspMu.Unlock()
+		if s != nil && s.statusPtr >= 0x10000 {
+			words := unsafe.Slice((*uint32)(osPtr(s.statusPtr)), 4)
+			words[0]++
+			words[1] = words[0] // completed == submitted
+			words[3] = 0        // S_OK
+		}
+		return hresultOK
+	})
 	t.bind("chad.dll", "XDspConnectWithMaximumStreamLimit", cbXDspConnect)
 	t.bind("chad.dll", "XDspDisconnect", cbOK)
-	t.bind("chad.dll", "XDspActivate", cbOK)
+	t.bind("chad.dll", "XDspActivate", cbXDspActivate)
 	t.bind("chad.dll", "XDspDeactivate", cbOK)
-	t.bind("chad.dll", "XDspSubmitCommand", cbOK)
+	t.bind("chad.dll", "XDspSubmitCommand", cbXDspSubmit)
 }

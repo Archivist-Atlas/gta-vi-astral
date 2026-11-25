@@ -910,6 +910,24 @@ func newD3D12XDevice() uintptr {
 		st.mu.Unlock()
 		return 0
 	})
+	cbListWrite32 := syscall.NewCallback(func(this, addr, val, flush, flags uintptr) uintptr {
+		listSlotHits[71].Add(1)
+		if addr >= 0x10000 && addr < 0x800000000000 {
+			atomic.StoreUint32((*uint32)(osPtr(addr)), uint32(val))
+		}
+		return 0
+	})
+	cbListWrite64 := syscall.NewCallback(func(this, addr, val, flush, flags uintptr) uintptr {
+		listSlotHits[72].Add(1)
+		if addr >= 0x10000 && addr < 0x800000000000 {
+			v := uint64(val)
+			if uint32(flags) == 1 || uint32(flags) == 2 { // GPU_TIMESTAMP / SYSTEM_TIMESTAMP
+				v = uint64(time.Now().UnixNano() / 100) // ticks 10 MHz
+			}
+			atomic.StoreUint64((*uint64)(osPtr(addr)), v)
+		}
+		return 0
+	})
 	cmdListSlots[12] = cbListDrawInst     // DrawInstanced
 	cmdListSlots[13] = cbListDrawIdx      // DrawIndexedInstanced
 	cmdListSlots[14] = cbListDispatch     // Dispatch
@@ -922,8 +940,12 @@ func newD3D12XDevice() uintptr {
 	cmdListSlots[48] = cbListSetVB        // IASetVertexBuffers (Xbox #48 = PC #44)
 	cmdListSlots[50] = cbListSetRTVs      // OMSetRenderTargets (Xbox #50 = PC #46)
 	cmdListSlots[52] = cbListClearRTV     // ClearRenderTargetView (Xbox slot 52 = PC slot 48)
-	cmdListSlots[60] = cbListCopyMem      // CopyMemoryToMemoryX (0x1E0)
-	cmdListSlots[78] = cbListDispatch     // DispatchX (0x270)
+	cmdListSlots[60] = cbListCopyMem      // CopyMemoryToMemoryX (2020, 0x1E0)
+	cmdListSlots[62] = cbListCopyMem      // CopyMemoryToMemoryX (2026 +2, 0x1F0)
+	cmdListSlots[71] = cbListWrite32      // WriteValueBottomOfPipe 32-bit (2026 +2, 0x238)
+	cmdListSlots[72] = cbListWrite64      // WriteValueBottomOfPipe 64-bit / Timestamp (2026 +2, 0x240)
+	cmdListSlots[78] = cbListDispatch     // DispatchX (2020, 0x270)
+	cmdListSlots[80] = cbListDispatch     // DispatchX (2026 +2, 0x280)
 	cmdListSlots[81] = cbListDrawIdxX     // DrawIndexedX (0x288)
 	cmdListSlots[148] = cbListAllocUpload // AllocateUploadMemory (0x4A0)
 	cmdListProto := NewCOMObjectWithHeader("ID3D12GraphicsCommandListX", 160, 0x1000, cmdListSlots)
