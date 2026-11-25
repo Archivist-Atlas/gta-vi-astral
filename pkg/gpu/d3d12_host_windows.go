@@ -18,9 +18,21 @@ var (
 	modDXGIHost            = syscall.NewLazyDLL("dxgi.dll")
 	modK32Host             = syscall.NewLazyDLL("kernel32.dll")
 	procD3D12CreateDevice  = modD3D12Host.NewProc("D3D12CreateDevice")
+	procD3D12GetDebugIface = modD3D12Host.NewProc("D3D12GetDebugInterface")
 	procCreateDXGIFactory2 = modDXGIHost.NewProc("CreateDXGIFactory2")
 	procCreateEventW       = modK32Host.NewProc("CreateEventW")
 	procWaitForSingleObj   = modK32Host.NewProc("WaitForSingleObject")
+
+	// IID_ID3D12Debug = {344488b7-6846-474b-b989-f027448245e0}
+	guidID3D12Debug = [16]byte{
+		0xb7, 0x88, 0x44, 0x34, 0x46, 0x68, 0x4b, 0x47,
+		0xb9, 0x89, 0xf0, 0x27, 0x44, 0x82, 0x45, 0xe0,
+	}
+	// IID_ID3D12InfoQueue = {0742a90b-c387-483f-b946-30a7e4e61458}
+	guidID3D12InfoQueue = [16]byte{
+		0x0b, 0xa9, 0x42, 0x07, 0x87, 0xc3, 0x3f, 0x48,
+		0xb9, 0x46, 0x30, 0xa7, 0xe4, 0xe6, 0x14, 0x58,
+	}
 
 	// IID_ID3D12Device = {189819f1-1db6-4b57-be54-1821339b85f7}
 	guidID3D12Device = [16]byte{
@@ -115,7 +127,9 @@ type HostD3D12 struct {
 	SRVGPUStart   uintptr
 	SRVStride       uintptr
 	NextSRVSlot     uint32
+	NextRTVSlot     uint32
 	TexCache        map[uint64]*hostTexEntry
+	RTCache         map[uint64]*hostRTEntry
 	ReadbackBuf     uintptr
 	ReadbackPtr     uintptr
 	ReadbackPitch   uint32
@@ -231,6 +245,15 @@ func InitHostD3D12(hwnd uintptr, width, height uint32) (*HostD3D12, error) {
 		return nil, fmt.Errorf("dxgi.dll indisponible : %w", err)
 	}
 
+	if os.Getenv("ASTRAL_D3D12_DEBUG") == "1" && procD3D12GetDebugIface.Find() == nil {
+		var dbg uintptr
+		if hrDbg, _, _ := procD3D12GetDebugIface.Call(uintptr(unsafe.Pointer(&guidID3D12Debug[0])), uintptr(unsafe.Pointer(&dbg))); int32(hrDbg) >= 0 && dbg != 0 {
+			_ = comCall(dbg, 3) // EnableDebugLayer
+			_ = comCall(dbg, 2) // Release
+			slog.Info("Host D3D12 Debug Layer activé (ASTRAL_D3D12_DEBUG=1)")
+		}
+	}
+
 	var device uintptr
 	hr, _, _ := procD3D12CreateDevice.Call(
 		0,      // adaptateur par défaut
@@ -303,8 +326,8 @@ func (h *HostD3D12) initPresentPipeline() {
 	if h.Device == 0 || h.SwapChain3 == 0 {
 		return
 	}
-	// 1. Heap RTV (2 descripteurs pour le double-buffering)
-	rtvDesc := d3d12DescriptorHeapDesc{Type: 2 /* RTV */, NumDescriptors: 2}
+	// 1. Heap RTV (32 descripteurs : 0..1 = double-buffering SwapChain, 2..31 = RenderTargets offscreen)
+	rtvDesc := d3d12DescriptorHeapDesc{Type: 2 /* RTV */, NumDescriptors: 32}
 	if int32(comCall(h.Device, 14, uintptr(unsafe.Pointer(&rtvDesc)), uintptr(unsafe.Pointer(&guidID3D12DescriptorHeap[0])), uintptr(unsafe.Pointer(&h.RTVHeap)))) < 0 || h.RTVHeap == 0 {
 		return
 	}
@@ -421,8 +444,9 @@ func (h *HostD3D12) waitGPU() {
 }
 
 // PresentClear présente la trame courante en effaçant le backbuffer avec clearColor (RGBA),
-// en rejouant les Compute Dispatches + DrawInstanced hôtes (si présents), puis en appelant Present.
-func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32, dispatches []HostDispatchPass, draws ...HostDrawPass) {
+// en rejouant les Compute Dispatches + DrawInstanced hôtes (avec support des RenderTargets offscreen -> SRV),
+// puis en appelant Present.
+func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, presentVA uint64, srcRGBA []byte, srcW, srcH, srcPitch uint32, dispatches []HostDispatchPass, draws ...HostDrawPass) {
 	if h == nil || h.SwapChain == 0 {
 		return
 	}
@@ -533,12 +557,20 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 				}
 				total := uint32(len(draws))
 				hasRealPSO := false
+				hasPresentTarget := false
 				for _, d := range draws {
 					if d.HostPSO != 0 {
 						hasRealPSO = true
-						break
+					}
+					if presentVA != 0 && d.TargetVA == presentVA {
+						hasPresentTarget = true
 					}
 				}
+				// N'active les RenderTargets offscreen que si au moins un draw cible explicitement le backbuffer final (presentVA)
+				useOffscreenRT := presentVA != 0 && hasPresentTarget
+				clearedRT := make(map[uint64]bool)
+				curRTV := rtv
+				curTargetVA := uint64(0)
 				vbOff := uint64(0)
 				ibOff := uint64(0)
 				for idxPass, d := range draws {
@@ -552,6 +584,45 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 						}
 						pso = h.ReplayPSO
 					}
+					// 1. Sélection de la cible RTV (backbuffer ou RenderTarget offscreen)
+					wantRTV := rtv
+					wantTargetVA := uint64(0)
+					if useOffscreenRT && d.TargetVA != 0 && d.TargetVA != presentVA {
+						if rt := h.ensureHostRT(d.TargetVA); rt != nil {
+							if rt.state != 0x4 {
+								if h.SRVGPUStart != 0 {
+									_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart) // Détache le SRV avant transition -> RENDER_TARGET
+								}
+								br := d3d12ResourceBarrier{Resource: rt.res, Subresource: 0xFFFFFFFF, StateBefore: rt.state, StateAfter: 0x4 /* RENDER_TARGET */}
+								_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&br)))
+								rt.state = 0x4
+							}
+							if !clearedRT[d.TargetVA] {
+								zeroClr := [4]float32{0, 0, 0, 0}
+								_ = comCall(h.CmdList, 48, rt.rtvCPU, uintptr(unsafe.Pointer(&zeroClr[0])), 0, 0)
+								clearedRT[d.TargetVA] = true
+							}
+							wantRTV = rt.rtvCPU
+							wantTargetVA = d.TargetVA
+						}
+					}
+					if wantRTV != curRTV {
+						_ = comCall(h.CmdList, 46, 1, uintptr(unsafe.Pointer(&wantRTV)), 0, 0) // OMSetRenderTargets
+						curRTV = wantRTV
+						curTargetVA = wantTargetVA
+					}
+					// 2. Liaison du SRV t0 : priorité au RenderTarget offscreen hôte si SRVGuestVA correspond !
+					if useOffscreenRT && d.SRVGuestVA != 0 && d.SRVGuestVA != curTargetVA {
+						if srcRT, ok := h.RTCache[d.SRVGuestVA]; ok && srcRT != nil {
+							if srcRT.state != 0xC0 {
+								br := d3d12ResourceBarrier{Resource: srcRT.res, Subresource: 0xFFFFFFFF, StateBefore: srcRT.state, StateAfter: 0xC0 /* NON_PIXEL | PIXEL_SHADER_RESOURCE */}
+								_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&br)))
+								srcRT.state = 0xC0
+							}
+							_ = comCall(h.CmdList, 32, 1, srcRT.srvGPU)
+							goto srvBound
+						}
+					}
 					if d.SRVTex != nil {
 						srvGPU := h.ensureHostTexture(d.SRVTex)
 						if srvGPU != 0 {
@@ -560,6 +631,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 					} else if h.SRVGPUStart != 0 {
 						_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart)
 					}
+				srvBound:
 					topo := d.Topology
 					if topo == 0 || topo == 17 || topo >= 32 {
 						// Topologie par défaut ou Xbox RECTLIST -> TRIANGLELIST (4) sur PC
@@ -684,10 +756,17 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, src
 			}
 		}
 
-		_ = comCall(h.CmdList, 9) // Close
+		hrClose := comCall(h.CmdList, 9) // Close
+		if int32(hrClose) < 0 {
+			slog.Error("Host D3D12 CmdList::Close échoué", "hr", fmt.Sprintf("0x%08X", uint32(hrClose)), "draws", len(draws), "dispatches", len(dispatches))
+		}
 		lists := [1]uintptr{h.CmdList}
 		_ = comCall(h.Queue, 10, 1, uintptr(unsafe.Pointer(&lists[0]))) // ExecuteCommandLists
-		_ = comCall(h.SwapChain, 8, uintptr(syncInterval), 0)           // Present
+		hrPres := comCall(h.SwapChain, 8, uintptr(syncInterval), 0)     // Present
+		if int32(hrPres) < 0 {
+			h.dumpDebugMessages()
+			slog.Error("Host D3D12 SwapChain::Present échoué", "hr", fmt.Sprintf("0x%08X", uint32(hrPres)), "removedReason", fmt.Sprintf("0x%08X", h.DeviceRemovedReason()))
+		}
 		h.waitGPU()
 		if h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && (h.introFrameCount == 1 || h.introFrameCount == 45) && len(draws) >= 8 {
 			h.saveReadbackPNG(fmt.Sprintf("%s\\astral_intro_%d.png", os.TempDir(), h.introFrameCount))
@@ -757,9 +836,43 @@ func (h *HostD3D12) saveReadbackPNG(path string) {
 	)
 }
 
+func (h *HostD3D12) dumpDebugMessages() {
+	if h == nil || h.Device == 0 || os.Getenv("ASTRAL_D3D12_DEBUG") != "1" {
+		return
+	}
+	var iq uintptr
+	if int32(comCall(h.Device, 0, uintptr(unsafe.Pointer(&guidID3D12InfoQueue[0])), uintptr(unsafe.Pointer(&iq)))) < 0 || iq == 0 {
+		return
+	}
+	defer comCall(iq, 2) // Release
+	// ID3D12InfoQueue : ClearStoredMessages=4, GetMessage=5, GetNumStoredMessages=8
+	n := uint64(comCall(iq, 8))
+	if n > 12 {
+		n = 12
+	}
+	for i := uint64(0); i < n; i++ {
+		var sz uintptr
+		_ = comCall(iq, 5, uintptr(i), 0, uintptr(unsafe.Pointer(&sz)))
+		if sz == 0 || sz > 16384 {
+			continue
+		}
+		buf := make([]byte, sz)
+		if int32(comCall(iq, 5, uintptr(i), uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&sz)))) >= 0 && len(buf) >= 32 {
+			// D3D12_MESSAGE : { Category u32 (+0), Severity u32 (+4), ID u32 (+8), _pad u32 (+12), pDescription ptr (+16), DescriptionByteLength size_t (+24) }
+			pDesc := *(*uintptr)(unsafe.Pointer(&buf[16]))
+			dLen := *(*uintptr)(unsafe.Pointer(&buf[24]))
+			if pDesc != 0 && dLen > 0 && dLen < 4096 {
+				msg := string(unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&pDesc))), dLen))
+				slog.Error("D3D12_DEBUG", "msg", msg)
+			}
+		}
+	}
+	_ = comCall(iq, 4) // ClearStoredMessages
+}
+
 // Present présente la trame courante sur la SwapChain DXGI hôte.
 func (h *HostD3D12) Present(syncInterval uint32) {
-	h.PresentClear(syncInterval, [4]float32{0.04, 0.05, 0.09, 1.0}, nil, 0, 0, 0, nil)
+	h.PresentClear(syncInterval, [4]float32{0.04, 0.05, 0.09, 1.0}, 0, nil, 0, 0, 0, nil)
 }
 
 // PresentHost présente la trame courante sur l'instance globale HostD3D12 si active.
@@ -772,12 +885,12 @@ func PresentHost(syncInterval uint32) {
 	}
 }
 
-// PresentHostFrame présente une trame avec couleur de clear, framebuffer optionnel, Dispatches Compute et DrawInstanced.
-func PresentHostFrame(syncInterval uint32, clearColor [4]float32, srcRGBA []byte, srcW, srcH, srcPitch uint32, dispatches []HostDispatchPass, draws ...HostDrawPass) {
+// PresentHostFrame présente une trame avec couleur de clear, adresse du backbuffer invité, framebuffer optionnel, Dispatches Compute et DrawInstanced.
+func PresentHostFrame(syncInterval uint32, clearColor [4]float32, presentVA uint64, srcRGBA []byte, srcW, srcH, srcPitch uint32, dispatches []HostDispatchPass, draws ...HostDrawPass) {
 	hostMu.Lock()
 	h := hostInstance
 	hostMu.Unlock()
 	if h != nil {
-		h.PresentClear(syncInterval, clearColor, srcRGBA, srcW, srcH, srcPitch, dispatches, draws...)
+		h.PresentClear(syncInterval, clearColor, presentVA, srcRGBA, srcW, srcH, srcPitch, dispatches, draws...)
 	}
 }

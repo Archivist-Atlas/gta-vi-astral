@@ -18,7 +18,7 @@ var (
 )
 
 const (
-	giKindGamepad      uint32 = 0x00020000
+	giKindGamepad      uint32 = 0x00040000 // GameInputKindGamepad (1 << 18 = 262144)
 	giDeviceConnected  uint32 = 0x00000001
 	giBtnMenu          uint32 = 0x00000001
 	giBtnView          uint32 = 0x00000002
@@ -173,7 +173,7 @@ func pollLiveGamepad() gameInputGamepadState {
 	if keyDown('R') {
 		st.Buttons |= giBtnX
 	}
-	if keyDown('F') {
+	if keyDown('F') || keyDown('Y') {
 		st.Buttons |= giBtnY
 	}
 	if keyDown('Q') {
@@ -197,13 +197,20 @@ func bindGameInput(t *LiveTable) {
 		return uint64(time.Since(startTime).Microseconds()) + 1000
 	}
 
-	// Allocation d'une structure GameInputDeviceInfo (256 octets) persistante
-	devInfoMem, _, _ := k32VirtualAlloc.Call(0, 256, 0x3000, 0x04)
+	// Allocation d'une structure GameInputDeviceInfo (512 octets, ABI GDK exact)
+	devInfoMem, _, _ := k32VirtualAlloc.Call(0, 512, 0x3000, 0x04)
 	if devInfoMem != 0 {
-		*(*uint32)(osPtr(devInfoMem + 0)) = 256          // infoSize
-		*(*uint16)(osPtr(devInfoMem + 4)) = 0x045E       // vendorId = Microsoft
-		*(*uint16)(osPtr(devInfoMem + 6)) = 0x02EA       // productId = Xbox One S Controller
-		*(*uint32)(osPtr(devInfoMem + 48)) = giKindGamepad // supportedInput
+		*(*uint32)(osPtr(devInfoMem + 0x00)) = 304           // infoSize
+		*(*uint16)(osPtr(devInfoMem + 0x04)) = 0x045E        // vendorId = Microsoft
+		*(*uint16)(osPtr(devInfoMem + 0x06)) = 0x0B12        // productId = Xbox Series X|S Controller
+		*(*uint32)(osPtr(devInfoMem + 0x20)) = 0x41535452    // deviceId[0..3] non nul
+		*(*uint32)(osPtr(devInfoMem + 0x40)) = 0x41535452    // deviceRootId[0..3] non nul
+		*(*uint32)(osPtr(devInfoMem + 0x60)) = 3             // deviceFamily = GameInputFamilyXboxOne
+		*(*uint32)(osPtr(devInfoMem + 0x68)) = giKindGamepad // supportedInput (offset +0x68!)
+		*(*uint32)(osPtr(devInfoMem + 0x6C)) = 0x0F          // supportedRumbleMotors
+		*(*uint32)(osPtr(devInfoMem + 0x7C)) = 6             // controllerAxisCount
+		*(*uint32)(osPtr(devInfoMem + 0x80)) = 14            // controllerButtonCount
+		*(*uint32)(osPtr(devInfoMem + 0x84)) = 1             // controllerSwitchCount
 	}
 
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
@@ -222,7 +229,19 @@ func bindGameInput(t *LiveTable) {
 		12: cbOK, // SetRumbleState
 	})
 
-	// IGameInputReading (28 slots)
+	var gamepadPolls atomic.Uint64
+	cbGetGamepadState := syscall.NewCallback(func(this, outState uintptr) uintptr { // GetGamepadState (slot 22, 0xB0)
+		if outState >= 0x10000 {
+			st := pollLiveGamepad()
+			*(*gameInputGamepadState)(osPtr(outState)) = st
+			if n := gamepadPolls.Add(1); n == 1 {
+				slog.Info("IGameInputReading!GetGamepadState actif (manette XInput + clavier Windows connectés)")
+			}
+			return 1
+		}
+		return 0
+	})
+	// IGameInputReading (28 slots, ABI GDK)
 	readingObj := NewCOMObject("IGameInputReading", 28, map[int]uintptr{
 		3: syscall.NewCallback(func(this uintptr) uintptr { // GetInputKind
 			return uintptr(giKindGamepad)
@@ -239,13 +258,7 @@ func bindGameInput(t *LiveTable) {
 			}
 			return 0
 		}),
-		16: syscall.NewCallback(func(this, outState uintptr) uintptr { // GetGamepadState
-			if outState >= 0x10000 {
-				*(*gameInputGamepadState)(osPtr(outState)) = pollLiveGamepad()
-				return 1
-			}
-			return 0
-		}),
+		22: cbGetGamepadState, // GetGamepadState (0xB0)
 	})
 
 	cbGetTimestamp := syscall.NewCallback(func(this uintptr) uintptr {
@@ -268,8 +281,14 @@ func bindGameInput(t *LiveTable) {
 		return hresultOK
 	})
 	cbRegDevice := syscall.NewCallback(func(this, dev, kind, status, enumKind, ctx, cb, outToken uintptr) uintptr {
+		tok := nextToken.Add(1)
 		if outToken >= 0x10000 {
-			*(*uint64)(osPtr(outToken)) = nextToken.Add(1)
+			*(*uint64)(osPtr(outToken)) = tok
+		}
+		// Si le titre demande l'énumération initiale des périphériques connectés (Async=1 ou Blocking=2)
+		// et filtre les manettes (kind == 0 ou giKindGamepad), on notifie immédiatement notre manette virtuelle.
+		if uint32(enumKind) != 0 && (uint32(kind) == 0 || uint32(kind)&giKindGamepad != 0) && cb >= 0x10000 && cb < 0x800000000000 {
+			_, _, _ = syscall.SyscallN(cb, uintptr(tok), ctx, deviceObj, uintptr(nowUS()), uintptr(giDeviceConnected), 0)
 		}
 		return hresultOK
 	})

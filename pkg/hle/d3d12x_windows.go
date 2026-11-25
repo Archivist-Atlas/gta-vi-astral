@@ -57,8 +57,10 @@ type d3d12xState struct {
 	activeIBFormat  uint32
 	activeTopology  uint32
 	activeRTVCount  uint32
+	activeRTVVA     uint64
 	activeRootVA    uintptr
 	activeRootSize  uint32
+	activeSRVVA     uint64
 	activeSRVTex    *gpu.HostTextureUpload
 	frameDispatches []gpu.HostDispatchPass
 	frameDraws      []gpu.HostDrawPass
@@ -276,10 +278,12 @@ func newD3D12XDevice() uintptr {
 		st.frameDraws = nil
 		dispatches := st.frameDispatches
 		st.frameDispatches = nil
+		var presentVA uint64
 		if resObj != 0 {
 			if d, ok := st.resDescs[resObj]; ok {
 				resW, resH, resFmt = uint32(d.Width), d.Height, d.Format
 			}
+			presentVA = st.resGPUAddrs[resObj]
 		}
 		st.mu.Unlock()
 		for i := range draws {
@@ -331,7 +335,7 @@ func newD3D12XDevice() uintptr {
 			_ = os.WriteFile(os.TempDir()+"\\astral_intro_frame.txt", []byte(sb), 0o644)
 			slog.Info("ASTRAL_DUMP_FRAME intro capturée", "frame", n, "draws", len(draws), "dispatches", len(dispatches))
 		}
-		gpu.PresentHostFrame(0, clr, nil, 0, 0, 0, dispatches, draws...)
+		gpu.PresentHostFrame(0, clr, presentVA, nil, 0, 0, 0, dispatches, draws...)
 		return hresultOK
 	})
 	// Vtables partagées O(1) pour Queue, Allocator, DescriptorHeap, Resource, PSO et enfants génériques
@@ -430,6 +434,8 @@ func newD3D12XDevice() uintptr {
 				BaseVertex:    baseVtx,
 				StartInstance: startInst,
 				HostPSO:       st.activeHostPSO,
+				TargetVA:      st.activeRTVVA,
+				SRVGuestVA:    st.activeSRVVA,
 				VBStride:      st.activeVBStride,
 				IBFormat:      st.activeIBFormat,
 			}
@@ -722,6 +728,7 @@ func newD3D12XDevice() uintptr {
 					fmtID := *(*uint32)(osPtr(slotPtr + 4))
 					swz := *(*uint32)(osPtr(slotPtr + 28))
 					if dim == 3 && va >= 0x10000 && va < 0x800000000000 && w > 0 && h > 0 {
+						st.activeSRVVA = va
 						st.activeSRVTex = &gpu.HostTextureUpload{
 							GuestVA: va,
 							Width:   w,
@@ -796,8 +803,27 @@ func newD3D12XDevice() uintptr {
 	})
 	cbListSetRTVs := syscall.NewCallback(func(this, numRTVs, rtvsPtr, single, dsvPtr uintptr) uintptr {
 		listSlotHits[50].Add(1)
+		var rtvVA uint64
+		if uint32(numRTVs) > 0 && rtvsPtr >= 0x10000 && rtvsPtr < 0x800000000000 {
+			rtvHandle := *(*uintptr)(osPtr(rtvsPtr))
+			var res uintptr
+			st.mu.Lock()
+			if r, ok := st.rtvResources[rtvHandle]; ok {
+				res = r
+			} else if rtvHandle >= 0x10000 && rtvHandle < 0x800000000000 && *(*uint32)(osPtr(rtvHandle)) == 0x52545631 {
+				res = *(*uintptr)(osPtr(rtvHandle + 8))
+			}
+			if res != 0 {
+				rtvVA = st.resGPUAddrs[res]
+			}
+			st.activeRTVCount = uint32(numRTVs)
+			st.activeRTVVA = rtvVA
+			st.mu.Unlock()
+			return 0
+		}
 		st.mu.Lock()
 		st.activeRTVCount = uint32(numRTVs)
+		st.activeRTVVA = 0
 		st.mu.Unlock()
 		return 0
 	})

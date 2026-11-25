@@ -48,12 +48,23 @@ type HostDrawPass struct {
 	PassIndex     uint32
 	FrameNumber   uint32
 	HostPSO       uintptr
+	TargetVA      uint64 // Adresse GPU invitée du RenderTarget (0 ou presentVA = backbuffer)
+	SRVGuestVA    uint64 // Adresse GPU invitée du SRV t0 (pour liaison directe RenderTarget -> SRV)
 	VBData        []byte
 	VBStride      uint32
 	IBData        []byte
 	IBFormat      uint32 // 57 = R16_UINT, 42 = R32_UINT
 	CBData        []byte
 	SRVTex        *HostTextureUpload
+}
+
+type hostRTEntry struct {
+	res    uintptr
+	rtvCPU uintptr
+	srvGPU uintptr
+	width  uint32
+	height uint32
+	state  uint32 // 0x4 = RENDER_TARGET, 0x80 = PIXEL_SHADER_RESOURCE
 }
 
 type d3d12IndexBufferView struct {
@@ -228,6 +239,7 @@ type d3d12SRVDesc struct {
 	Format                  uint32
 	ViewDimension           uint32 // 4 = TEXTURE2D
 	Shader4ComponentMapping uint32 // 0x1688 = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+	_pad                    uint32 // alignement 8 octets de l'union (D3D12_BUFFER_SRV::FirstElement est UINT64)
 	MostDetailedMip         uint32
 	MipLevels               uint32
 	PlaneSlice              uint32
@@ -390,7 +402,7 @@ func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []Ho
 	hr := comCall(h.Device, 10, uintptr(unsafe.Pointer(&psoDesc)), uintptr(unsafe.Pointer(&guidID3D12PipelineState[0])), uintptr(unsafe.Pointer(&pso)))
 	_ = nameBufs
 	if int32(hr) < 0 || pso == 0 {
-		return 0, fmt.Errorf("CreateGraphicsPipelineState échoué (0x%08X)", uint32(hr))
+		return 0, fmt.Errorf("CreateGraphicsPipelineState échoué (0x%08X, removedReason=0x%08X)", uint32(hr), h.DeviceRemovedReason())
 	}
 	return pso, nil
 }
@@ -540,13 +552,22 @@ func (h *HostD3D12) initReplayPipeline() {
 	srvHeapDesc := d3d12DescriptorHeapDesc{Type: 0 /* CBV_SRV_UAV */, NumDescriptors: 64, Flags: 1 /* SHADER_VISIBLE */}
 	if int32(comCall(h.Device, 14, uintptr(unsafe.Pointer(&srvHeapDesc)), uintptr(unsafe.Pointer(&guidID3D12DescriptorHeap[0])), uintptr(unsafe.Pointer(&h.SRVHeap)))) >= 0 && h.SRVHeap != 0 {
 		var cpuStart, gpuStart uintptr
-		_ = comCall(h.SRVHeap, 9, uintptr(unsafe.Pointer(&cpuStart)))  // GetCPUDescriptorHandleForHeapStart
-		_ = comCall(h.SRVHeap, 10, uintptr(unsafe.Pointer(&gpuStart))) // GetGPUDescriptorHandleForHeapStart
+		retCPU := comCall(h.SRVHeap, 9, uintptr(unsafe.Pointer(&cpuStart)))  // GetCPUDescriptorHandleForHeapStart
+		retGPU := comCall(h.SRVHeap, 10, uintptr(unsafe.Pointer(&gpuStart))) // GetGPUDescriptorHandleForHeapStart
+		if cpuStart == 0 {
+			cpuStart = retCPU
+		}
+		if gpuStart == 0 {
+			gpuStart = retGPU
+		}
 		h.SRVCPUStart = cpuStart
 		h.SRVGPUStart = gpuStart
 		h.SRVStride = comCall(h.Device, 15, 0 /* CBV_SRV_UAV */)
+		slog.Info("Host D3D12 SRVHeap initialisé", "cpuStart", fmt.Sprintf("0x%X", cpuStart), "gpuStart", fmt.Sprintf("0x%X", gpuStart), "stride", h.SRVStride)
 		h.NextSRVSlot = 1
 		h.TexCache = make(map[uint64]*hostTexEntry)
+		h.RTCache = make(map[uint64]*hostRTEntry)
+		h.NextRTVSlot = 2
 		srvDesc := d3d12SRVDesc{
 			Format:                  28,     // R8G8B8A8_UNORM
 			ViewDimension:           4,      // TEXTURE2D
@@ -715,7 +736,7 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 			_ = comCall(h.CmdList, 16, uintptr(unsafe.Pointer(&dstLoc)), 0, 0, 0, uintptr(unsafe.Pointer(&srcLoc)), 0)
 		}
 	}
-	b := d3d12ResourceBarrier{Resource: res, Subresource: 0xFFFFFFFF, StateBefore: 0x400 /* COPY_DEST */, StateAfter: 0x80 /* PIXEL_SHADER_RESOURCE */}
+	b := d3d12ResourceBarrier{Resource: res, Subresource: 0xFFFFFFFF, StateBefore: 0x400 /* COPY_DEST */, StateAfter: 0xC0 /* NON_PIXEL | PIXEL_SHADER_RESOURCE */}
 	_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b)))
 
 	slot := h.NextSRVSlot
@@ -739,6 +760,71 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 	}
 	slog.Info("Host D3D12 Texture2D SRV créée et uploadée", "va", fmt.Sprintf("0x%X", tx.GuestVA), "w", tx.Width, "h", tx.Height, "fmt", fmtID, "slot", slot)
 	return gpuHandle
+}
+
+// ensureHostRT crée (ou retrouve) une Texture2D hôte utilisable à la fois comme RenderTarget (RTV)
+// et comme ShaderResourceView (SRV t0) pour les passes intermédiaires offscreen -> composite.
+func (h *HostD3D12) ensureHostRT(guestVA uint64) *hostRTEntry {
+	if guestVA == 0 || h.Device == 0 || h.RTVHeap == 0 || h.SRVHeap == 0 || h.Width == 0 || h.Height == 0 {
+		return nil
+	}
+	if e, ok := h.RTCache[guestVA]; ok {
+		return e
+	}
+	if h.NextRTVSlot >= 32 || h.NextSRVSlot >= 64 {
+		return nil
+	}
+	heapProps := d3d12HeapProperties{Type: 1 /* DEFAULT */, CreationNodeMask: 1, VisibleNodeMask: 1}
+	texDesc := d3d12ResourceDesc{
+		Dimension:        3, // TEXTURE2D
+		Width:            uint64(h.Width),
+		Height:           h.Height,
+		DepthOrArraySize: 1,
+		MipLevels:        1,
+		Format:           28, // DXGI_FORMAT_R8G8B8A8_UNORM
+		SampleCount:      1,
+		Layout:           0,   // UNKNOWN
+		Flags:            0x1, // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+	}
+	var res uintptr
+	if int32(comCall(h.Device, 27,
+		uintptr(unsafe.Pointer(&heapProps)), 0,
+		uintptr(unsafe.Pointer(&texDesc)),
+		0x4, // D3D12_RESOURCE_STATE_RENDER_TARGET
+		0,
+		uintptr(unsafe.Pointer(&guidID3D12Resource[0])),
+		uintptr(unsafe.Pointer(&res)),
+	)) < 0 || res == 0 {
+		return nil
+	}
+	rtvSlot := h.NextRTVSlot
+	h.NextRTVSlot++
+	rtvCPU := h.RTVStart + uintptr(rtvSlot)*h.RTVStride
+	_ = comCall(h.Device, 20, res, 0, rtvCPU) // CreateRenderTargetView
+
+	srvSlot := h.NextSRVSlot
+	h.NextSRVSlot++
+	srvCPU := h.SRVCPUStart + uintptr(srvSlot)*h.SRVStride
+	srvGPU := h.SRVGPUStart + uintptr(srvSlot)*h.SRVStride
+	srvDesc := d3d12SRVDesc{
+		Format:                  28,
+		ViewDimension:           4,      // TEXTURE2D
+		Shader4ComponentMapping: 0x1688, // DEFAULT
+		MipLevels:               1,
+	}
+	_ = comCall(h.Device, 18, res, uintptr(unsafe.Pointer(&srvDesc)), srvCPU) // CreateShaderResourceView
+
+	e := &hostRTEntry{
+		res:    res,
+		rtvCPU: rtvCPU,
+		srvGPU: srvGPU,
+		width:  h.Width,
+		height: h.Height,
+		state:  0x4, // RENDER_TARGET
+	}
+	h.RTCache[guestVA] = e
+	slog.Info("Host D3D12 RenderTarget offscreen créé (RTV+SRV)", "guestVA", fmt.Sprintf("0x%X", guestVA), "w", h.Width, "h", h.Height, "rtvSlot", rtvSlot, "srvSlot", srvSlot)
+	return e
 }
 
 func (h *HostD3D12) createUploadBuffer(size uint64) (res uintptr, cpuPtr uintptr, gpuVA uint64) {
