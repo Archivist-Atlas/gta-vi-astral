@@ -108,12 +108,11 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 			}
 		}
 		b.WriteString("};\n\nstruct StageOut {\n")
-		if len(outputs) == 0 {
-			if isPS {
-				b.WriteString("    float4 mrt0 : SV_Target0;\n")
-			} else {
-				b.WriteString("    float4 pos : SV_Position;\n")
-			}
+		if isPS {
+			// Cible unique R8G8B8A8_UNORM : garantit la compatibilité D3D12 (évite E_INVALIDARG sur SV_Depth ou SV_Target entier)
+			b.WriteString("    float4 mrt0 : SV_Target0;\n")
+		} else if len(outputs) == 0 {
+			b.WriteString("    float4 pos : SV_Position;\n")
 		} else {
 			for idx, el := range outputs {
 				b.WriteString(fmt.Sprintf("    %s out%d : %s;\n", el.HLSLType(), idx, el.HLSLSemantic()))
@@ -318,23 +317,15 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 
 	// Liaison des exports RDNA2 (exp_pos / exp_param / exp_mrt) vers StageOut
 	b.WriteString("    StageOut o = (StageOut)0;\n")
-	if len(outputs) == 0 {
-		if isPS {
-			b.WriteString("    o.mrt0 = exp_mrt[0];\n")
-		} else {
-			b.WriteString("    o.pos = exp_pos;\n")
-		}
+	if isPS {
+		b.WriteString("    o.mrt0 = exp_mrt[0];\n")
+	} else if len(outputs) == 0 {
+		b.WriteString("    o.pos = exp_pos;\n")
 	} else {
 		paramIdx := 0
 		for idx, el := range outputs {
 			up := strings.ToUpper(el.SemanticName)
-			if isPS {
-				mrt := el.SemanticIndex
-				if mrt >= 4 {
-					mrt = 0
-				}
-				b.WriteString(fmt.Sprintf("    o.out%d = %s;\n", idx, swizzleForMask(fmt.Sprintf("exp_mrt[%d]", mrt), el)))
-			} else if up == "SV_POSITION" {
+			if up == "SV_POSITION" {
 				b.WriteString(fmt.Sprintf("    o.out%d = %s;\n", idx, swizzleForMask("exp_pos", el)))
 			} else {
 				p := paramIdx

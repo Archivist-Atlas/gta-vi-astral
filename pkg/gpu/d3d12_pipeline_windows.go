@@ -403,7 +403,8 @@ func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []Ho
 	hr := comCall(h.Device, 10, uintptr(unsafe.Pointer(&psoDesc)), uintptr(unsafe.Pointer(&guidID3D12PipelineState[0])), uintptr(unsafe.Pointer(&pso)))
 	_ = nameBufs
 	if int32(hr) < 0 || pso == 0 {
-		return 0, fmt.Errorf("CreateGraphicsPipelineState échoué (0x%08X, removedReason=0x%08X)", uint32(hr), h.DeviceRemovedReason())
+		h.dumpDebugMessages()
+		return 0, fmt.Errorf("CreateGraphicsPipelineState échoué (0x%08X, removedReason=0x%08X, inElems=%d)", uint32(hr), h.DeviceRemovedReason(), len(inputElems))
 	}
 	return pso, nil
 }
