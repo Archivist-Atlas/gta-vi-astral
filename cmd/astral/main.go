@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,12 +33,17 @@ func main() {
 	if len(os.Args) >= 2 {
 		attachParentConsoleIfCLI()
 	}
-	core.InitLogger(os.Stderr)
-
 	if len(os.Args) < 2 {
+		if lf, lerr := os.Create(filepath.Join(os.TempDir(), "astral_last.log")); lerr == nil {
+			defer lf.Close()
+			core.InitLogger(io.MultiWriter(os.Stderr, lf))
+		} else {
+			core.InitLogger(os.Stderr)
+		}
 		runDefaultUI()
 		return
 	}
+	core.InitLogger(os.Stderr)
 
 	var err error
 	switch os.Args[1] {
