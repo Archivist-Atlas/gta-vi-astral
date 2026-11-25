@@ -569,7 +569,7 @@ func newD3D12XDevice() uintptr {
 	}
 	recordDrawPass := func(indexed bool, count, instCount, startLoc uint32, baseVtx int32, startInst uint32) {
 		st.mu.Lock()
-		if len(st.frameDraws) < 64 {
+		if len(st.frameDraws) < 512 {
 			pass := gpu.HostDrawPass{
 				Indexed:       indexed,
 				Topology:      st.activeTopology,

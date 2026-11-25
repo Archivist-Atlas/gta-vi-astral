@@ -549,8 +549,8 @@ func (h *HostD3D12) initReplayPipeline() {
 	}
 	h.ReplayRootSig = rootSig
 
-	// Heap SRV shader-visible (64 descripteurs : slot 0 = null-descriptor par défaut, slots 1..63 = textures 2D hôtes)
-	srvHeapDesc := d3d12DescriptorHeapDesc{Type: 0 /* CBV_SRV_UAV */, NumDescriptors: 64, Flags: 1 /* SHADER_VISIBLE */}
+	// Heap SRV shader-visible (256 descripteurs : slot 0 = null-descriptor par défaut, slots 1..255 = textures 2D hôtes)
+	srvHeapDesc := d3d12DescriptorHeapDesc{Type: 0 /* CBV_SRV_UAV */, NumDescriptors: 256, Flags: 1 /* SHADER_VISIBLE */}
 	if int32(comCall(h.Device, 14, uintptr(unsafe.Pointer(&srvHeapDesc)), uintptr(unsafe.Pointer(&guidID3D12DescriptorHeap[0])), uintptr(unsafe.Pointer(&h.SRVHeap)))) >= 0 && h.SRVHeap != 0 {
 		var cpuStart, gpuStart uintptr
 		retCPU := comCall(h.SRVHeap, 9, uintptr(unsafe.Pointer(&cpuStart)))  // GetCPUDescriptorHandleForHeapStart
@@ -607,10 +607,10 @@ float4 PSMain(VSOut i) : SV_Target {
 		return
 	}
 	h.ReplayPSO = pso
-	// Buffers dynamiques persistants UPLOAD pour VB (32 MiB), IB (16 MiB), CB (1 MiB = 64x16 KiB) et Staging Texture (16 MiB)
+	// Buffers dynamiques persistants UPLOAD pour VB (32 MiB), IB (16 MiB), CB (8 MiB = 512x16 KiB) et Staging Texture (32 MiB)
 	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(32 << 20)
 	h.UploadIB, h.UploadIBPtr, h.UploadIBGPU = h.createUploadBuffer(16 << 20)
-	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(1 << 20)
+	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(8 << 20)
 	h.UploadTex, h.UploadTexPtr, _ = h.createUploadBuffer(32 << 20)
 	h.initComputePipeline()
 	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS+CS DXBC, RootCBV b0 + SRV t0x64 + UAV u0 + VB/IB)",
@@ -747,7 +747,7 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 		}
 		return e.srvGPU
 	}
-	if h.NextSRVSlot >= 64 {
+	if h.NextSRVSlot >= 256 {
 		return h.SRVGPUStart
 	}
 	bw := (tx.Width + block - 1) / block
@@ -829,7 +829,7 @@ func (h *HostD3D12) ensureHostRT(guestVA uint64) *hostRTEntry {
 	if e, ok := h.RTCache[guestVA]; ok {
 		return e
 	}
-	if h.NextRTVSlot >= 32 || h.NextSRVSlot >= 64 {
+	if h.NextRTVSlot >= 64 || h.NextSRVSlot >= 256 {
 		return nil
 	}
 	heapProps := d3d12HeapProperties{Type: 1 /* DEFAULT */, CreationNodeMask: 1, VisibleNodeMask: 1}

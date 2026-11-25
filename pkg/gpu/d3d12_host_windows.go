@@ -331,8 +331,8 @@ func (h *HostD3D12) initPresentPipeline() {
 	if h.Device == 0 || h.SwapChain3 == 0 {
 		return
 	}
-	// 1. Heap RTV (32 descripteurs : 0..1 = double-buffering SwapChain, 2..31 = RenderTargets offscreen)
-	rtvDesc := d3d12DescriptorHeapDesc{Type: 2 /* RTV */, NumDescriptors: 32}
+	// 1. Heap RTV (64 descripteurs : 0..1 = double-buffering SwapChain, 2..63 = RenderTargets offscreen)
+	rtvDesc := d3d12DescriptorHeapDesc{Type: 2 /* RTV */, NumDescriptors: 64}
 	if int32(comCall(h.Device, 14, uintptr(unsafe.Pointer(&rtvDesc)), uintptr(unsafe.Pointer(&guidID3D12DescriptorHeap[0])), uintptr(unsafe.Pointer(&h.RTVHeap)))) < 0 || h.RTVHeap == 0 {
 		return
 	}
@@ -542,8 +542,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						continue
 					}
 					if h.UploadCBPtr != 0 && h.UploadCBGPU != 0 {
-						cbSlot := uint64((idxCS+32)%64) * 16384
-						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 1<<20)[cbSlot : cbSlot+16384]
+						cbSlot := uint64((idxCS+480)%512) * 16384
+						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 8<<20)[cbSlot : cbSlot+16384]
 						clear(dstCB)
 						if len(cs.CBData) > 0 {
 							copy(dstCB, cs.CBData)
@@ -666,10 +666,10 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					}
 					_ = comCall(h.CmdList, 20, uintptr(topo)) // IASetPrimitiveTopology
 					_ = comCall(h.CmdList, 25, pso)           // SetPipelineState
-					// Upload Constant Buffer (16 KiB alignés sur 256 octets, slot = idxPass % 64)
+					// Upload Constant Buffer (16 KiB alignés sur 256 octets, slot = idxPass % 512)
 					if h.UploadCBPtr != 0 && h.UploadCBGPU != 0 {
-						cbSlot := uint64(idxPass%64) * 16384
-						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 1<<20)[cbSlot : cbSlot+16384]
+						cbSlot := uint64(idxPass%512) * 16384
+						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 8<<20)[cbSlot : cbSlot+16384]
 						clear(dstCB)
 						if len(d.CBData) > 0 {
 							copy(dstCB, d.CBData)
