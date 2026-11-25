@@ -3,6 +3,7 @@
 package hle
 
 import (
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"syscall"
@@ -15,6 +16,9 @@ var (
 	procGetAsyncKey   = modUser32GI.NewProc("GetAsyncKeyState")
 	modXInput14       = syscall.NewLazyDLL("xinput1_4.dll")
 	procXInputGetStat = modXInput14.NewProc("XInputGetState")
+	modWinMM          = syscall.NewLazyDLL("winmm.dll")
+	procJoyGetPosEx   = modWinMM.NewProc("joyGetPosEx")
+	procJoyGetDevCaps = modWinMM.NewProc("joyGetDevCapsW")
 )
 
 const (
@@ -74,16 +78,72 @@ func normStick(v int16) float32 {
 	return float32(v) / 32767.0
 }
 
-// pollLiveGamepad fusionne la manette XInput 0 (si branchée) et le clavier Windows
-// (WASD = stick gauche, flèches = D-Pad, Entrée/Espace = A, Échap = Menu, Retour = B).
+// joyInfoEx correspond à JOYINFOEX (52 octets, winmm.dll) pour DualSense/PS5, DualShock, Switch Pro et manettes HID génériques.
+type joyInfoEx struct {
+	Size         uint32
+	Flags        uint32
+	Xpos         uint32
+	Ypos         uint32
+	Zpos         uint32
+	Rpos         uint32
+	Upos         uint32
+	Vpos         uint32
+	Buttons      uint32
+	ButtonNumber uint32
+	POV          uint32
+	Reserved1    uint32
+	Reserved2    uint32
+}
+
+// joyCapsW correspond au début de JOYCAPSW (winmm.dll) pour identifier VID/PID (Sony 0x054C, Nintendo 0x057E, etc.).
+type joyCapsW struct {
+	Mid  uint16
+	Pid  uint16
+	Name [32]uint16
+	_pad [360]byte
+}
+
+var (
+	giLoggedController atomic.Bool
+	giLoggedFirstBtn   atomic.Bool
+)
+
+func normU16Axis(v uint32, invert bool) float32 {
+	f := (float32(v) - 32767.5) / 32767.5
+	if f > -0.12 && f < 0.12 {
+		return 0
+	}
+	if f < -1.0 {
+		f = -1.0
+	} else if f > 1.0 {
+		f = 1.0
+	}
+	if invert {
+		return -f
+	}
+	return f
+}
+
+// pollLiveGamepad fusionne toutes les manettes connectées :
+// 1) XInput slots 0..3 (Xbox 360 / One / Series / PC XInput)
+// 2) winmm.dll HID/DirectInput slots 0..15 (DualSense PS5, DualShock 4, Switch Pro, manettes USB/BT génériques)
+// 3) Clavier Windows (WASD = stick gauche, flèches = D-Pad, Entrée/Espace = A, Retour = B, Y/F = Y, R = X, Échap = Menu).
 func pollLiveGamepad() gameInputGamepadState {
 	var st gameInputGamepadState
+	xinputFound := false
 
-	// 1. Manette XInput réelle (xinput1_4.dll)
+	// 1. Manettes XInput réelles (slots 0..3)
 	if procXInputGetStat.Find() == nil {
-		var xs xinputState
-		r, _, _ := procXInputGetStat.Call(0, uintptr(unsafe.Pointer(&xs)))
-		if r == 0 {
+		for slot := uintptr(0); slot < 4; slot++ {
+			var xs xinputState
+			r, _, _ := procXInputGetStat.Call(slot, uintptr(unsafe.Pointer(&xs)))
+			if r != 0 {
+				continue
+			}
+			xinputFound = true
+			if giLoggedController.CompareAndSwap(false, true) {
+				slog.Info("GameInput manette XInput détectée", "slot", slot)
+			}
 			if xs.Buttons&0x0001 != 0 {
 				st.Buttons |= giBtnDPadUp
 			}
@@ -132,6 +192,140 @@ func pollLiveGamepad() gameInputGamepadState {
 			st.LeftThumbstickY = normStick(xs.ThumbLY)
 			st.RightThumbstickX = normStick(xs.ThumbRX)
 			st.RightThumbstickY = normStick(xs.ThumbRY)
+			break
+		}
+	}
+
+	// 2. Manettes HID / DirectInput universelles (DualSense PS5, DualShock 4, Switch Pro, génériques) via winmm.dll
+	if !xinputFound && procJoyGetPosEx.Find() == nil {
+		for id := uintptr(0); id < 16; id++ {
+			ji := joyInfoEx{Size: uint32(unsafe.Sizeof(joyInfoEx{})), Flags: 0xFF /* JOY_RETURNALL */}
+			r, _, _ := procJoyGetPosEx.Call(id, uintptr(unsafe.Pointer(&ji)))
+			if r != 0 {
+				continue
+			}
+			var caps joyCapsW
+			isSony := false
+			if procJoyGetDevCaps.Find() == nil {
+				if rc, _, _ := procJoyGetDevCaps.Call(id, uintptr(unsafe.Pointer(&caps)), uintptr(unsafe.Sizeof(caps))); rc == 0 {
+					isSony = caps.Mid == 0x054C // Sony Interactive Entertainment (DualSense / DualShock 4)
+				}
+			}
+			if giLoggedController.CompareAndSwap(false, true) {
+				kindName := "HID générique"
+				if isSony {
+					kindName = "PlayStation DualSense/DualShock"
+				}
+				slog.Info("GameInput manette universelle détectée (winmm)",
+					"type", kindName,
+					"slot", id,
+					"vid", fmt.Sprintf("0x%04X", caps.Mid),
+					"pid", fmt.Sprintf("0x%04X", caps.Pid),
+				)
+			}
+
+			// Croix directionnelle (POV en centièmes de degré, 0xFFFF = centré)
+			if ji.POV < 36000 {
+				if ji.POV <= 4500 || ji.POV >= 31500 {
+					st.Buttons |= giBtnDPadUp
+				}
+				if ji.POV >= 4500 && ji.POV <= 13500 {
+					st.Buttons |= giBtnDPadRight
+				}
+				if ji.POV >= 13500 && ji.POV <= 22500 {
+					st.Buttons |= giBtnDPadDown
+				}
+				if ji.POV >= 22500 && ji.POV <= 31500 {
+					st.Buttons |= giBtnDPadLeft
+				}
+			}
+
+			b := ji.Buttons
+			if isSony {
+				// Mapping natif DualSense (PS5) / DualShock 4 (PS4) en HID Windows :
+				// 0=Carré(X), 1=Croix(A), 2=Rond(B), 3=Triangle(Y), 4=L1, 5=R1, 6=L2, 7=R2, 8=Create, 9=Options, 10=L3, 11=R3, 13=Touchpad
+				if b&(1<<0) != 0 {
+					st.Buttons |= giBtnX
+				}
+				if b&(1<<1) != 0 {
+					st.Buttons |= giBtnA
+				}
+				if b&(1<<2) != 0 {
+					st.Buttons |= giBtnB
+				}
+				if b&(1<<3) != 0 {
+					st.Buttons |= giBtnY
+				}
+				if b&(1<<4) != 0 {
+					st.Buttons |= giBtnLeftShoulder
+				}
+				if b&(1<<5) != 0 {
+					st.Buttons |= giBtnRightShoulder
+				}
+				if b&(1<<8) != 0 || b&(1<<13) != 0 {
+					st.Buttons |= giBtnView
+				}
+				if b&(1<<9) != 0 {
+					st.Buttons |= giBtnMenu
+				}
+				if b&(1<<10) != 0 {
+					st.Buttons |= giBtnLeftThumb
+				}
+				if b&(1<<11) != 0 {
+					st.Buttons |= giBtnRightThumb
+				}
+				st.LeftThumbstickX = normU16Axis(ji.Xpos, false)
+				st.LeftThumbstickY = normU16Axis(ji.Ypos, true)
+				st.RightThumbstickX = normU16Axis(ji.Zpos, false)
+				st.RightThumbstickY = normU16Axis(ji.Rpos, true)
+				st.LeftTrigger = float32(ji.Upos) / 65535.0
+				st.RightTrigger = float32(ji.Vpos) / 65535.0
+				if st.LeftTrigger < 0.05 && b&(1<<6) != 0 {
+					st.LeftTrigger = 1.0
+				}
+				if st.RightTrigger < 0.05 && b&(1<<7) != 0 {
+					st.RightTrigger = 1.0
+				}
+			} else {
+				// Mapping HID générique (Switch Pro, 8BitDo, manettes PC DirectInput)
+				if b&(1<<0) != 0 {
+					st.Buttons |= giBtnA
+				}
+				if b&(1<<1) != 0 {
+					st.Buttons |= giBtnB
+				}
+				if b&(1<<2) != 0 {
+					st.Buttons |= giBtnX
+				}
+				if b&(1<<3) != 0 {
+					st.Buttons |= giBtnY
+				}
+				if b&(1<<4) != 0 {
+					st.Buttons |= giBtnLeftShoulder
+				}
+				if b&(1<<5) != 0 {
+					st.Buttons |= giBtnRightShoulder
+				}
+				if b&(1<<6) != 0 {
+					st.Buttons |= giBtnView
+				}
+				if b&(1<<7) != 0 {
+					st.Buttons |= giBtnMenu
+				}
+				if b&(1<<8) != 0 {
+					st.Buttons |= giBtnLeftThumb
+				}
+				if b&(1<<9) != 0 {
+					st.Buttons |= giBtnRightThumb
+				}
+				st.LeftThumbstickX = normU16Axis(ji.Xpos, false)
+				st.LeftThumbstickY = normU16Axis(ji.Ypos, true)
+				st.RightThumbstickX = normU16Axis(ji.Zpos, false)
+				st.RightThumbstickY = normU16Axis(ji.Rpos, true)
+				st.LeftTrigger = float32(ji.Upos) / 65535.0
+				st.RightTrigger = float32(ji.Vpos) / 65535.0
+			}
+			break
 		}
 	}
 
@@ -181,6 +375,9 @@ func pollLiveGamepad() gameInputGamepadState {
 	}
 	if keyDown('E') {
 		st.Buttons |= giBtnRightShoulder
+	}
+	if st.Buttons != 0 && giLoggedFirstBtn.CompareAndSwap(false, true) {
+		slog.Info("GameInput premier appui bouton détecté", "buttons", fmt.Sprintf("0x%04X", st.Buttons))
 	}
 	return st
 }
