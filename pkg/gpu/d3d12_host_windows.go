@@ -511,9 +511,12 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 			h.introReached = true
 			markIntroReached()
 			ReportBootProgress(1.0)
-			// Ne quitte l'écran de chargement du monde qu'une fois la phase de chargement réellement
-			// entrée ET la vraie scène 3D démarrée (évite la coupure sur le fondu de sortie des menus).
-			if worldLoadingActive.Load() && worldLoadingEntered.Load() && realDraws >= 16 {
+			// Ne quitte l'écran de chargement du monde qu'une fois le streaming story000 terminé
+			// (>= 44 000 requêtes depuis story000.rpf) ET que la vraie scène 3D dessine (>= 20 draws).
+			// Sans ce seuil DirectStorage, 3-4 trames de chargement (5 draws chacune) fusionnées pendant
+			// une rafale I/O dépassaient realDraws >= 16 et coupaient la barre trop tôt.
+			if worldLoadingActive.Load() && worldLoadingEntered.Load() && realDraws >= 20 &&
+				bootDSReads.Load() >= worldLoadBaseReads.Load()+44000 {
 				worldLoadingActive.Store(false)
 			}
 		} else if len(dispatches) > 0 {
@@ -526,7 +529,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 				srcH = h.Height
 				srcPitch = h.Width * 4
 			}
-		} else if h.introReached && worldLoadingActive.Load() && realDraws < 16 && len(srcRGBA) == 0 && h.UploadBuf != 0 && h.UploadPtr != 0 {
+		} else if h.introReached && worldLoadingActive.Load() && len(srcRGBA) == 0 && h.UploadBuf != 0 && h.UploadPtr != 0 {
 			if realDraws < 8 {
 				worldLoadingEntered.Store(true)
 			}
