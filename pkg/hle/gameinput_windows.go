@@ -199,8 +199,33 @@ func pollLiveGamepad() gameInputGamepadState {
 		}
 	}
 
-	// 2. Manettes HID / DirectInput universelles (DualSense PS5, DualShock 4, Switch Pro, génériques) via winmm.dll
-	if !xinputFound && procJoyGetPosEx.Find() == nil {
+	// 2. Manettes HID universelles (Google Stadia, DualSense PS5, DualShock 4, Switch Pro, 8BitDo, USB/BT génériques) via hid.dll
+	hidFound := false
+	if hs, ok := hidManager.mergedState(); ok {
+		hidFound = true
+		st.Buttons |= hs.Buttons
+		if hs.LeftTrigger > st.LeftTrigger {
+			st.LeftTrigger = hs.LeftTrigger
+		}
+		if hs.RightTrigger > st.RightTrigger {
+			st.RightTrigger = hs.RightTrigger
+		}
+		if absF32(hs.LeftThumbstickX) > absF32(st.LeftThumbstickX) {
+			st.LeftThumbstickX = hs.LeftThumbstickX
+		}
+		if absF32(hs.LeftThumbstickY) > absF32(st.LeftThumbstickY) {
+			st.LeftThumbstickY = hs.LeftThumbstickY
+		}
+		if absF32(hs.RightThumbstickX) > absF32(st.RightThumbstickX) {
+			st.RightThumbstickX = hs.RightThumbstickX
+		}
+		if absF32(hs.RightThumbstickY) > absF32(st.RightThumbstickY) {
+			st.RightThumbstickY = hs.RightThumbstickY
+		}
+	}
+
+	// 3. Repli winmm.dll (manettes DirectInput héritées non ouvertes via hid.dll)
+	if !xinputFound && !hidFound && procJoyGetPosEx.Find() == nil {
 		for id := uintptr(0); id < 16; id++ {
 			ji := joyInfoEx{Size: uint32(unsafe.Sizeof(joyInfoEx{})), Flags: 0xFF /* JOY_RETURNALL */}
 			r, _, _ := procJoyGetPosEx.Call(id, uintptr(unsafe.Pointer(&ji)))
