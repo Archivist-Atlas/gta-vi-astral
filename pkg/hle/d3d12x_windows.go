@@ -1718,7 +1718,7 @@ func newD3D12XDevice() uintptr {
 	}
 	storeDXBCBlob := func(p uintptr, l uint64) ([16]byte, bool) {
 		var h [16]byte
-		if p < 0x10000 || l < 32 || l > (16<<20) {
+		if p < 0x10000 || p >= 0x800000000000 || l < 32 || l > (16<<20) || !isGuestReadable(p, l) {
 			return h, false
 		}
 		src := unsafe.Slice((*byte)(osPtr(p)), l)
@@ -1878,7 +1878,7 @@ func newD3D12XDevice() uintptr {
 		if streamDesc >= 0x10000 {
 			sz := *(*uint64)(osPtr(streamDesc + 0))
 			sub := *(*uintptr)(osPtr(streamDesc + 8))
-			if sub >= 0x10000 && sz >= 24 && sz <= 4096 {
+			if sub >= 0x10000 && sz >= 24 && sz <= 4096 && isGuestReadable(sub, sz) {
 				q := unsafe.Slice((*uint64)(osPtr(sub)), sz/8)
 				gp := &guestPSO{}
 				// Un subobject shader dans D3D12_PIPELINE_STATE_STREAM_DESC est précédé de son tag u32
