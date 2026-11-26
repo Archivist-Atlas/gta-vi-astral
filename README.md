@@ -6,27 +6,28 @@ Système modulaire en **Go** pour l'analyse, la recompilation de shaders et l'ex
 
 > [!WARNING]
 > **Projet expérimental en cours de développement — NON JOUABLE actuellement.**
-> Le moteur démarre, charge toutes ses archives (`.rpf` + TTDB + licences), connecte l'utilisateur hors-ligne (`XUser` + `XGameSave`) et tourne en boucle continue **780+ frames `PresentX` sur 45 s (0 crash, 0 `WARN`)** avec recompilation live de ses shaders RDNA2 sur GPU Windows, mais le rendu 3D complet et l'audio ne sont **pas encore fonctionnels**.
+> Le moteur démarre, charge toutes ses archives (`.rpf` + TTDB + licences), connecte l'utilisateur hors-ligne (`XUser` + `XGameSave`), lit la **vidéo d'introduction 4K Bink2 avec son audio** et affiche les **menus de configuration** en boucle continue avec recompilation live de ses shaders RDNA2 sur GPU Windows, mais le **rendu 3D temps réel du monde ouvert** n'est pas encore fonctionnel.
 
-## Avancement global : ~46 %
+## Avancement global : ~54 %
 
 ```text
-Progression globale : [█████████░░░░░░░░░░░] 46 %
+Progression globale : [███████████░░░░░░░░░] 54 %
 ```
 
-- **Boot natif continu + `XUser` + `XGameSave` + `XAsyncRun` + `XStore` + DirectStorage (`story000.rpf`)** : ✅ Opérationnel (`90 %`)
-- **Interfaces 2D / menus de configuration (`ASTRALPLAYER (A)` -> `EXPÉRIENCE DE NAVIGATION` -> `TERMINER LA CONFIGURATION ?`)** : 🔄 En cours (`~75 %` — navigation et textes fonctionnels, fond de panneau UI encore imparfait)
-- **Audio console (`xapu` Opus + `AcpHal` XMA2 vers WASAPI)** : 🔄 En cours (`~35 %` — décodage Opus 48 kHz pur Go opérationnel pour les sons UI/clics + pacing 60 Hz ; décodage XMA2 et audio d'intro à compléter)
-- **Rendu 3D temps réel & monde ouvert jouable (shaders 3D bindless, G-Buffer, Depth-Stencil, BCPack, ray tracing)** : ⏳ Début (`~15 %`)
+- **Boot natif continu + `XUser` + `XGameSave` + `XAsyncRun` + `XStore` + DirectStorage (`story000.rpf`) + BCPack pur Go** : ✅ Opérationnel (`92 %`)
+- **Vidéo d'introduction 4K Bink2 + Audio** : ✅ Opérationnel (`100 %` — passe matérielle D3D12 YUV420p BT.709 fluide, couleurs fidèles, sans trames noires)
+- **Interfaces 2D / menus de configuration (`ASTRALPLAYER (A)` -> `TAILLE DE L'INTERFACE` -> `LUMINOSITÉ` -> `MENTIONS LÉGALES`)** : 🔄 En cours (`~82 %` — navigation manette, dégradés et fonds Vice City nets ; courbe gamma luminosité et quelques glyphes courts à corriger)
+- **Audio console (`xapu` Opus + audio d'intro + `AcpHal` XMA2)** : 🔄 En cours (`~55 %` — audio d'intro, sons UI Opus 48 kHz pur Go et musique de chargement avec bouton mute persisté opérationnels ; décodage XMA2 in-game à compléter)
+- **Rendu 3D temps réel & monde ouvert jouable (shaders 3D bindless, G-Buffer, Depth-Stencil, ray tracing)** : ⏳ Début (`~18 %`)
 
 | Sous-système | Avancement | État actuel | Reste à faire |
 | :--- | :---: | :--- | :--- |
 | **Chargeur PE / Mémoire / CPU x64** | `90 %` | Mappage natif, `DllMain` des DLL du titre, 53 246 patchs TLS, VEH + émulation AMD Zen 2 (`CLZERO`, `MONITORX`, `MWAITX`, `RDPRU`, `CLWB`, SSE4a `INSERTQ`/`EXTRQ`), pools physiques 64 KiB (`xmem` 6,2 Go) + `xmemMapAlias` + `xmemWritePhysical`. | Cas limites CPU/mémoire en monde ouvert. |
-| **Stockage & Streaming (`VirtualFS` / `DirectStorage`)** | `75 %` | 20+ `.rpf` (jusqu'à `story000.rpf` / `story000_script.rpf`) et TTDB `.ttpf` ouverts ; 23 000+ requêtes `ReadAt` + `zlib`, `EnqueueSignal`, et `PAGE_DESTINATION` (pages physiques 64 KiB). | Décompression **BCPack** (textures 3D BC1–BC7) et exécution **asynchrone** multi-thread (pour ne plus bloquer l'audio). |
+| **Stockage & Streaming (`VirtualFS` / `DirectStorage` / `BCPack`)** | `85 %` | 20+ `.rpf` (jusqu'à `story000.rpf` / `story000_script.rpf`) et TTDB `.ttpf` ouverts ; file `Submit()` FIFO stricte, `zlib`, `PAGE_DESTINATION` (pages 64 KiB), **décodeur BCPack pur Go (BC1/BC3/BC4/BC5/BC6H/BC7)** et continuation multi-pages. | Exécution **asynchrone** multi-thread et cas limites streaming monde ouvert. |
 | **OS Console / HLE (`xgameruntime`, `GameInput`)** | `88 %` | `xasync`/`XTaskQueue` (ports partagés composites), `xuser` (`AstralPlayer`), `xgamesave` 30 slots sur disque, `xstore`/`xgameui`/`xnetworking` hors-ligne, `OEM\ConsoleMode`, `GameInput` complet (DualSense PS5 / XInput / clavier). | APIs secondaires rencontrées en jeu. |
-| **Audio (`AcpHal` / `xapu` / `chad`)** | `35 %` | Allocation/mapping APU (`ApuMapVirtualAddress` corrigé), canal `IAcpHal`, décodeur **Opus 48 kHz pur Go** actif (`xapu.dll`, `ApuResult` 80 octets, sons de clics UI audibles), pacing 60 Hz (`timeBeginPeriod(1)`). | Décodage **XMA2** (`AcpHal` SHAPE 350 contextes), correction complète de l'audio global d'intro. |
-| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `30 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10 partiel, recompilation live HLSL SM 5.0 suffisante pour l'UI 2D Scaleform et quelques Compute Shaders simples. | Masque `EXEC` par lane, descripteurs **bindless**, `LDS`/`FLAT`, émulation wave64, **DXIL SM 6.6**, Mesh/Amplification Shaders (indispensables pour la 3D). |
-| **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `35 %` | Fenêtre Win32 unique 1280×720, `PresentX` à 30 fps, rejeu de passes 2D/UI, RenderTargets offscreen, rafraîchissement dynamique de l'atlas de police, détuilage RDNA2, Compute root bindings de base. | **G-Buffer / MRT**, **Depth-Stencil (`DSV`)**, tas de descripteurs bindless, `ExecuteIndirect`, synchronisation inter-files (`Wait64BitValueX`), rendu 3D complet. |
+| **Audio (`AcpHal` / `xapu` / `chad`)** | `55 %` | Audio d'intro fonctionnel, allocation/mapping APU (`ApuMapVirtualAddress`), décodeur **Opus 48 kHz pur Go** (`xapu.dll`, sons UI), pacing 60 Hz (`timeBeginPeriod(1)`), musique d'écran de chargement (`go-mp3` + `waveOut`) avec bouton mute persisté. | Décodage **XMA2** (`AcpHal` SHAPE 350 contextes) pour les sons et dialogues en jeu. |
+| **Recompilateur Shaders RDNA2 (`pkg/shader`)** | `32 %` | Extraction `DXBC->XDAT->XBCH->FSSM`, décodeur GFX10 partiel, recompilation live HLSL SM 5.0 suffisante pour l'UI 2D Scaleform et plusieurs Compute Shaders. | Masque `EXEC` par lane, descripteurs **bindless**, `LDS`/`FLAT`, émulation wave64, **DXIL SM 6.6**, Mesh/Amplification Shaders (indispensables pour la 3D). |
+| **Pont GPU Hôte D3D12 (`pkg/gpu` + `d3d12x`)** | `45 %` | Fenêtre Win32 unique 1280×720 à lancement instantané, **vidéo d'intro 4K Bink2 (PSO BT.709 YUV420p→RGB)** 100 % fluide, `PresentX`, RenderTargets offscreen, détuilage RDNA2 aligné sur tuiles, splash synthwave + barre néon + bouton audio. | **G-Buffer / MRT**, **Depth-Stencil (`DSV`)**, passe composite gamma, tas de descripteurs bindless, `ExecuteIndirect`, synchronisation inter-files (`Wait64BitValueX`), rendu 3D complet. |
 
 ## Captures d'avancement
 
@@ -34,15 +35,21 @@ Les captures d'écran illustrant les jalons techniques sont stockées dans [`doc
 
 ### Écran de chargement / préchargeur (splash D3D12 + barre néon temps réel)
 
-![Écran de chargement GTA VI Astral](docs/screenshots/03-ecran-chargement-preloader.jpg)
+![Écran de chargement GTA VI Astral](docs/screenshots/01-ecran-chargement-preloader.jpg)
 
-*Écran de préchargement natif dans la fenêtre `gta-vi-astral` (icône synthwave dédiée + barre de progression néon pilotée en temps réel par DirectStorage, `XUser` et `XGameSave`).*
+*Écran de préchargement natif dans la fenêtre `gta-vi-astral` (icône synthwave dédiée, bouton audio mute/unmute persisté et barre de progression néon pilotée en temps réel par DirectStorage, `XUser` et `XGameSave`).*
 
 ### Profil `ASTRALPLAYER (A)` actif & sélectionnable à la manette
 
 ![Sélecteur de profil et AstralPlayer (A)](docs/screenshots/02-selecteur-profil-astralplayer.png)
 
 *Profil hors-ligne `ASTRALPLAYER (A)` affiché en temps réel suite à la résolution complète de `XUSER_GAMERTAG_IID`, `XUSER_DEVICE` et de la vtable 30 slots `XGameSave`.*
+
+### Vidéo d'introduction 4K Bink2 fonctionnelle (image + audio)
+
+![Vidéo d'introduction GTA VI](docs/screenshots/03-video-intro.jpg)
+
+*Cinématique d'introduction 4K Bink2 décodée et affichée en temps réel via la passe matérielle D3D12 YUV420p BT.709→RGB avec son audio synchronisé.*
 
 ## Pourquoi ASTRAL ?
 
@@ -59,7 +66,7 @@ gta-vi-astral/
 ├── pkg/
 │   ├── core/         # Configuration TOML/env, garde-fou anti-fuite (.astral-root), logs slog
 │   ├── pe/           # Analyseur PE32+ x86-64 (sections, entropie, imports/exports, TLS, .pdata, CodeView)
-│   ├── formats/      # SGD5, RPF9 (en-tête), layouts textures RDNA2 GFX10.3, AWC audio, JOAAT32
+│   ├── formats/      # SGD5, RPF9 (en-tête), BCPack pur Go (BC1–BC7), layouts textures RDNA2 GFX10.3, AWC audio, JOAAT32
 │   ├── shader/       # DXBC -> XDAT -> XBCH -> FSSM, décodeur RDNA2/GFX10, CFG/IR, cible DXIL ou SPIR-V
 │   ├── pipeline/     # Cache atomique SHA-256 hors dépôt + orchestrateur parallèle par goroutines
 │   ├── gpu/          # Contrats ABI Xbox D3D12.X + abstraction double backend (D3D12 / Vulkan)
