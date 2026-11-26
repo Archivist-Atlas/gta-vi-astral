@@ -278,8 +278,8 @@ func CompileHLSL(source, entryPoint, target string) ([]byte, error) {
 	entryBytes := append([]byte(entryPoint), 0)
 	targetBytes := append([]byte(target), 0)
 	var flags1 uintptr
-	if len(source) > 16384 {
-		// Évite 5-10s de blocage D3DCompile sur les gros Compute Shaders (2000+ ins) -> prévient le watchdog RAGE.
+	if len(source) > 8192 {
+		// Évite 5-20s de blocage D3DCompile sur les gros shaders 3D/Compute -> prévient le watchdog RAGE.
 		flags1 = (1 << 2) | (1 << 14) // D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_OPTIMIZATION_LEVEL0
 	}
 	var codeBlob, errBlob uintptr

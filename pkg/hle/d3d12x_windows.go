@@ -1004,6 +1004,7 @@ func newD3D12XDevice() uintptr {
 		}
 		return fmt.Sprintf("len=%d parts=[%s] native=[%s]", len(data), parts, nat)
 	}
+	psoCompileSem := make(chan struct{}, 4)
 	compileGuestPSO := func(psoObj uintptr, gp *guestPSO) {
 		if gp.hasCS && !gp.hasVS {
 			st.mu.Lock()
@@ -1015,6 +1016,8 @@ func newD3D12XDevice() uintptr {
 			// Compile les Compute PSO en arrière-plan : ne jamais bloquer le thread de rendu du jeu
 			// pendant 15-20s sur D3DCompile (déclenchait le watchdog RAGE 0x4D8BD421).
 			go func(psoObj uintptr, gp *guestPSO, csData []byte) {
+				psoCompileSem <- struct{}{}
+				defer func() { <-psoCompileSem }()
 				csC, err := shader.ParseDXBC(csData)
 				if err != nil {
 					return
@@ -1101,68 +1104,81 @@ func newD3D12XDevice() uintptr {
 				})
 			}
 		}
-		var hPSO uintptr
-		var cerr error
-		isGammaComposite := vsOut.TotalInsts == 45 && psOut.TotalInsts >= 60 && len(psOut.SRVDescriptorSlots) == 1
-		if isGammaComposite {
-			// Le VS 45/45 lit une 2e matrice CBV absente ; on l'associe à un VS triangle plein écran
-			// tout en exécutant le vrai PS 70/70 recompilé (courbe gamma / luminosité).
-			fsVS := buildFullscreenCompositeVS(psC)
-			opaqueBlend := &gpu.HostBlendState{
-				BlendEnable: false, SrcBlend: 2, DestBlend: 1, BlendOp: 1,
-				SrcBlendAlpha: 2, DestBlendAlpha: 1, BlendOpAlpha: 1, WriteMask: 0x0F,
+		finishGraphicsPSO := func() {
+			var hPSO uintptr
+			var cerr error
+			isGammaComposite := vsOut.TotalInsts == 45 && psOut.TotalInsts >= 60 && len(psOut.SRVDescriptorSlots) == 1
+			if isGammaComposite {
+				// Le VS 45/45 lit une 2e matrice CBV absente ; on l'associe à un VS triangle plein écran
+				// tout en exécutant le vrai PS 70/70 recompilé (courbe gamma / luminosité).
+				fsVS := buildFullscreenCompositeVS(psC)
+				opaqueBlend := &gpu.HostBlendState{
+					BlendEnable: false, SrcBlend: 2, DestBlend: 1, BlendOp: 1,
+					SrcBlendAlpha: 2, DestBlendAlpha: 1, BlendOpAlpha: 1, WriteMask: 0x0F,
+				}
+				hPSO, cerr = gpu.CompileHostPSOWithBlend(fsVS, "VSMain", psOut.Source, psOut.EntryPoint, nil, opaqueBlend)
+				if cerr == nil && hPSO != 0 {
+					gpu.RegisterGammaCompositePSO(hPSO)
+					slog.Info("PSO composite gamma/luminosité plein écran activé (PS réel 70/70)", "guestPSO", fmt.Sprintf("0x%X", psoObj), "hostPSO", fmt.Sprintf("0x%X", hPSO))
+				}
+			} else {
+				hPSO, cerr = gpu.CompileHostPSOWithBlend(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems, gp.blend)
 			}
-			hPSO, cerr = gpu.CompileHostPSOWithBlend(fsVS, "VSMain", psOut.Source, psOut.EntryPoint, nil, opaqueBlend)
-			if cerr == nil && hPSO != 0 {
-				gpu.RegisterGammaCompositePSO(hPSO)
-				slog.Info("PSO composite gamma/luminosité plein écran activé (PS réel 70/70)", "guestPSO", fmt.Sprintf("0x%X", psoObj), "hostPSO", fmt.Sprintf("0x%X", hPSO))
+			if cerr != nil {
+				slog.Warn("Recompilation PSO RDNA2->HLSL->D3D12 échouée (repli actif)", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
+				return
 			}
+			st.mu.Lock()
+			gp.hostPSO = hPSO
+			gp.vsCBSlot = vsOut.CBDescriptorSlot
+			gp.psCBSlot = psOut.CBDescriptorSlot
+			gp.psSRVCount = len(psOut.SRVDescriptorSlots)
+			if gp.psSRVCount > 4 {
+				gp.psSRVCount = 4
+			}
+			for i := 0; i < gp.psSRVCount; i++ {
+				gp.psSRVSlots[i] = psOut.SRVDescriptorSlots[i]
+			}
+			st.mu.Unlock()
+			blendDesc := "default"
+			if gp.blend != nil {
+				blendDesc = fmt.Sprintf("en=%v src=%d dst=%d op=%d", gp.blend.BlendEnable, gp.blend.SrcBlend, gp.blend.DestBlend, gp.blend.BlendOp)
+			}
+			ilDescStr := "none"
+			if len(gp.inputElems) > 0 {
+				var parts []string
+				for _, el := range gp.inputElems {
+					parts = append(parts, fmt.Sprintf("%s%d:fmt%d@%d/s%d", el.SemanticName, el.SemanticIndex, el.Format, el.AlignedByteOffset, el.InputSlot))
+				}
+				ilDescStr = strings.Join(parts, ",")
+			}
+			slog.Info("PSO RDNA2 recompilé en ID3D12PipelineState matériel",
+				"guestPSO", fmt.Sprintf("0x%X", psoObj),
+				"hostPSO", fmt.Sprintf("0x%X", hPSO),
+				"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
+				"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
+				"missingPS", psOut.MissingOps,
+				"blend", blendDesc,
+				"guestIL", ilDescStr,
+				"vsCBSlot", vsOut.CBDescriptorSlot,
+				"psCBSlot", psOut.CBDescriptorSlot,
+				"psSRVs", psOut.SRVDescriptorSlots,
+			)
+			if dumpFrame {
+				_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_vs.hlsl", os.TempDir(), hPSO), []byte(vsOut.Source), 0o644)
+				_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_ps.hlsl", os.TempDir(), hPSO), []byte(psOut.Source), 0o644)
+			}
+		}
+		// Les petits PSO UI/vidéo (<= 160 ins) compilent en <20ms de façon synchrone ;
+		// les gros PSO 3D du monde compilent en arrière-plan pour ne jamais bloquer PresentX (>30s = watchdog 0x4D8BD421).
+		if vsOut.TotalInsts+psOut.TotalInsts > 160 {
+			go func() {
+				psoCompileSem <- struct{}{}
+				defer func() { <-psoCompileSem }()
+				finishGraphicsPSO()
+			}()
 		} else {
-			hPSO, cerr = gpu.CompileHostPSOWithBlend(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems, gp.blend)
-		}
-		if cerr != nil {
-			slog.Warn("Recompilation PSO RDNA2->HLSL->D3D12 échouée (repli actif)", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
-			return
-		}
-		st.mu.Lock()
-		gp.hostPSO = hPSO
-		gp.vsCBSlot = vsOut.CBDescriptorSlot
-		gp.psCBSlot = psOut.CBDescriptorSlot
-		gp.psSRVCount = len(psOut.SRVDescriptorSlots)
-		if gp.psSRVCount > 4 {
-			gp.psSRVCount = 4
-		}
-		for i := 0; i < gp.psSRVCount; i++ {
-			gp.psSRVSlots[i] = psOut.SRVDescriptorSlots[i]
-		}
-		st.mu.Unlock()
-		blendDesc := "default"
-		if gp.blend != nil {
-			blendDesc = fmt.Sprintf("en=%v src=%d dst=%d op=%d", gp.blend.BlendEnable, gp.blend.SrcBlend, gp.blend.DestBlend, gp.blend.BlendOp)
-		}
-		ilDescStr := "none"
-		if len(gp.inputElems) > 0 {
-			var parts []string
-			for _, el := range gp.inputElems {
-				parts = append(parts, fmt.Sprintf("%s%d:fmt%d@%d/s%d", el.SemanticName, el.SemanticIndex, el.Format, el.AlignedByteOffset, el.InputSlot))
-			}
-			ilDescStr = strings.Join(parts, ",")
-		}
-		slog.Info("PSO RDNA2 recompilé en ID3D12PipelineState matériel",
-			"guestPSO", fmt.Sprintf("0x%X", psoObj),
-			"hostPSO", fmt.Sprintf("0x%X", hPSO),
-			"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
-			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
-			"missingPS", psOut.MissingOps,
-			"blend", blendDesc,
-			"guestIL", ilDescStr,
-			"vsCBSlot", vsOut.CBDescriptorSlot,
-			"psCBSlot", psOut.CBDescriptorSlot,
-			"psSRVs", psOut.SRVDescriptorSlots,
-		)
-		if dumpFrame {
-			_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_vs.hlsl", os.TempDir(), hPSO), []byte(vsOut.Source), 0o644)
-			_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_ps.hlsl", os.TempDir(), hPSO), []byte(psOut.Source), 0o644)
+			finishGraphicsPSO()
 		}
 		if gpuTrace {
 			slog.Info("GPU_TRACE PSO missing ops", "guestPSO", fmt.Sprintf("0x%X", psoObj), "vsMissing", vsOut.MissingOps, "psMissing", psOut.MissingOps)
