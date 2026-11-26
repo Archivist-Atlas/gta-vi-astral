@@ -84,6 +84,36 @@ func isGuestReadable(addr uintptr, sz uint64) bool {
 	return guestReadableLen(addr, sz) >= sz
 }
 
+// cmdListState isole l'état d'enregistrement GPU par ID3D12GraphicsCommandListX (multi-thread safe).
+type cmdListState struct {
+	hostPSO    uintptr
+	hostCSPSO  uintptr
+	vbVA       uintptr
+	vbSize     uint32
+	vbStride   uint32
+	ibVA       uintptr
+	ibSize     uint32
+	ibFormat   uint32
+	topology   uint32
+	rtvCount   uint32
+	rtvVA      uint64
+	rootVA     uintptr
+	rootSize   uint32
+	csRootVA   uintptr
+	csRootSize uint32
+	cbSlot     uint32
+	psCBSlot   uint32
+	psSRVSlots [4]uint32
+	psSRVCount int
+	cbvSlots   [16]struct {
+		va   uintptr
+		size uint32
+	}
+	srvSlots [16]*gpu.HostTextureUpload
+	srvVA    uint64
+	srvTex   *gpu.HostTextureUpload
+}
+
 // d3d12xState centralise les objets COM Xbox Series D3D12.X créés pendant le boot.
 type d3d12xState struct {
 	mu              sync.Mutex
@@ -97,32 +127,7 @@ type d3d12xState struct {
 	rtvResources    map[uintptr]uintptr
 	psos            map[uintptr]*guestPSO
 	dxbcBlobs       map[[16]byte][]byte
-	activeHostPSO   uintptr
-	activeHostCSPSO uintptr
-	activeVBVA      uintptr
-	activeVBSize    uint32
-	activeVBStride  uint32
-	activeIBVA      uintptr
-	activeIBSize    uint32
-	activeIBFormat  uint32
-	activeTopology  uint32
-	activeRTVCount  uint32
-	activeRTVVA     uint64
-	activeRootVA     uintptr
-	activeRootSize   uint32
-	activeCSRootVA   uintptr
-	activeCSRootSize uint32
-	activeCBSlot     uint32
-	activePSCBSlot   uint32
-	activePSSRVSlots [4]uint32
-	activePSSRVCount int
-	activeCBVSlots   [16]struct {
-		va   uintptr
-		size uint32
-	}
-	activeSRVSlots  [16]*gpu.HostTextureUpload
-	activeSRVVA     uint64
-	activeSRVTex    *gpu.HostTextureUpload
+	lists           map[uintptr]*cmdListState
 	frameDispatches []gpu.HostDispatchPass
 	frameDraws      []gpu.HostDrawPass
 	frameTexCache   map[uint64]*gpu.HostTextureUpload
@@ -141,6 +146,15 @@ type d3d12xState struct {
 	clearRTVCalls   atomic.Uint64
 }
 
+func (st *d3d12xState) getList(this uintptr) *cmdListState {
+	cl, ok := st.lists[this]
+	if !ok {
+		cl = &cmdListState{}
+		st.lists[this] = cl
+	}
+	return cl
+}
+
 func newD3D12XDevice() uintptr {
 	st := &d3d12xState{
 		fenceWaiters:   make(map[uintptr][]fenceWaiter),
@@ -150,6 +164,7 @@ func newD3D12XDevice() uintptr {
 		rtvResources:   make(map[uintptr]uintptr),
 		psos:           make(map[uintptr]*guestPSO),
 		dxbcBlobs:      make(map[[16]byte][]byte),
+		lists:          make(map[uintptr]*cmdListState),
 		frameTexCache:  make(map[uint64]*gpu.HostTextureUpload),
 		rtvSeenVAs:     make(map[uint64]bool),
 		lastClearColor: [4]float32{0.04, 0.05, 0.09, 1.0},
@@ -595,45 +610,46 @@ func newD3D12XDevice() uintptr {
 			return hresultOK
 		})
 	}
-	recordDrawPass := func(indexed bool, count, instCount, startLoc uint32, baseVtx int32, startInst uint32) {
+	recordDrawPass := func(this uintptr, indexed bool, count, instCount, startLoc uint32, baseVtx int32, startInst uint32) {
 		st.mu.Lock()
+		cl := st.getList(this)
 		if len(st.frameDraws) < 512 {
 			pass := gpu.HostDrawPass{
 				Indexed:       indexed,
-				Topology:      st.activeTopology,
+				Topology:      cl.topology,
 				VertexCount:   count,
 				InstanceCount: instCount,
 				StartVertex:   startLoc,
 				BaseVertex:    baseVtx,
 				StartInstance: startInst,
-				HostPSO:       st.activeHostPSO,
-				TargetVA:      st.activeRTVVA,
-				SRVGuestVA:    st.activeSRVVA,
-				VBStride:      st.activeVBStride,
-				IBFormat:      st.activeIBFormat,
+				HostPSO:       cl.hostPSO,
+				TargetVA:      cl.rtvVA,
+				SRVGuestVA:    cl.srvVA,
+				VBStride:      cl.vbStride,
+				IBFormat:      cl.ibFormat,
 			}
-			if st.activeVBVA >= 0x10000 && st.activeVBSize > 0 {
-				cpLen := st.activeVBSize
+			if cl.vbVA >= 0x10000 && cl.vbSize > 0 {
+				cpLen := cl.vbSize
 				if cpLen > (1 << 20) {
 					cpLen = 1 << 20
 				}
 				pass.VBData = make([]byte, cpLen)
-				copy(pass.VBData, unsafe.Slice((*byte)(osPtr(st.activeVBVA)), cpLen))
+				copy(pass.VBData, unsafe.Slice((*byte)(osPtr(cl.vbVA)), cpLen))
 			}
-			if indexed && st.activeIBVA >= 0x10000 && st.activeIBSize > 0 {
-				cpLen := st.activeIBSize
+			if indexed && cl.ibVA >= 0x10000 && cl.ibSize > 0 {
+				cpLen := cl.ibSize
 				if cpLen > (1 << 20) {
 					cpLen = 1 << 20
 				}
 				pass.IBData = make([]byte, cpLen)
-				copy(pass.IBData, unsafe.Slice((*byte)(osPtr(st.activeIBVA)), cpLen))
+				copy(pass.IBData, unsafe.Slice((*byte)(osPtr(cl.ibVA)), cpLen))
 			}
 			readCB := func(slot uint32) []byte {
-				cbVA := st.activeRootVA
-				cbSz := st.activeRootSize
-				if slot < 16 && st.activeCBVSlots[slot].va >= 0x10000 {
-					cbVA = st.activeCBVSlots[slot].va
-					cbSz = st.activeCBVSlots[slot].size
+				cbVA := cl.rootVA
+				cbSz := cl.rootSize
+				if slot < 16 && cl.cbvSlots[slot].va >= 0x10000 {
+					cbVA = cl.cbvSlots[slot].va
+					cbSz = cl.cbvSlots[slot].size
 				}
 				if cbVA < 0x10000 {
 					return nil
@@ -653,9 +669,9 @@ func newD3D12XDevice() uintptr {
 				copy(buf, unsafe.Slice((*byte)(osPtr(cbVA)), avail))
 				return buf
 			}
-			pass.CBData = readCB(st.activeCBSlot)
-			if st.activePSCBSlot != st.activeCBSlot {
-				pass.PSCBData = readCB(st.activePSCBSlot)
+			pass.CBData = readCB(cl.cbSlot)
+			if cl.psCBSlot != cl.cbSlot {
+				pass.PSCBData = readCB(cl.psCBSlot)
 			}
 			cloneSRV := func(src *gpu.HostTextureUpload) *gpu.HostTextureUpload {
 				if src == nil || st.rtvSeenVAs[src.GuestVA] {
@@ -683,16 +699,16 @@ func newD3D12XDevice() uintptr {
 				}
 				return nil
 			}
-			if st.activePSSRVCount > 0 {
-				for si := 0; si < st.activePSSRVCount && si < 4; si++ {
-					gSlot := st.activePSSRVSlots[si]
+			if cl.psSRVCount > 0 {
+				for si := 0; si < cl.psSRVCount && si < 4; si++ {
+					gSlot := cl.psSRVSlots[si]
 					var src *gpu.HostTextureUpload
 					if gSlot < 16 {
-						src = st.activeSRVSlots[gSlot]
+						src = cl.srvSlots[gSlot]
 					}
 					if si == 0 {
 						if src == nil {
-							src = st.activeSRVTex
+							src = cl.srvTex
 						}
 						if src != nil {
 							pass.SRVGuestVA = src.GuestVA
@@ -702,8 +718,8 @@ func newD3D12XDevice() uintptr {
 						pass.ExtraSRVs[si-1] = cloneSRV(src)
 					}
 				}
-			} else if st.activeSRVTex != nil {
-				pass.SRVTex = cloneSRV(st.activeSRVTex)
+			} else if cl.srvTex != nil {
+				pass.SRVTex = cloneSRV(cl.srvTex)
 			}
 			st.frameDraws = append(st.frameDraws, pass)
 		}
@@ -712,7 +728,7 @@ func newD3D12XDevice() uintptr {
 	cbListDrawInst := syscall.NewCallback(func(this, vtxCount, instCount, startVtx, startInst uintptr) uintptr {
 		listSlotHits[12].Add(1)
 		n := st.drawCalls.Add(1)
-		recordDrawPass(false, uint32(vtxCount), uint32(instCount), uint32(startVtx), 0, uint32(startInst))
+		recordDrawPass(this, false, uint32(vtxCount), uint32(instCount), uint32(startVtx), 0, uint32(startInst))
 		if gpuTrace && n <= 12 {
 			slog.Info("GPU_TRACE DrawInstanced", "n", n, "vtx", uint32(vtxCount), "inst", uint32(instCount), "startVtx", uint32(startVtx), "startInst", uint32(startInst))
 		}
@@ -721,7 +737,7 @@ func newD3D12XDevice() uintptr {
 	cbListDrawIdx := syscall.NewCallback(func(this, idxCount, instCount, startIdx, baseVtx, startInst uintptr) uintptr {
 		listSlotHits[13].Add(1)
 		n := st.drawCalls.Add(1)
-		recordDrawPass(true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
+		recordDrawPass(this, true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
 		if gpuTrace && n <= 12 {
 			slog.Info("GPU_TRACE DrawIndexedInstanced", "n", n, "idx", uint32(idxCount), "inst", uint32(instCount), "startIdx", uint32(startIdx), "baseVtx", int32(baseVtx))
 		}
@@ -730,7 +746,7 @@ func newD3D12XDevice() uintptr {
 	cbListDrawIdxX := syscall.NewCallback(func(this, idxCount, instCount, startIdx, baseVtx, startInst uintptr) uintptr {
 		listSlotHits[81].Add(1)
 		n := st.drawCalls.Add(1)
-		recordDrawPass(true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
+		recordDrawPass(this, true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
 		if gpuTrace && n <= 12 {
 			slog.Info("GPU_TRACE DrawIndexedX", "n", n, "idx", uint32(idxCount), "inst", uint32(instCount), "startIdx", uint32(startIdx))
 		}
@@ -740,18 +756,19 @@ func newD3D12XDevice() uintptr {
 		listSlotHits[14].Add(1)
 		st.dispatchCalls.Add(1)
 		st.mu.Lock()
-		if len(st.frameDispatches) < 32 && st.activeHostCSPSO != 0 {
+		cl := st.getList(this)
+		if len(st.frameDispatches) < 32 && cl.hostCSPSO != 0 {
 			dp := gpu.HostDispatchPass{
 				X:       uint32(x),
 				Y:       uint32(y),
 				Z:       uint32(z),
-				HostPSO: st.activeHostCSPSO,
+				HostPSO: cl.hostCSPSO,
 			}
-			csVA := st.activeCSRootVA
-			csSz := st.activeCSRootSize
+			csVA := cl.csRootVA
+			csSz := cl.csRootSize
 			if csVA < 0x10000 {
-				csVA = st.activeRootVA
-				csSz = st.activeRootSize
+				csVA = cl.rootVA
+				csSz = cl.rootSize
 			}
 			if csVA >= 0x10000 {
 				if csSz < 256 {
@@ -760,9 +777,9 @@ func newD3D12XDevice() uintptr {
 				if csSz > 4096 {
 					csSz = 4096
 				}
-				if isGuestReadable(csVA, uint64(csSz)) {
-					dp.CBData = make([]byte, csSz)
-					copy(dp.CBData, unsafe.Slice((*byte)(osPtr(csVA)), csSz))
+				if avail := guestReadableLen(csVA, uint64(csSz)); avail > 0 {
+					dp.CBData = make([]byte, avail)
+					copy(dp.CBData, unsafe.Slice((*byte)(osPtr(csVA)), avail))
 				}
 			}
 			st.frameDispatches = append(st.frameDispatches, dp)
@@ -942,14 +959,15 @@ func newD3D12XDevice() uintptr {
 					compileGuestPSO(pso, gp)
 				}
 				st.mu.Lock()
+				cl := st.getList(this)
 				if gp.hasCS && !gp.hasVS {
-					st.activeHostCSPSO = gp.hostPSO
+					cl.hostCSPSO = gp.hostPSO
 				} else {
-					st.activeHostPSO = gp.hostPSO
-					st.activeCBSlot = gp.vsCBSlot
-					st.activePSCBSlot = gp.psCBSlot
-					st.activePSSRVSlots = gp.psSRVSlots
-					st.activePSSRVCount = gp.psSRVCount
+					cl.hostPSO = gp.hostPSO
+					cl.cbSlot = gp.vsCBSlot
+					cl.psCBSlot = gp.psCBSlot
+					cl.psSRVSlots = gp.psSRVSlots
+					cl.psSRVCount = gp.psSRVCount
 				}
 				st.mu.Unlock()
 			}
@@ -960,6 +978,7 @@ func newD3D12XDevice() uintptr {
 		listSlotHits[36].Add(1)
 		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
 			st.mu.Lock()
+			cl := st.getList(this)
 			foundSRV := false
 			for s := uintptr(0); s < 16; s++ {
 				slotPtr := baseDesc + s*32
@@ -972,11 +991,11 @@ func newD3D12XDevice() uintptr {
 					cbVA := *(*uintptr)(osPtr(slotPtr + 8))
 					cbSz := *(*uint32)(osPtr(slotPtr + 16))
 					if cbVA >= 0x10000 && cbVA < 0x800000000000 {
-						st.activeCBVSlots[s].va = cbVA
-						st.activeCBVSlots[s].size = cbSz
+						cl.cbvSlots[s].va = cbVA
+						cl.cbvSlots[s].size = cbSz
 						if s == 0 {
-							st.activeRootVA = cbVA
-							st.activeRootSize = cbSz
+							cl.rootVA = cbVA
+							cl.rootSize = cbSz
 						}
 					}
 				case 0x53525632: // "SRV2"
@@ -997,10 +1016,10 @@ func newD3D12XDevice() uintptr {
 							Format:  fmtID,
 							Swizzle: swz,
 						}
-						st.activeSRVSlots[s] = tx
+						cl.srvSlots[s] = tx
 						if !foundSRV {
-							st.activeSRVVA = va
-							st.activeSRVTex = tx
+							cl.srvVA = va
+							cl.srvTex = tx
 							foundSRV = true
 						}
 					}
@@ -1014,11 +1033,12 @@ func newD3D12XDevice() uintptr {
 		c := listSlotHits[42].Add(1)
 		if gpuVA >= 0x10000 && gpuVA < 0x800000000000 {
 			st.mu.Lock()
-			st.activeRootVA = gpuVA
-			st.activeRootSize = 4096
-			if rootIdx < 8 {
-				st.activeCBVSlots[rootIdx].va = gpuVA
-				st.activeCBVSlots[rootIdx].size = 4096
+			cl := st.getList(this)
+			cl.rootVA = gpuVA
+			cl.rootSize = 4096
+			if rootIdx < 16 {
+				cl.cbvSlots[rootIdx].va = gpuVA
+				cl.cbvSlots[rootIdx].size = 4096
 			}
 			st.mu.Unlock()
 		}
@@ -1031,7 +1051,8 @@ func newD3D12XDevice() uintptr {
 		c := listSlotHits[44].Add(1)
 		if gpuVA >= 0x10000 && gpuVA < 0x800000000000 {
 			st.mu.Lock()
-			st.activeRootVA = gpuVA
+			cl := st.getList(this)
+			cl.rootVA = gpuVA
 			st.mu.Unlock()
 		}
 		if gpuTrace && c <= 8 {
@@ -1048,9 +1069,10 @@ func newD3D12XDevice() uintptr {
 			stride := *(*uint32)(osPtr(viewsPtr + 12))
 			if loc >= 0x10000 && loc < 0x800000000000 && sz > 0 && stride > 0 {
 				st.mu.Lock()
-				st.activeVBVA = uintptr(loc)
-				st.activeVBSize = sz
-				st.activeVBStride = stride
+				cl := st.getList(this)
+				cl.vbVA = uintptr(loc)
+				cl.vbSize = sz
+				cl.vbStride = stride
 				st.mu.Unlock()
 			}
 			if gpuTrace && c <= 8 {
@@ -1067,9 +1089,10 @@ func newD3D12XDevice() uintptr {
 			ibFmt := *(*uint32)(osPtr(viewPtr + 12))
 			if loc >= 0x10000 && loc < 0x800000000000 && sz > 0 {
 				st.mu.Lock()
-				st.activeIBVA = uintptr(loc)
-				st.activeIBSize = sz
-				st.activeIBFormat = ibFmt
+				cl := st.getList(this)
+				cl.ibVA = uintptr(loc)
+				cl.ibSize = sz
+				cl.ibFormat = ibFmt
 				st.mu.Unlock()
 			}
 		}
@@ -1078,7 +1101,7 @@ func newD3D12XDevice() uintptr {
 	cbListSetTopo := syscall.NewCallback(func(this, topo uintptr) uintptr {
 		listSlotHits[20].Add(1)
 		st.mu.Lock()
-		st.activeTopology = uint32(topo)
+		st.getList(this).topology = uint32(topo)
 		st.mu.Unlock()
 		return 0
 	})
@@ -1097,8 +1120,9 @@ func newD3D12XDevice() uintptr {
 			if res != 0 {
 				rtvVA = st.resGPUAddrs[res]
 			}
-			st.activeRTVCount = uint32(numRTVs)
-			st.activeRTVVA = rtvVA
+			cl := st.getList(this)
+			cl.rtvCount = uint32(numRTVs)
+			cl.rtvVA = rtvVA
 			if rtvVA != 0 {
 				st.rtvSeenVAs[rtvVA] = true
 			}
@@ -1106,8 +1130,9 @@ func newD3D12XDevice() uintptr {
 			return 0
 		}
 		st.mu.Lock()
-		st.activeRTVCount = uint32(numRTVs)
-		st.activeRTVVA = 0
+		cl := st.getList(this)
+		cl.rtvCount = uint32(numRTVs)
+		cl.rtvVA = 0
 		st.mu.Unlock()
 		return 0
 	})
@@ -1133,14 +1158,15 @@ func newD3D12XDevice() uintptr {
 		listSlotHits[35].Add(1)
 		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
 			st.mu.Lock()
+			cl := st.getList(this)
 			for s := uintptr(0); s < 8; s++ {
 				slotPtr := baseDesc + s*32
 				if *(*uint32)(osPtr(slotPtr)) == 0x43425631 { // "CBV1"
 					cbVA := *(*uintptr)(osPtr(slotPtr + 8))
 					cbSz := *(*uint32)(osPtr(slotPtr + 16))
 					if cbVA >= 0x10000 && cbVA < 0x800000000000 {
-						st.activeCSRootVA = cbVA
-						st.activeCSRootSize = cbSz
+						cl.csRootVA = cbVA
+						cl.csRootSize = cbSz
 						break
 					}
 				}
@@ -1153,8 +1179,9 @@ func newD3D12XDevice() uintptr {
 		listSlotHits[41].Add(1)
 		if gpuVA >= 0x10000 && gpuVA < 0x800000000000 {
 			st.mu.Lock()
-			st.activeCSRootVA = gpuVA
-			st.activeCSRootSize = 4096
+			cl := st.getList(this)
+			cl.csRootVA = gpuVA
+			cl.csRootSize = 4096
 			st.mu.Unlock()
 		}
 		return 0
@@ -1163,9 +1190,10 @@ func newD3D12XDevice() uintptr {
 		listSlotHits[43].Add(1)
 		if gpuVA >= 0x10000 && gpuVA < 0x800000000000 {
 			st.mu.Lock()
-			if st.activeCSRootVA == 0 {
-				st.activeCSRootVA = gpuVA
-				st.activeCSRootSize = 4096
+			cl := st.getList(this)
+			if cl.csRootVA == 0 {
+				cl.csRootVA = gpuVA
+				cl.csRootSize = 4096
 			}
 			st.mu.Unlock()
 		}

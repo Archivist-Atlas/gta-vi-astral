@@ -978,6 +978,20 @@ func (h *HostD3D12) Present(syncInterval uint32) {
 	h.PresentClear(syncInterval, [4]float32{0.04, 0.05, 0.09, 1.0}, 0, nil, 0, 0, 0, nil)
 }
 
+var procGetForegroundWin = syscall.NewLazyDLL("user32.dll").NewProc("GetForegroundWindow")
+
+// IsWindowFocused retourne true si la fenêtre Astral est actuellement au premier plan (focus Windows).
+func IsWindowFocused() bool {
+	hostMu.Lock()
+	h := hostInstance
+	hostMu.Unlock()
+	if h == nil || h.HWND == 0 {
+		return true
+	}
+	fg, _, _ := procGetForegroundWin.Call()
+	return fg == h.HWND
+}
+
 // PresentHost présente la trame courante sur l'instance globale HostD3D12 si active.
 func PresentHost(syncInterval uint32) {
 	hostMu.Lock()

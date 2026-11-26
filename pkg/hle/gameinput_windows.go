@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+	"github.com/Archivist-Atlas/gta-vi-astral/pkg/gpu"
 )
 
 var (
@@ -133,6 +134,9 @@ func normU16Axis(v uint32, invert bool) float32 {
 // 3) Clavier Windows (WASD = stick gauche, flèches = D-Pad, Entrée/Espace = A, Retour = B, Y/F = Y, R = X, Échap = Menu).
 func pollLiveGamepad() gameInputGamepadState {
 	var st gameInputGamepadState
+	if !gpu.IsWindowFocused() {
+		return st
+	}
 	xinputFound := false
 
 	// 1. Manettes XInput réelles (slots 0..3)
