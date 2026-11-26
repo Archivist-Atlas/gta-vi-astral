@@ -1041,6 +1041,7 @@ func newD3D12XDevice() uintptr {
 				st.mu.Lock()
 				gp.hostPSO = hPSO
 				st.mu.Unlock()
+				gpu.ReportWorldShaderCompiled()
 				slog.Info("Compute PSO RDNA2 recompilé en ID3D12PipelineState matériel",
 					"guestPSO", fmt.Sprintf("0x%X", psoObj),
 					"hostPSO", fmt.Sprintf("0x%X", hPSO),

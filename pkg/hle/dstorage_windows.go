@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -637,6 +638,9 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		3:  cbCreateQueue, // CreateQueue (2020)
 		4:  syscall.NewCallback(func(this, pathPtr, iidPtr, outPtr uintptr) uintptr { // OpenFile
 			orig := readUTF16Str(pathPtr)
+			if strings.Contains(strings.ToLower(orig), "story000.rpf") {
+				gpu.ReportWorldLoadingStarted(ds.readCount.Load())
+			}
 			hostPath := orig
 			if ds.vfs != nil {
 				if mapped, ok := ds.vfs.ResolveRead(orig); ok {

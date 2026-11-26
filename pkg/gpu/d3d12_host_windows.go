@@ -511,12 +511,22 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 			h.introReached = true
 			markIntroReached()
 			ReportBootProgress(1.0)
+			if worldLoadingActive.Load() {
+				worldLoadingActive.Store(false)
+			}
 		} else if len(dispatches) > 0 {
 			ReportBootProgress(0.92)
 		}
 		if !h.introReached && len(srcRGBA) == 0 && h.UploadBuf != 0 && h.UploadPtr != 0 {
 			if splash := h.renderSplashRGBA(); len(splash) > 0 {
 				srcRGBA = splash
+				srcW = h.Width
+				srcH = h.Height
+				srcPitch = h.Width * 4
+			}
+		} else if h.introReached && worldLoadingActive.Load() && realDraws < 8 && len(srcRGBA) == 0 && h.UploadBuf != 0 && h.UploadPtr != 0 {
+			if wl := h.renderWorldLoadingRGBA(); len(wl) > 0 {
+				srcRGBA = wl
 				srcW = h.Width
 				srcH = h.Height
 				srcPitch = h.Width * 4
@@ -673,21 +683,6 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 								"cb", len(d.CBData),
 								"pscb", len(d.PSCBData),
 								"hasTex", d.SRVTex != nil,
-							)
-						}
-					}
-					if draws[0].FrameNumber >= 1800 && draws[0].FrameNumber < 2000 && len(draws) <= 12 {
-						for i, d := range draws {
-							texInfo := "none"
-							if d.SRVTex != nil {
-								texInfo = fmt.Sprintf("%dx%d:fmt%d", d.SRVTex.Width, d.SRVTex.Height, d.SRVTex.Format)
-							}
-							slog.Info("HostD3D12 LoadDraw",
-								"i", i, "clr", d.IsClear, "idx", d.Indexed, "topo", d.Topology,
-								"pso", fmt.Sprintf("0x%X", d.HostPSO),
-								"tgt", fmt.Sprintf("0x%X", d.TargetVA),
-								"srv", fmt.Sprintf("0x%X", d.SRVGuestVA),
-								"cnt", d.VertexCount, "tex", texInfo,
 							)
 						}
 					}

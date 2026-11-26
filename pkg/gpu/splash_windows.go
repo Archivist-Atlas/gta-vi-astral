@@ -5,9 +5,11 @@ package gpu
 import (
 	"bytes"
 	_ "embed"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -16,14 +18,29 @@ import (
 var astralLogoJPG []byte
 
 var (
-	bootProgressMilli atomic.Int32 // 0..1000 (0.0% .. 100.0%)
-	bootDSReads       atomic.Uint64
+	bootProgressMilli    atomic.Int32 // 0..1000 (0.0% .. 100.0%)
+	bootDSReads          atomic.Uint64
+	worldLoadingActive   atomic.Bool
+	worldLoadBaseReads   atomic.Uint64
+	worldShadersCompiled atomic.Uint64
 
 	splashOnce    sync.Once
 	splashLogoPix []byte
 	splashLogoW   int
 	splashLogoH   int
 )
+
+// ReportWorldLoadingStarted active l'écran de chargement du monde (story000) avec progression en direct.
+func ReportWorldLoadingStarted(curReads uint64) {
+	if worldLoadingActive.CompareAndSwap(false, true) {
+		worldLoadBaseReads.Store(curReads)
+	}
+}
+
+// ReportWorldShaderCompiled incrémente le compteur de shaders 3D / Compute compilés pendant le chargement.
+func ReportWorldShaderCompiled() {
+	worldShadersCompiled.Add(1)
+}
 
 // ReportBootProgress met à jour la progression de chargement affichée sur l'écran splash (0.0 .. 1.0).
 // La progression est monotone croissante pour éviter tout retour en arrière visuel.
@@ -225,6 +242,235 @@ func (h *HostD3D12) renderSplashRGBA() []byte {
 	drawAudioButton(h.splashBuf, w, ht, IsLoadingAudioEnabled())
 
 	return h.splashBuf
+}
+
+// renderWorldLoadingRGBA remplace l'écran gris vide pendant le streaming de story000 par un écran
+// de chargement GTA VI Astral informatif : barre néon synthwave en direct + pourcentage + télémétrie.
+func (h *HostD3D12) renderWorldLoadingRGBA() []byte {
+	initSplashLogo()
+	w, ht := int(h.Width), int(h.Height)
+	if w <= 0 || ht <= 0 {
+		return nil
+	}
+	need := w * ht * 4
+	if len(h.splashBuf) != need {
+		h.splashBuf = make([]byte, need)
+	}
+	// Fond noir profond
+	for i := 0; i < need; i += 4 {
+		h.splashBuf[i+0] = 6
+		h.splashBuf[i+1] = 4
+		h.splashBuf[i+2] = 12
+		h.splashBuf[i+3] = 255
+	}
+	h.splashFrame++
+	curReads := bootDSReads.Load()
+	baseReads := worldLoadBaseReads.Load()
+	var delta uint64
+	if curReads > baseReads {
+		delta = curReads - baseReads
+	}
+	// story000 streame ~46 500 requêtes DirectStorage (de ~19 500 à ~66 000)
+	pct := float32(delta) / 46500.0
+	if pct > 0.99 {
+		pct = 0.99
+	}
+	if pct < 0.02 {
+		pct = 0.02
+	}
+
+	// Logo GTA VI Astral centré légèrement plus haut pour laisser place au texte de statut
+	if len(splashLogoPix) > 0 && splashLogoW > 0 && splashLogoH > 0 {
+		maxW := int(float64(w) * 0.56)
+		maxH := int(float64(ht) * 0.56)
+		scale := math.Min(float64(maxW)/float64(splashLogoW), float64(maxH)/float64(splashLogoH))
+		dstW := int(float64(splashLogoW) * scale)
+		dstH := int(float64(splashLogoH) * scale)
+		offX := (w - dstW) / 2
+		offY := (ht-dstH)/2 - ht/10
+		if offY < 16 {
+			offY = 16
+		}
+		for y := 0; y < dstH; y++ {
+			sy := y * splashLogoH / dstH
+			dy := offY + y
+			if dy < 0 || dy >= ht {
+				continue
+			}
+			for x := 0; x < dstW; x++ {
+				sx := x * splashLogoW / dstW
+				dx := offX + x
+				if dx < 0 || dx >= w {
+					continue
+				}
+				sOff := (sy*splashLogoW + sx) * 4
+				dOff := (dy*w + dx) * 4
+				h.splashBuf[dOff+0] = splashLogoPix[sOff+0]
+				h.splashBuf[dOff+1] = splashLogoPix[sOff+1]
+				h.splashBuf[dOff+2] = splashLogoPix[sOff+2]
+				h.splashBuf[dOff+3] = 255
+			}
+		}
+	}
+
+	// Barre de progression néon synthwave animée
+	barW := w * 46 / 100
+	barH := 16
+	barX := (w - barW) / 2
+	barY := ht * 74 / 100
+	fillW := int(float32(barW-4) * pct)
+	if fillW < 6 {
+		fillW = 6
+	}
+	sweepX := int((h.splashFrame * 8) % uint64(barW+160)) - 80
+
+	for y := barY - 2; y <= barY+barH+1; y++ {
+		if y < 0 || y >= ht {
+			continue
+		}
+		for x := barX - 2; x <= barX+barW+1; x++ {
+			if x < 0 || x >= w {
+				continue
+			}
+			dOff := (y*w + x) * 4
+			isBorder := x < barX || x >= barX+barW || y < barY || y >= barY+barH
+			if isBorder {
+				h.splashBuf[dOff+0] = 96
+				h.splashBuf[dOff+1] = 48
+				h.splashBuf[dOff+2] = 152
+				h.splashBuf[dOff+3] = 255
+				continue
+			}
+			lx := x - barX - 2
+			ly := y - barY - 2
+			insideTrack := lx >= 0 && lx < barW-4 && ly >= 0 && ly < barH-4
+			if insideTrack && lx < fillW {
+				t := float32(lx) / float32(barW-4)
+				var r, g, bl float32
+				if t < 0.55 {
+					u := t / 0.55
+					r = 157 + u*(255-157)
+					g = 78 + u*(42-78)
+					bl = 221 + u*(133-221)
+				} else {
+					u := (t - 0.55) / 0.45
+					r = 255
+					g = 42 + u*(140-42)
+					bl = 133 + u*(66-133)
+				}
+				dist := float64(lx - sweepX)
+				glow := float32(math.Exp(-(dist * dist) / 1400.0))
+				h.splashBuf[dOff+0] = clampByte(r + glow*80)
+				h.splashBuf[dOff+1] = clampByte(g + glow*80)
+				h.splashBuf[dOff+2] = clampByte(bl + glow*90)
+				h.splashBuf[dOff+3] = 255
+			} else {
+				h.splashBuf[dOff+0] = 20
+				h.splashBuf[dOff+1] = 16
+				h.splashBuf[dOff+2] = 32
+				h.splashBuf[dOff+3] = 255
+			}
+		}
+	}
+
+	// Texte de statut centré sous la barre : titre + pourcentage + télémétrie temps réel
+	dots := strings.Repeat(".", int((h.splashFrame/15)%4))
+	title := fmt.Sprintf("CHARGEMENT DU MONDE  %d%%%s", int(pct*100), dots)
+	sub := fmt.Sprintf("DIRECTSTORAGE %d   SHADERS 3D %d", curReads, worldShadersCompiled.Load())
+	drawSplashTextCentered(h.splashBuf, w, ht, w/2, barY+barH+22, 3, title, 245, 240, 255)
+	drawSplashTextCentered(h.splashBuf, w, ht, w/2, barY+barH+56, 2, sub, 192, 168, 245)
+
+	drawFullscreenButton(h.splashBuf, w, ht, IsWindowFullscreen())
+	return h.splashBuf
+}
+
+var splashFont5x7 = map[rune][7]uint8{
+	'A': {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+	'B': {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},
+	'C': {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E},
+	'D': {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
+	'E': {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
+	'F': {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},
+	'G': {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F},
+	'H': {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+	'I': {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},
+	'J': {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C},
+	'K': {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11},
+	'L': {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},
+	'M': {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},
+	'N': {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11},
+	'O': {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+	'P': {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
+	'Q': {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D},
+	'R': {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},
+	'S': {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E},
+	'T': {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+	'U': {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+	'V': {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04},
+	'W': {0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11},
+	'X': {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11},
+	'Y': {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04},
+	'Z': {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F},
+	'0': {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E},
+	'1': {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
+	'2': {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},
+	'3': {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E},
+	'4': {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02},
+	'5': {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},
+	'6': {0x0E, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x0E},
+	'7': {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+	'8': {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},
+	'9': {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E},
+	'%': {0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13},
+	'.': {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C},
+	':': {0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00},
+	'-': {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00},
+	' ': {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+}
+
+func drawSplashTextCentered(buf []byte, w, h, cx, y0, scale int, text string, r, g, b byte) {
+	runes := []rune(strings.ToUpper(text))
+	if len(runes) == 0 || scale < 1 {
+		return
+	}
+	charW := 6 * scale
+	totalW := len(runes)*charW - scale
+	x0 := cx - totalW/2
+	for ci, ch := range runes {
+		glyph, ok := splashFont5x7[ch]
+		if !ok {
+			continue
+		}
+		gx := x0 + ci*charW
+		for row := 0; row < 7; row++ {
+			bits := glyph[row]
+			if bits == 0 {
+				continue
+			}
+			for col := 0; col < 5; col++ {
+				if bits&(1<<uint(4-col)) == 0 {
+					continue
+				}
+				for sy := 0; sy < scale; sy++ {
+					py := y0 + row*scale + sy
+					if py < 0 || py >= h {
+						continue
+					}
+					for sx := 0; sx < scale; sx++ {
+						px := gx + col*scale + sx
+						if px < 0 || px >= w {
+							continue
+						}
+						off := (py*w + px) * 4
+						buf[off+0] = r
+						buf[off+1] = g
+						buf[off+2] = b
+						buf[off+3] = 255
+					}
+				}
+			}
+		}
+	}
 }
 
 const (
