@@ -38,6 +38,8 @@ type HostTextureUpload struct {
 
 // HostDrawPass décrit un appel DrawInstanced ou DrawIndexedInstanced rejoué sur le GPU hôte.
 type HostDrawPass struct {
+	IsClear       bool
+	ClearColor    [4]float32
 	Indexed       bool
 	Topology      uint32 // 4=TRIANGLELIST, 5=TRIANGLESTRIP, 17/32=Xbox RECTLIST
 	VertexCount   uint32 // VertexCountPerInstance ou IndexCountPerInstance
@@ -61,12 +63,13 @@ type HostDrawPass struct {
 }
 
 type hostRTEntry struct {
-	res    uintptr
-	rtvCPU uintptr
-	srvGPU uintptr
-	width  uint32
-	height uint32
-	state  uint32 // 0x4 = RENDER_TARGET, 0x80 = PIXEL_SHADER_RESOURCE
+	res       uintptr
+	rtvCPU    uintptr
+	srvGPU    uintptr
+	width     uint32
+	height    uint32
+	state     uint32 // 0x4 = RENDER_TARGET, 0x80 = PIXEL_SHADER_RESOURCE
+	initClear bool
 }
 
 type d3d12IndexBufferView struct {

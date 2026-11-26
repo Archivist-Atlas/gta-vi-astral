@@ -617,6 +617,9 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 				hasRealPSO := false
 				hasPresentTarget := false
 				for _, d := range draws {
+					if d.IsClear {
+						continue
+					}
 					if d.HostPSO != 0 {
 						hasRealPSO = true
 					}
@@ -658,12 +661,29 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 				}
 				// N'active les RenderTargets offscreen que si des backbuffers swapchain sont connus
 				useOffscreenRT := len(h.PresentVAs) > 0 && (hasPresentTarget || skipHostPresent)
-				clearedRT := make(map[uint64]bool)
 				curRTV := rtv
 				curTargetVA := uint64(0)
 				vbOff := uint64(0)
 				ibOff := uint64(0)
 				for idxPass, d := range draws {
+					if d.IsClear {
+						if useOffscreenRT && d.TargetVA != 0 && !isBackbuffer(d.TargetVA) {
+							if rt := h.ensureHostRT(d.TargetVA); rt != nil {
+								if rt.state != 0x4 {
+									if h.SRVGPUStart != 0 {
+										_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart)
+									}
+									br := d3d12ResourceBarrier{Resource: rt.res, Subresource: 0xFFFFFFFF, StateBefore: rt.state, StateAfter: 0x4 /* RENDER_TARGET */}
+									_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&br)))
+									rt.state = 0x4
+								}
+								clr := d.ClearColor
+								_ = comCall(h.CmdList, 48, rt.rtvCPU, uintptr(unsafe.Pointer(&clr[0])), 0, 0)
+								rt.initClear = true
+							}
+						}
+						continue
+					}
 					if d.VertexCount == 0 || d.InstanceCount == 0 {
 						continue
 					}
@@ -687,10 +707,13 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 								_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&br)))
 								rt.state = 0x4
 							}
-							if !clearedRT[d.TargetVA] {
+							// Ne jamais effacer un RT offscreen en début de batch PresentX (cela effacerait
+							// l'image de la trame N-1 avant son composite !). Uniquement à la toute 1re création
+							// ou sur un vrai ClearRenderTargetView enregistré dans l'ordre du jeu.
+							if !rt.initClear {
 								zeroClr := [4]float32{0, 0, 0, 0}
 								_ = comCall(h.CmdList, 48, rt.rtvCPU, uintptr(unsafe.Pointer(&zeroClr[0])), 0, 0)
-								clearedRT[d.TargetVA] = true
+								rt.initClear = true
 							}
 							wantRTV = rt.rtvCPU
 							wantTargetVA = d.TargetVA

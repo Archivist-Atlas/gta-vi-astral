@@ -778,9 +778,24 @@ func newD3D12XDevice() uintptr {
 			st.mu.Lock()
 			st.lastClearColor = c
 			st.hasClearColor = true
+			var rtvVA uint64
+			if res := st.rtvResources[rtvHandle]; res != 0 {
+				rtvVA = st.resGPUAddrs[res]
+			} else if rtvHandle >= 0x10000 && rtvHandle < 0x800000000000 && *(*uint32)(osPtr(rtvHandle)) == 0x52545631 {
+				if res := *(*uintptr)(osPtr(rtvHandle + 8)); res != 0 {
+					rtvVA = st.resGPUAddrs[res]
+				}
+			}
+			if rtvVA != 0 && len(st.frameDraws) < 512 {
+				st.frameDraws = append(st.frameDraws, gpu.HostDrawPass{
+					IsClear:    true,
+					TargetVA:   rtvVA,
+					ClearColor: c,
+				})
+			}
 			st.mu.Unlock()
 			if gpuTrace && n <= 8 {
-				slog.Info("GPU_TRACE ClearRenderTargetView", "n", n, "rtv", fmt.Sprintf("0x%X", rtvHandle), "rgba", c)
+				slog.Info("GPU_TRACE ClearRenderTargetView", "n", n, "rtv", fmt.Sprintf("0x%X", rtvHandle), "va", fmt.Sprintf("0x%X", rtvVA), "rgba", c)
 			}
 		}
 		return 0
