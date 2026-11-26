@@ -482,7 +482,13 @@ func installVEH(sess *LiveSession) {
 				msg = fmt.Sprintf("%s rax=0x%X rcx=0x%X rdx=0x%X rbx=0x%X r8=0x%X r9=0x%X", msg, rax, rcx, rdx, rbx, r8, r9)
 				if s != nil && rsp > 0x10000 {
 					var callers []string
-					stackWords := unsafe.Slice((*uintptr)(ptrFromAddr(uintptr(rsp))), 512)
+					// Limite la lecture de pile à la page 4 KiB courante (évite un segfault VEH au sommet de la pile).
+					pageEnd := (uintptr(rsp) + 4096) &^ 4095
+					nWords := int((pageEnd - uintptr(rsp)) / unsafe.Sizeof(uintptr(0)))
+					if nWords > 512 {
+						nWords = 512
+					}
+					stackWords := unsafe.Slice((*uintptr)(ptrFromAddr(uintptr(rsp))), nWords)
 					for _, w := range stackWords {
 						for _, m := range s.Modules {
 							if w >= m.Base && w < m.Base+uintptr(m.Size) {
