@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/formats"
@@ -32,12 +33,11 @@ const (
 )
 
 // dsPendingCmd mémorise une commande DirectStorage en attente jusqu'à Submit()
-// (en ordre FIFO strict : GTA VI remplit les tables de pages juste avant Submit).
+// ou auto-submit à capacity/2 (en ordre FIFO strict).
 type dsPendingCmd struct {
 	kind             dsCmdKind
 	opts             uint64
 	dstPtr           uintptr
-	pagesSnap        []uintptr
 	pageOff          int
 	dstSize          uint32
 	srcPtr           uintptr
@@ -48,6 +48,16 @@ type dsPendingCmd struct {
 	statusIdx        int
 	fence            uintptr
 	fenceVal         uintptr
+}
+
+type dsQueueState struct {
+	mu          sync.Mutex
+	cond        *sync.Cond
+	capacity    int
+	unsubmitted []dsPendingCmd
+	submitted   [][]dsPendingCmd
+	closed      bool
+	done        chan struct{}
 }
 
 type dsChunkCache struct {
@@ -64,7 +74,7 @@ type dstorageState struct {
 	files         map[uintptr]*os.File
 	fileNames     map[uintptr]string
 	statuses      map[uintptr]*dstorageStatus
-	pending       map[uintptr][]dsPendingCmd
+	queues        map[uintptr]*dsQueueState
 	lastChunks    map[uintptr][]dsChunkCache
 	readCount     atomic.Uint64
 	bytesRead     atomic.Uint64
@@ -86,7 +96,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		files:      make(map[uintptr]*os.File),
 		fileNames:  make(map[uintptr]string),
 		statuses:   make(map[uintptr]*dstorageStatus),
-		pending:    make(map[uintptr][]dsPendingCmd),
+		queues:     make(map[uintptr]*dsQueueState),
 		lastChunks: make(map[uintptr][]dsChunkCache),
 	}
 
@@ -445,9 +455,28 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		if isPageDst && written > 0 {
 			nPages := (pageOff + int(dstSize) + int(xmemPageSize) - 1) / int(xmemPageSize)
 			if nPages > 0 && nPages <= 4096 {
-				pages := r.pagesSnap
-				if len(pages) < nPages || pages[0] == 0 {
-					pages = unsafe.Slice((*uintptr)(osPtr(dstPtr)), nPages)
+				// Le jeu remplit le tableau de pages physiques APRÈS EnqueueRequest (souvent depuis un autre thread) :
+				// lire le tableau au moment de l'exécution et attendre jusqu'à 100 ms si une entrée vaut encore 0.
+				readPages := func() ([]uintptr, bool) {
+					src := unsafe.Slice((*uintptr)(osPtr(dstPtr)), nPages)
+					out := make([]uintptr, nPages)
+					hasZero := false
+					for idx := 0; idx < nPages; idx++ {
+						v := atomic.LoadUintptr(&src[idx])
+						out[idx] = v
+						if v == 0 {
+							hasZero = true
+						}
+					}
+					return out, hasZero
+				}
+				pages, hasZero := readPages()
+				if hasZero {
+					deadline := time.Now().Add(100 * time.Millisecond)
+					for hasZero && time.Now().Before(deadline) {
+						time.Sleep(2 * time.Millisecond)
+						pages, hasZero = readPages()
+					}
 				}
 				if xmemWritePhysical(pages, pageOff, dst[:written]) {
 					if pw := ds.pageWrites.Add(1); pw == 1 || pw%250 == 0 {
@@ -467,18 +496,13 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		}
 		return resHR
 	}
-	flushQueue := func(q uintptr) {
-		ds.mu.Lock()
-		cmds := ds.pending[q]
-		if len(cmds) > 0 {
-			delete(ds.pending, q)
-		}
-		ds.mu.Unlock()
+	runBatch := func(cmds []dsPendingCmd) {
 		// Exécute les lots consécutifs de lectures indépendantes en parallèle entre barrières Status/Signal
 		workers := runtime.GOMAXPROCS(0)
 		if workers > 8 {
 			workers = 8
 		}
+		batchHR := uint32(hresultOK)
 		for i := 0; i < len(cmds); {
 			if cmds[i].kind == dsCmdRead {
 				j := i
@@ -491,6 +515,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				}
 				if canPar && j-i >= 4 && workers > 1 {
 					batch := cmds[i:j]
+					hrs := make([]uint32, len(batch))
 					var nextIdx atomic.Int32
 					var wg sync.WaitGroup
 					nw := workers
@@ -506,14 +531,25 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 								if k >= len(batch) {
 									return
 								}
-								_ = execDSReq(batch[k])
+								hrs[k] = execDSReq(batch[k])
 							}
 						}()
 					}
 					wg.Wait()
+					if batchHR == uint32(hresultOK) {
+						for _, hr := range hrs {
+							if hr != uint32(hresultOK) {
+								batchHR = hr
+								break
+							}
+						}
+					}
 				} else {
 					for k := i; k < j; k++ {
-						_ = execDSReq(cmds[k])
+						hr := execDSReq(cmds[k])
+						if batchHR == uint32(hresultOK) && hr != uint32(hresultOK) {
+							batchHR = hr
+						}
 					}
 				}
 				i = j
@@ -529,10 +565,11 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				if s != nil {
 					s.mu.Lock()
 					if c.statusIdx >= 0 && c.statusIdx < len(s.results) {
-						s.results[c.statusIdx] = uint32(hresultOK)
+						s.results[c.statusIdx] = batchHR
 					}
 					s.mu.Unlock()
 				}
+				batchHR = uint32(hresultOK)
 			case dsCmdSignal:
 				if c.fence >= 0x10000 {
 					vtbl := *(*uintptr)(osPtr(c.fence))
@@ -545,6 +582,48 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				}
 			}
 		}
+	}
+	getQueue := func(q uintptr) *dsQueueState {
+		ds.mu.Lock()
+		qs := ds.queues[q]
+		ds.mu.Unlock()
+		return qs
+	}
+	submitQueue := func(q uintptr) {
+		qs := getQueue(q)
+		if qs == nil {
+			return
+		}
+		qs.mu.Lock()
+		if len(qs.unsubmitted) > 0 {
+			qs.submitted = append(qs.submitted, qs.unsubmitted)
+			qs.unsubmitted = nil
+			qs.cond.Signal()
+		}
+		qs.mu.Unlock()
+	}
+	enqueueCmd := func(q uintptr, cmd dsPendingCmd) {
+		qs := getQueue(q)
+		if qs == nil {
+			return
+		}
+		qs.mu.Lock()
+		if qs.closed {
+			qs.mu.Unlock()
+			return
+		}
+		qs.unsubmitted = append(qs.unsubmitted, cmd)
+		// Auto-submit Xbox Series dès que la moitié de la capacité de la file est atteinte
+		autoThresh := qs.capacity / 2
+		if autoThresh < 1 {
+			autoThresh = 1
+		}
+		if len(qs.unsubmitted) >= autoThresh {
+			qs.submitted = append(qs.submitted, qs.unsubmitted)
+			qs.unsubmitted = nil
+			qs.cond.Signal()
+		}
+		qs.mu.Unlock()
 	}
 
 	dsQueueProto := NewCOMObject("IDStorageQueueX", 32, map[int]uintptr{
@@ -565,71 +644,105 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				slog.Warn("IDStorageQueueX!EnqueueRequest ignoré (null/zero)", "opts", opts, "dst", dstPtr, "dstSize", dstSize, "src", srcPtr, "srcSize", srcSize)
 				return 0
 			}
-			// Capture immédiate du tableau de pages PAGE_DESTINATION si déjà rempli (évite qu'un tampon
-			// temporaire ne soit remis à zéro avant Submit(), tout en conservant le repli Submit() sinon).
-			var pagesSnap []uintptr
-			if opts&(1<<21) != 0 {
-				nPages := (pageOff + int(dstSize) + int(xmemPageSize) - 1) / int(xmemPageSize)
-				if nPages > 0 && nPages <= 4096 {
-					srcPages := unsafe.Slice((*uintptr)(osPtr(dstPtr)), nPages)
-					if srcPages[0] != 0 {
-						pagesSnap = make([]uintptr, nPages)
-						copy(pagesSnap, srcPages)
-					}
-				}
-			}
-			ds.mu.Lock()
-			ds.pending[this] = append(ds.pending[this], dsPendingCmd{
-				kind: dsCmdRead, opts: opts, dstPtr: dstPtr, pagesSnap: pagesSnap, pageOff: pageOff, dstSize: dstSize,
+			enqueueCmd(this, dsPendingCmd{
+				kind: dsCmdRead, opts: opts, dstPtr: dstPtr, pageOff: pageOff, dstSize: dstSize,
 				srcPtr: srcPtr, srcOff: srcOff, srcSize: srcSize, intermediateSize: interSize,
 			})
-			ds.mu.Unlock()
 			return 0
 		}),
 		4: syscall.NewCallback(func(this, statusArr, index uintptr) uintptr { // EnqueueStatus (0x20)
 			idx := int(uint32(index))
 			ds.mu.Lock()
-			if s := ds.statuses[statusArr]; s != nil {
+			s := ds.statuses[statusArr]
+			ds.mu.Unlock()
+			if s != nil {
 				s.mu.Lock()
 				if idx >= 0 && idx < len(s.results) {
 					s.results[idx] = hresultPending
 				}
 				s.mu.Unlock()
 			}
-			ds.pending[this] = append(ds.pending[this], dsPendingCmd{
+			enqueueCmd(this, dsPendingCmd{
 				kind: dsCmdStatus, statusArr: statusArr, statusIdx: idx,
 			})
-			ds.mu.Unlock()
 			return hresultOK
 		}),
 		5: syscall.NewCallback(func(this, fence, val uintptr) uintptr { // EnqueueSignal (0x28)
-			ds.mu.Lock()
-			ds.pending[this] = append(ds.pending[this], dsPendingCmd{
+			enqueueCmd(this, dsPendingCmd{
 				kind: dsCmdSignal, fence: fence, fenceVal: val,
 			})
-			ds.mu.Unlock()
 			return hresultOK
 		}),
-		6: syscall.NewCallback(func(this uintptr) uintptr { // Submit (0x30)
-			flushQueue(this)
+		6: syscall.NewCallback(func(this uintptr) uintptr { // Submit (0x30) — asynchrone
+			submitQueue(this)
 			return hresultOK
 		}),
-		8:  cbOK, // Close (0x40)
-		10: cbOK, // Submit / ErrorRecord fallback
+		8: syscall.NewCallback(func(this uintptr) uintptr { // Close (0x40)
+			qs := getQueue(this)
+			if qs != nil {
+				qs.mu.Lock()
+				qs.closed = true
+				qs.unsubmitted = nil
+				qs.cond.Broadcast()
+				qs.mu.Unlock()
+				<-qs.done
+			}
+			return hresultOK
+		}),
+		10: cbOK, // ErrorRecord fallback
 	})
 	dsQueueVtable := *(*uintptr)(osPtr(dsQueueProto))
-	newDSQueue := func() uintptr {
+	newDSQueue := func(capacity int) uintptr {
+		if capacity < 2 {
+			capacity = 2048
+		}
+		if capacity > 8192 {
+			capacity = 8192
+		}
 		obj, _, _ := k32VirtualAlloc.Call(0, 0x20, 0x3000, 0x04)
 		if obj != 0 {
 			*(*uintptr)(osPtr(obj)) = dsQueueVtable
+			qs := &dsQueueState{
+				capacity: capacity,
+				done:     make(chan struct{}),
+			}
+			qs.cond = sync.NewCond(&qs.mu)
+			ds.mu.Lock()
+			ds.queues[obj] = qs
+			ds.mu.Unlock()
+			go func(q *dsQueueState) {
+				defer close(q.done)
+				for {
+					q.mu.Lock()
+					for len(q.submitted) == 0 && !q.closed {
+						q.cond.Wait()
+					}
+					if len(q.submitted) == 0 && q.closed {
+						q.mu.Unlock()
+						return
+					}
+					batch := q.submitted[0]
+					q.submitted[0] = nil
+					q.submitted = q.submitted[1:]
+					q.mu.Unlock()
+					runBatch(batch)
+				}
+			}(qs)
 		}
 		return obj
 	}
 
 	cbCreateQueue := syscall.NewCallback(func(this, descPtr, iidPtr, outPtr uintptr) uintptr {
-		slog.Info("IDStorageFactoryX!CreateQueue -> IDStorageQueueX")
+		capVal := 2048
+		if descPtr >= 0x10000 {
+			c := int(*(*uint16)(osPtr(descPtr + 8)))
+			if c >= 2 {
+				capVal = c
+			}
+		}
+		slog.Info("IDStorageFactoryX!CreateQueue -> IDStorageQueueX", "capacity", capVal)
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newDSQueue()
+			*(*uintptr)(osPtr(outPtr)) = newDSQueue(capVal)
 		}
 		return hresultOK
 	})

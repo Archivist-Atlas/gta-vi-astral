@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1004,7 +1005,14 @@ func newD3D12XDevice() uintptr {
 		}
 		return fmt.Sprintf("len=%d parts=[%s] native=[%s]", len(data), parts, nat)
 	}
-	psoCompileSem := make(chan struct{}, 4)
+	psoWorkers := runtime.GOMAXPROCS(0)
+	if psoWorkers > 6 {
+		psoWorkers = 6
+	}
+	if psoWorkers < 2 {
+		psoWorkers = 2
+	}
+	psoCompileSem := make(chan struct{}, psoWorkers)
 	compileGuestPSO := func(psoObj uintptr, gp *guestPSO) {
 		if gp.hasCS && !gp.hasVS {
 			st.mu.Lock()
@@ -1060,129 +1068,141 @@ func newD3D12XDevice() uintptr {
 		if len(vsData) < 32 || len(psData) < 32 {
 			return
 		}
-		if gpuTrace {
-			slog.Info("GPU_TRACE Active PSO bound",
-				"pso", fmt.Sprintf("0x%X", psoObj),
-				"vs", describeDXBCBytes(vsData),
-				"ps", describeDXBCBytes(psData),
-			)
-		}
-		vsC, err := shader.ParseDXBC(vsData)
-		if err != nil {
-			slog.Warn("ParseDXBC VS échoué", "pso", fmt.Sprintf("0x%X", psoObj), "err", err)
-			return
-		}
-		psC, err := shader.ParseDXBC(psData)
-		if err != nil {
-			slog.Warn("ParseDXBC PS échoué", "pso", fmt.Sprintf("0x%X", psoObj), "err", err)
-			return
-		}
-		vsProgs, err := shader.ExtractNativePrograms(vsC)
-		if err != nil || len(vsProgs) == 0 {
-			return
-		}
-		psProgs, err := shader.ExtractNativePrograms(psC)
-		if err != nil || len(psProgs) == 0 {
-			return
-		}
-		vsOut, err := shader.EmitHLSL(vsC, vsProgs[0])
-		if err != nil {
-			return
-		}
-		psOut, err := shader.EmitHLSL(psC, psProgs[0])
-		if err != nil {
-			return
-		}
-		var inElems []gpu.HostInputElement
-		if len(gp.inputElems) > 0 {
-			inElems = gp.inputElems
-		} else {
-			for _, el := range vsOut.InputElements {
-				inElems = append(inElems, gpu.HostInputElement{
-					SemanticName:  el.SemanticName,
-					SemanticIndex: el.SemanticIndex,
-					Format:        el.DXGIFormat(),
-				})
+		runGraphicsCompile := func(asyncLarge bool) {
+			if gpuTrace {
+				slog.Info("GPU_TRACE Active PSO bound",
+					"pso", fmt.Sprintf("0x%X", psoObj),
+					"vs", describeDXBCBytes(vsData),
+					"ps", describeDXBCBytes(psData),
+				)
 			}
-		}
-		finishGraphicsPSO := func() {
-			var hPSO uintptr
-			var cerr error
-			isGammaComposite := vsOut.TotalInsts == 45 && psOut.TotalInsts >= 60 && len(psOut.SRVDescriptorSlots) == 1
-			if isGammaComposite {
-				// Le VS 45/45 lit une 2e matrice CBV absente ; on l'associe à un VS triangle plein écran
-				// tout en exécutant le vrai PS 70/70 recompilé (courbe gamma / luminosité).
-				fsVS := buildFullscreenCompositeVS(psC)
-				opaqueBlend := &gpu.HostBlendState{
-					BlendEnable: false, SrcBlend: 2, DestBlend: 1, BlendOp: 1,
-					SrcBlendAlpha: 2, DestBlendAlpha: 1, BlendOpAlpha: 1, WriteMask: 0x0F,
-				}
-				hPSO, cerr = gpu.CompileHostPSOWithBlend(fsVS, "VSMain", psOut.Source, psOut.EntryPoint, nil, opaqueBlend)
-				if cerr == nil && hPSO != 0 {
-					gpu.RegisterGammaCompositePSO(hPSO)
-					slog.Info("PSO composite gamma/luminosité plein écran activé (PS réel 70/70)", "guestPSO", fmt.Sprintf("0x%X", psoObj), "hostPSO", fmt.Sprintf("0x%X", hPSO))
-				}
-			} else {
-				hPSO, cerr = gpu.CompileHostPSOWithBlend(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems, gp.blend)
-			}
-			if cerr != nil {
-				slog.Warn("Recompilation PSO RDNA2->HLSL->D3D12 échouée (repli actif)", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
+			vsC, err := shader.ParseDXBC(vsData)
+			if err != nil {
+				slog.Warn("ParseDXBC VS échoué", "pso", fmt.Sprintf("0x%X", psoObj), "err", err)
 				return
 			}
-			st.mu.Lock()
-			gp.hostPSO = hPSO
-			gp.vsCBSlot = vsOut.CBDescriptorSlot
-			gp.psCBSlot = psOut.CBDescriptorSlot
-			gp.psSRVCount = len(psOut.SRVDescriptorSlots)
-			if gp.psSRVCount > 4 {
-				gp.psSRVCount = 4
+			psC, err := shader.ParseDXBC(psData)
+			if err != nil {
+				slog.Warn("ParseDXBC PS échoué", "pso", fmt.Sprintf("0x%X", psoObj), "err", err)
+				return
 			}
-			for i := 0; i < gp.psSRVCount; i++ {
-				gp.psSRVSlots[i] = psOut.SRVDescriptorSlots[i]
+			vsProgs, err := shader.ExtractNativePrograms(vsC)
+			if err != nil || len(vsProgs) == 0 {
+				return
 			}
-			st.mu.Unlock()
-			blendDesc := "default"
-			if gp.blend != nil {
-				blendDesc = fmt.Sprintf("en=%v src=%d dst=%d op=%d", gp.blend.BlendEnable, gp.blend.SrcBlend, gp.blend.DestBlend, gp.blend.BlendOp)
+			psProgs, err := shader.ExtractNativePrograms(psC)
+			if err != nil || len(psProgs) == 0 {
+				return
 			}
-			ilDescStr := "none"
+			vsOut, err := shader.EmitHLSL(vsC, vsProgs[0])
+			if err != nil {
+				return
+			}
+			psOut, err := shader.EmitHLSL(psC, psProgs[0])
+			if err != nil {
+				return
+			}
+			var inElems []gpu.HostInputElement
 			if len(gp.inputElems) > 0 {
-				var parts []string
-				for _, el := range gp.inputElems {
-					parts = append(parts, fmt.Sprintf("%s%d:fmt%d@%d/s%d", el.SemanticName, el.SemanticIndex, el.Format, el.AlignedByteOffset, el.InputSlot))
+				inElems = gp.inputElems
+			} else {
+				for _, el := range vsOut.InputElements {
+					inElems = append(inElems, gpu.HostInputElement{
+						SemanticName:  el.SemanticName,
+						SemanticIndex: el.SemanticIndex,
+						Format:        el.DXGIFormat(),
+					})
 				}
-				ilDescStr = strings.Join(parts, ",")
 			}
-			slog.Info("PSO RDNA2 recompilé en ID3D12PipelineState matériel",
-				"guestPSO", fmt.Sprintf("0x%X", psoObj),
-				"hostPSO", fmt.Sprintf("0x%X", hPSO),
-				"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
-				"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
-				"missingPS", psOut.MissingOps,
-				"blend", blendDesc,
-				"guestIL", ilDescStr,
-				"vsCBSlot", vsOut.CBDescriptorSlot,
-				"psCBSlot", psOut.CBDescriptorSlot,
-				"psSRVs", psOut.SRVDescriptorSlots,
-			)
-			if dumpFrame {
-				_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_vs.hlsl", os.TempDir(), hPSO), []byte(vsOut.Source), 0o644)
-				_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_ps.hlsl", os.TempDir(), hPSO), []byte(psOut.Source), 0o644)
+			finishGraphicsPSO := func() {
+				var hPSO uintptr
+				var cerr error
+				isGammaComposite := vsOut.TotalInsts == 45 && psOut.TotalInsts >= 60 && len(psOut.SRVDescriptorSlots) == 1
+				if isGammaComposite {
+					// Le VS 45/45 lit une 2e matrice CBV absente ; on l'associe à un VS triangle plein écran
+					// tout en exécutant le vrai PS 70/70 recompilé (courbe gamma / luminosité).
+					fsVS := buildFullscreenCompositeVS(psC)
+					opaqueBlend := &gpu.HostBlendState{
+						BlendEnable: false, SrcBlend: 2, DestBlend: 1, BlendOp: 1,
+						SrcBlendAlpha: 2, DestBlendAlpha: 1, BlendOpAlpha: 1, WriteMask: 0x0F,
+					}
+					hPSO, cerr = gpu.CompileHostPSOWithBlend(fsVS, "VSMain", psOut.Source, psOut.EntryPoint, nil, opaqueBlend)
+					if cerr == nil && hPSO != 0 {
+						gpu.RegisterGammaCompositePSO(hPSO)
+						slog.Info("PSO composite gamma/luminosité plein écran activé (PS réel 70/70)", "guestPSO", fmt.Sprintf("0x%X", psoObj), "hostPSO", fmt.Sprintf("0x%X", hPSO))
+					}
+				} else {
+					hPSO, cerr = gpu.CompileHostPSOWithBlend(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems, gp.blend)
+				}
+				if cerr != nil {
+					slog.Warn("Recompilation PSO RDNA2->HLSL->D3D12 échouée (repli actif)", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
+					return
+				}
+				st.mu.Lock()
+				gp.hostPSO = hPSO
+				gp.vsCBSlot = vsOut.CBDescriptorSlot
+				gp.psCBSlot = psOut.CBDescriptorSlot
+				gp.psSRVCount = len(psOut.SRVDescriptorSlots)
+				if gp.psSRVCount > 4 {
+					gp.psSRVCount = 4
+				}
+				for i := 0; i < gp.psSRVCount; i++ {
+					gp.psSRVSlots[i] = psOut.SRVDescriptorSlots[i]
+				}
+				st.mu.Unlock()
+				gpu.ReportWorldShaderCompiled()
+				blendDesc := "default"
+				if gp.blend != nil {
+					blendDesc = fmt.Sprintf("en=%v src=%d dst=%d op=%d", gp.blend.BlendEnable, gp.blend.SrcBlend, gp.blend.DestBlend, gp.blend.BlendOp)
+				}
+				ilDescStr := "none"
+				if len(gp.inputElems) > 0 {
+					var parts []string
+					for _, el := range gp.inputElems {
+						parts = append(parts, fmt.Sprintf("%s%d:fmt%d@%d/s%d", el.SemanticName, el.SemanticIndex, el.Format, el.AlignedByteOffset, el.InputSlot))
+					}
+					ilDescStr = strings.Join(parts, ",")
+				}
+				slog.Info("PSO RDNA2 recompilé en ID3D12PipelineState matériel",
+					"guestPSO", fmt.Sprintf("0x%X", psoObj),
+					"hostPSO", fmt.Sprintf("0x%X", hPSO),
+					"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
+					"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
+					"missingPS", psOut.MissingOps,
+					"blend", blendDesc,
+					"guestIL", ilDescStr,
+					"vsCBSlot", vsOut.CBDescriptorSlot,
+					"psCBSlot", psOut.CBDescriptorSlot,
+					"psSRVs", psOut.SRVDescriptorSlots,
+				)
+				if dumpFrame {
+					_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_vs.hlsl", os.TempDir(), hPSO), []byte(vsOut.Source), 0o644)
+					_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_ps.hlsl", os.TempDir(), hPSO), []byte(psOut.Source), 0o644)
+				}
+			}
+			if asyncLarge && vsOut.TotalInsts+psOut.TotalInsts > 160 {
+				go func() {
+					psoCompileSem <- struct{}{}
+					defer func() { <-psoCompileSem }()
+					finishGraphicsPSO()
+				}()
+			} else {
+				finishGraphicsPSO()
+			}
+			if gpuTrace {
+				slog.Info("GPU_TRACE PSO missing ops", "guestPSO", fmt.Sprintf("0x%X", psoObj), "vsMissing", vsOut.MissingOps, "psMissing", psOut.MissingOps)
 			}
 		}
-		// Les petits PSO UI/vidéo (<= 160 ins) compilent en <20ms de façon synchrone ;
-		// les gros PSO 3D du monde compilent en arrière-plan pour ne jamais bloquer PresentX (>30s = watchdog 0x4D8BD421).
-		if vsOut.TotalInsts+psOut.TotalInsts > 160 {
+		// Après l'UI initiale (> 5 000 draws), toute compilation de PSO 3D (ParseDXBC+EmitHLSL+D3DCompile)
+		// passe en arrière-plan pour garantir que le thread de rendu ne dépasse jamais le watchdog 30s.
+		if st.drawCalls.Load() > 5000 {
 			go func() {
 				psoCompileSem <- struct{}{}
 				defer func() { <-psoCompileSem }()
-				finishGraphicsPSO()
+				runGraphicsCompile(false)
 			}()
 		} else {
-			finishGraphicsPSO()
-		}
-		if gpuTrace {
-			slog.Info("GPU_TRACE PSO missing ops", "guestPSO", fmt.Sprintf("0x%X", psoObj), "vsMissing", vsOut.MissingOps, "psMissing", psOut.MissingOps)
+			runGraphicsCompile(true)
 		}
 	}
 	cbListSetPSO := syscall.NewCallback(func(this, pso uintptr) uintptr {
@@ -1475,17 +1495,25 @@ func newD3D12XDevice() uintptr {
 			if this == 0 {
 				return hresultInvalidArg
 			}
+			// Vérifie et enregistre le waiter sous st.mu pour éliminer la course lost-wakeup avec signalFence.
+			st.mu.Lock()
 			cur := atomic.LoadUint64((*uint64)(osPtr(this + 0x10)))
 			if cur >= uint64(val) {
+				st.mu.Unlock()
 				if ev != 0 {
 					_, _, _ = k32SetEvent.Call(ev)
 				}
 				return hresultOK
 			}
 			if ev != 0 {
-				st.mu.Lock()
 				st.fenceWaiters[this] = append(st.fenceWaiters[this], fenceWaiter{val: uint64(val), event: ev})
 				st.mu.Unlock()
+				return hresultOK
+			}
+			st.mu.Unlock()
+			// ev == NULL : attente synchrone D3D12 jusqu'à ce que le fence atteigne val
+			for atomic.LoadUint64((*uint64)(osPtr(this+0x10))) < uint64(val) {
+				runtime.Gosched()
 			}
 			return hresultOK
 		}),

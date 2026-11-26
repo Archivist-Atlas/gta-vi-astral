@@ -274,13 +274,19 @@ func xmemWritePhysical(pages []uintptr, offset int, data []byte) bool {
 func (p *physAllocator) writePhysical(pages []uintptr, offset int, data []byte) bool {
 	p.mu.Lock()
 	slices := make([]physSlice, len(pages))
+	valid := make([]bool, len(pages))
 	for i, id := range pages {
+		if id == 0 {
+			continue
+		}
 		s, ok := p.pages[id]
 		if !ok {
 			p.mu.Unlock()
+			slog.Warn("XMem writePhysical: page physique inconnue", "idx", i, "page", id, "totalPages", len(pages))
 			return false
 		}
 		slices[i] = s
+		valid[i] = true
 	}
 	p.mu.Unlock()
 
@@ -288,9 +294,19 @@ func (p *physAllocator) writePhysical(pages []uintptr, offset int, data []byte) 
 	remaining := data
 	curOff := offset
 	for i := 0; i < len(slices) && len(remaining) > 0; {
+		if !valid[i] {
+			skip := int(xmemPageSize) - curOff
+			if skip > len(remaining) {
+				skip = len(remaining)
+			}
+			remaining = remaining[skip:]
+			curOff = 0
+			i++
+			continue
+		}
 		first := slices[i]
 		run := 1
-		for i+run < len(slices) {
+		for i+run < len(slices) && valid[i+run] {
 			next := slices[i+run]
 			if next.section != first.section || next.index != first.index+uintptr(run) {
 				break
