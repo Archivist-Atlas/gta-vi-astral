@@ -680,6 +680,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 				curTargetVA := uint64(0)
 				vbOff := uint64(0)
 				ibOff := uint64(0)
+				yuvRenderedThisFrame := false
 				for idxPass, d := range draws {
 					if d.IsClear {
 						if useOffscreenRT && d.TargetVA != 0 && !isBackbuffer(d.TargetVA) {
@@ -749,6 +750,11 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 								var dstRes uintptr
 								var dstRT *hostRTEntry
 								if curTargetVA == 0 {
+									if yuvRenderedThisFrame {
+										// Ne pas écraser la trame vidéo 4K YUV déjà dessinée sur le backbuffer
+										// par un RT UI vide/gris (0x105B7A0000) dans la même trame.
+										continue
+									}
 									dstRes = bb
 								} else if drt, dok := h.RTCache[curTargetVA]; dok && drt != nil {
 									dstRes = drt.res
@@ -834,8 +840,9 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						_ = comCall(h.CmdList, 20, 4)        // TRIANGLELIST
 						_ = comCall(h.CmdList, 25, h.YUVPSO) // SetPipelineState(YUVPSO)
 						_ = comCall(h.CmdList, 12, 3, 1, 0, 0)
-						// Affiche aussi directement la vidéo 4K sur le backbuffer hôte (rtv) pour éviter
-						// toute perte sur les passes de post-traitement / composite intermédiaires.
+						// Affiche aussi directement la vidéo 4K sur le backbuffer hôte (rtv) et garantit Present.
+						yuvRenderedThisFrame = true
+						skipHostPresent = false
 						if curTargetVA != 0 {
 							_ = comCall(h.CmdList, 46, 1, uintptr(unsafe.Pointer(&rtv)), 0, 0)
 							_ = comCall(h.CmdList, 12, 3, 1, 0, 0)
