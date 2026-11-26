@@ -311,9 +311,12 @@ func CompileHLSL(source, entryPoint, target string) ([]byte, error) {
 
 // HostInputElement décrit un attribut vertex pour D3D12_INPUT_ELEMENT_DESC.
 type HostInputElement struct {
-	SemanticName  string
-	SemanticIndex uint32
-	Format        uint32 // DXGI_FORMAT (ex. 2 = R32G32B32A32_FLOAT)
+	SemanticName      string
+	SemanticIndex     uint32
+	Format            uint32 // DXGI_FORMAT (ex. 28 = R8G8B8A8_UNORM, 16 = R32G32_FLOAT)
+	InputSlot         uint32
+	AlignedByteOffset uint32
+	HasOffset         bool
 }
 
 type d3d12InputElementDesc struct {
@@ -372,12 +375,16 @@ func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []Ho
 			if fmtID == 0 {
 				fmtID = 2 // DXGI_FORMAT_R32G32B32A32_FLOAT
 			}
+			byteOff := uint32(0xFFFFFFFF) // D3D12_APPEND_ALIGNED_ELEMENT
+			if el.HasOffset {
+				byteOff = el.AlignedByteOffset
+			}
 			rawDescs[i] = d3d12InputElementDesc{
 				SemanticName:      uintptr(unsafe.Pointer(&nb[0])),
 				SemanticIndex:     el.SemanticIndex,
 				Format:            fmtID,
-				InputSlot:         0,
-				AlignedByteOffset: 0xFFFFFFFF, // D3D12_APPEND_ALIGNED_ELEMENT
+				InputSlot:         el.InputSlot,
+				AlignedByteOffset: byteOff,
 			}
 		}
 	}

@@ -63,6 +63,7 @@ type guestPSO struct {
 	hasPS      bool
 	hasCS      bool
 	blend      *gpu.HostBlendState
+	inputElems []gpu.HostInputElement
 	vsCBSlot   uint32
 	psCBSlot   uint32
 	psSRVSlots [4]uint32
@@ -1084,12 +1085,16 @@ func newD3D12XDevice() uintptr {
 			return
 		}
 		var inElems []gpu.HostInputElement
-		for _, el := range vsOut.InputElements {
-			inElems = append(inElems, gpu.HostInputElement{
-				SemanticName:  el.SemanticName,
-				SemanticIndex: el.SemanticIndex,
-				Format:        el.DXGIFormat(),
-			})
+		if len(gp.inputElems) > 0 {
+			inElems = gp.inputElems
+		} else {
+			for _, el := range vsOut.InputElements {
+				inElems = append(inElems, gpu.HostInputElement{
+					SemanticName:  el.SemanticName,
+					SemanticIndex: el.SemanticIndex,
+					Format:        el.DXGIFormat(),
+				})
+			}
 		}
 		var hPSO uintptr
 		var cerr error
@@ -1137,6 +1142,7 @@ func newD3D12XDevice() uintptr {
 			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
 			"missingPS", psOut.MissingOps,
 			"blend", blendDesc,
+			"guestIL", len(gp.inputElems),
 			"vsCBSlot", vsOut.CBDescriptorSlot,
 			"psCBSlot", psOut.CBDescriptorSlot,
 			"psSRVs", psOut.SRVDescriptorSlots,
@@ -1752,6 +1758,52 @@ func newD3D12XDevice() uintptr {
 			WriteMask:      mask,
 		}
 	}
+	parseInputLayout := func(elemsPtr uintptr, num uint32) []gpu.HostInputElement {
+		if elemsPtr < 0x10000 || elemsPtr >= 0x800000000000 || num == 0 || num > 16 {
+			return nil
+		}
+		if !isGuestReadable(elemsPtr, uint64(num)*32) {
+			return nil
+		}
+		out := make([]gpu.HostInputElement, 0, num)
+		for i := uint32(0); i < num; i++ {
+			e := elemsPtr + uintptr(i)*32
+			namePtr := *(*uintptr)(osPtr(e + 0))
+			if namePtr < 0x10000 || namePtr >= 0x800000000000 || !isGuestReadable(namePtr, 1) {
+				return nil
+			}
+			var nb []byte
+			for k := uintptr(0); k < 64; k++ {
+				ch := *(*byte)(osPtr(namePtr + k))
+				if ch == 0 {
+					break
+				}
+				if ch < 0x20 || ch > 0x7E {
+					return nil
+				}
+				nb = append(nb, ch)
+			}
+			if len(nb) == 0 {
+				return nil
+			}
+			semIdx := *(*uint32)(osPtr(e + 8))
+			fmtID := *(*uint32)(osPtr(e + 12))
+			slot := *(*uint32)(osPtr(e + 16))
+			off := *(*uint32)(osPtr(e + 20))
+			if fmtID == 0 || fmtID > 132 || slot > 15 {
+				return nil
+			}
+			out = append(out, gpu.HostInputElement{
+				SemanticName:      string(nb),
+				SemanticIndex:     semIdx,
+				Format:            fmtID,
+				InputSlot:         slot,
+				AlignedByteOffset: off,
+				HasOffset:         true,
+			})
+		}
+		return out
+	}
 	storeGraphicsPSODesc := func(psoObj, desc uintptr) {
 		if desc < 0x10000 {
 			return
@@ -1760,7 +1812,12 @@ func newD3D12XDevice() uintptr {
 		vsLen := *(*uint64)(osPtr(desc + 0x10))
 		psPtr := *(*uintptr)(osPtr(desc + 0x18))
 		psLen := *(*uint64)(osPtr(desc + 0x20))
-		gp := &guestPSO{blend: parseRT0Blend(desc + 0x78)}
+		ilPtr := *(*uintptr)(osPtr(desc + 0x220))
+		ilNum := *(*uint32)(osPtr(desc + 0x228))
+		gp := &guestPSO{
+			blend:      parseRT0Blend(desc + 0x78),
+			inputElems: parseInputLayout(ilPtr, ilNum),
+		}
 		if h, ok := storeDXBCBlob(vsPtr, vsLen); ok {
 			gp.vsHash, gp.hasVS = h, true
 		}
@@ -1824,6 +1881,10 @@ func newD3D12XDevice() uintptr {
 						if offBytes+48 <= uintptr(sz) {
 							gp.blend = parseRT0Blend(sub + offBytes)
 						}
+						continue
+					}
+					if tag == 12 && len(gp.inputElems) == 0 {
+						gp.inputElems = parseInputLayout(uintptr(q[i]), uint32(q[i+1]))
 						continue
 					}
 					if tag != 1 && tag != 2 && tag != 6 {
