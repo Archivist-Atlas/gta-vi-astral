@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/Archivist-Atlas/gta-vi-astral/pkg/formats"
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/gpu"
 )
 
@@ -34,10 +35,11 @@ type dstorageState struct {
 	files        map[uintptr]*os.File
 	statuses     map[uintptr]*dstorageStatus
 	pendingPages map[uintptr][]dsPendingPageReq
-	readCount    atomic.Uint64
-	bytesRead    atomic.Uint64
-	pageWrites   atomic.Uint64
-	bcpackWarns  atomic.Int32
+	readCount     atomic.Uint64
+	bytesRead     atomic.Uint64
+	pageWrites    atomic.Uint64
+	bcpackDecoded atomic.Uint64
+	bcpackWarns   atomic.Int32
 }
 
 type dstorageStatus struct {
@@ -163,11 +165,6 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			return
 		}
 		bcFmt := (opts & optBCPack) >> 1
-		if bcFmt != 0 {
-			if ds.bcpackWarns.Add(1) <= 5 {
-				slog.Warn("IDStorageQueueX!EnqueueRequest BCPack non décodé (repli zéro)", "bcFmt", bcFmt, "srcSize", srcSize, "dstSize", dstSize)
-			}
-		}
 		isPageDst := (opts & optPageDst) != 0
 		var dst []byte
 		if isPageDst {
@@ -176,7 +173,31 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			dst = unsafe.Slice((*byte)(osPtr(dstPtr)), dstSize)
 		}
 		var written int
-		if bcFmt == 0 && opts&optZlib != 0 { // ZLIB (RFC 1950)
+		if bcFmt != 0 {
+			// Ordre matériel Xbox Series : ZLIB d'abord (si combiné), puis BCPack (BC1/BC3/BC4/BC5/BC6H/BC7)
+			packed := raw
+			if opts&optZlib != 0 {
+				if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
+					if dec, rerr := io.ReadAll(zr); rerr == nil && len(dec) > 0 {
+						packed = dec
+					}
+					_ = zr.Close()
+				}
+			}
+			if err := formats.DecodeBCPack(uint8(bcFmt), packed, dst, nil); err == nil {
+				written = int(dstSize)
+				ds.bytesRead.Add(uint64(written))
+				if n := ds.bcpackDecoded.Add(1); n == 1 || n%250 == 0 {
+					slog.Info("IDStorageQueueX!BCPack décodage matériel pur Go actif", "count", n, "bcFmt", bcFmt, "srcSize", len(packed), "dstSize", dstSize)
+				}
+			} else {
+				if ds.bcpackWarns.Add(1) <= 5 {
+					slog.Warn("IDStorageQueueX!EnqueueRequest BCPack erreur décodage (repli zéro)", "bcFmt", bcFmt, "srcSize", len(packed), "dstSize", dstSize, "err", err)
+				}
+				clear(dst)
+				written = int(dstSize)
+			}
+		} else if opts&optZlib != 0 { // ZLIB (RFC 1950)
 			if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
 				var rerr error
 				written, rerr = io.ReadFull(zr, dst)
@@ -188,11 +209,9 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			} else {
 				slog.Warn("IDStorageQueueX!EnqueueRequest zlib err", "err", err, "srcSize", srcSize, "dstSize", dstSize)
 			}
-		} else if bcFmt == 0 {
+		} else {
 			written = copy(dst, raw)
 			ds.bytesRead.Add(uint64(written))
-		} else {
-			written = int(dstSize)
 		}
 		if isPageDst && written > 0 {
 			nPages := (pageOff + int(dstSize) + int(xmemPageSize) - 1) / int(xmemPageSize)
