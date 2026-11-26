@@ -29,4 +29,10 @@ func TestLoadingMP3Decode(t *testing.T) {
 	if !IsPointInAudioButton(1280-42, 38, 1280, 720) {
 		t.Fatal("IsPointInAudioButton devrait détecter le centre du bouton")
 	}
+	if !IsPointInFullscreenButton(1280-98, 38, 1280, 720) {
+		t.Fatal("IsPointInFullscreenButton devrait détecter le centre du bouton plein écran")
+	}
+	if IsPointInAudioButton(1280-98, 38, 1280, 720) {
+		t.Fatal("les zones cliquables audio et plein écran ne doivent pas se chevaucher")
+	}
 }

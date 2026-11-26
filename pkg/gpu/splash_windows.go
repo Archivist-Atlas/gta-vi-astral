@@ -220,7 +220,8 @@ func (h *HostD3D12) renderSplashRGBA() []byte {
 			}
 		}
 	}
-	// Bouton audio synthwave en haut à droite (activer / couper loading.mp3)
+	// Boutons synthwave en haut à droite : Plein écran (F11) et Audio (M)
+	drawFullscreenButton(h.splashBuf, w, ht, IsWindowFullscreen())
 	drawAudioButton(h.splashBuf, w, ht, IsLoadingAudioEnabled())
 
 	return h.splashBuf
@@ -228,6 +229,7 @@ func (h *HostD3D12) renderSplashRGBA() []byte {
 
 const (
 	audioBtnMarginRight = 42
+	fsBtnMarginRight    = 98
 	audioBtnCenterY     = 38
 	audioBtnRadius      = 22.0
 )
@@ -239,6 +241,19 @@ func IsPointInAudioButton(bx, by, w, h int) bool {
 		return false
 	}
 	cx := w - audioBtnMarginRight
+	cy := audioBtnCenterY
+	dx := bx - cx
+	dy := by - cy
+	return dx*dx+dy*dy <= 28*28
+}
+
+// IsPointInFullscreenButton vérifie si le point (bx, by) en coordonnées backbuffer (w x h)
+// se trouve sur le bouton plein écran (F11) en haut à droite du splashscreen.
+func IsPointInFullscreenButton(bx, by, w, h int) bool {
+	if w <= 0 || h <= 0 {
+		return false
+	}
+	cx := w - fsBtnMarginRight
 	cy := audioBtnCenterY
 	dx := bx - cx
 	dy := by - cy
@@ -400,6 +415,106 @@ func drawAudioButton(buf []byte, w, ht int, soundOn bool) {
 						}
 						blendPixel(buf, off, 255, 77, 109, a)
 					}
+				}
+			}
+		}
+	}
+}
+
+func drawFullscreenButton(buf []byte, w, ht int, fullscreen bool) {
+	cx := w - fsBtnMarginRight
+	cy := audioBtnCenterY
+	box := 28
+
+	for dy := -box; dy <= box; dy++ {
+		y := cy + dy
+		if y < 0 || y >= ht {
+			continue
+		}
+		for dx := -box; dx <= box; dx++ {
+			x := cx + dx
+			if x < 0 || x >= w {
+				continue
+			}
+			off := (y*w + x) * 4
+			buf[off+0] = 0
+			buf[off+1] = 0
+			buf[off+2] = 0
+			buf[off+3] = 255
+
+			dist := float32(math.Hypot(float64(dx), float64(dy)))
+			if dist > audioBtnRadius+4 {
+				continue
+			}
+
+			// Halo extérieur discret lorsque le plein écran est actif
+			if fullscreen && dist > audioBtnRadius {
+				glow := (1.0 - (dist-audioBtnRadius)/4.0) * 0.35
+				blendPixel(buf, off, 255, 42, 133, glow)
+				continue
+			}
+
+			// Anneau bordure dégradé synthwave (2 px)
+			if dist >= audioBtnRadius-2.2 && dist <= audioBtnRadius {
+				edgeAlpha := float32(1.0)
+				if dist > audioBtnRadius-1.0 {
+					edgeAlpha = audioBtnRadius - dist
+				}
+				if fullscreen {
+					t := (float32(dx+dy)/(2.0*audioBtnRadius) + 0.5)
+					if t < 0 {
+						t = 0
+					} else if t > 1 {
+						t = 1
+					}
+					var br, bg, bb float32
+					if t < 0.5 {
+						u := t * 2
+						br = 157 + u*(255-157)
+						bg = 78 + u*(42-78)
+						bb = 221 + u*(133-221)
+					} else {
+						u := (t - 0.5) * 2
+						br = 255
+						bg = 42 + u*(140-42)
+						bb = 133 + u*(66-133)
+					}
+					blendPixel(buf, off, br, bg, bb, edgeAlpha)
+				} else {
+					blendPixel(buf, off, 128, 96, 168, edgeAlpha)
+				}
+				continue
+			}
+
+			// Fond sombre du badge
+			if dist < audioBtnRadius-2.0 {
+				if fullscreen {
+					blendPixel(buf, off, 28, 18, 46, 1.0)
+				} else {
+					blendPixel(buf, off, 22, 17, 34, 1.0)
+				}
+			}
+
+			// 4 coins de cadre : vers l'extérieur (entrer plein écran) ou vers l'intérieur (quitter plein écran)
+			ax := float32(math.Abs(float64(dx)))
+			ay := float32(math.Abs(float64(dy)))
+			inGlyph := false
+			if !fullscreen {
+				// Coins extérieurs : [4..9] sur un axe, [7..9] sur l'autre
+				horiz := ax >= 3.5 && ax <= 9.0 && ay >= 7.0 && ay <= 9.0
+				vert := ay >= 3.5 && ay <= 9.0 && ax >= 7.0 && ax <= 9.0
+				inGlyph = horiz || vert
+			} else {
+				// Coins intérieurs (quitter plein écran) : [3..9] et [3..5]
+				horiz := ax >= 3.0 && ax <= 9.0 && ay >= 3.0 && ay <= 5.0
+				vert := ay >= 3.0 && ay <= 9.0 && ax >= 3.0 && ax <= 5.0
+				inGlyph = horiz || vert
+			}
+			if inGlyph {
+				if fullscreen {
+					blendPixel(buf, off, 255, 110, 178, 1.0)
+				} else {
+					blendPixel(buf, off, 246, 238, 255, 1.0)
 				}
 			}
 		}

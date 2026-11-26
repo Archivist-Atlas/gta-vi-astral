@@ -37,9 +37,17 @@ var (
 	procIsWindowVisible     = modUser32.NewProc("IsWindowVisible")
 	procCreateIconFromResEx = modUser32.NewProc("CreateIconFromResourceEx")
 	procSendMessage         = modUser32.NewProc("SendMessageW")
+	procPostMessage         = modUser32.NewProc("PostMessageW")
 	procGetClientRect       = modUser32.NewProc("GetClientRect")
 	procLoadCursorWin       = modUser32.NewProc("LoadCursorW")
 	procSetCursorWin        = modUser32.NewProc("SetCursor")
+	procGetWindowLongPtr    = modUser32.NewProc("GetWindowLongPtrW")
+	procSetWindowLongPtr    = modUser32.NewProc("SetWindowLongPtrW")
+	procGetWindowPlacement  = modUser32.NewProc("GetWindowPlacement")
+	procSetWindowPlacement  = modUser32.NewProc("SetWindowPlacement")
+	procMonitorFromWindow   = modUser32.NewProc("MonitorFromWindow")
+	procGetMonitorInfo      = modUser32.NewProc("GetMonitorInfoW")
+	procSetWindowPos        = modUser32.NewProc("SetWindowPos")
 	procGetModuleHandle     = modKernel32Win.NewProc("GetModuleHandleW")
 	procGetCurrentProcessId = modKernel32Win.NewProc("GetCurrentProcessId")
 	procGetCurrentProcess   = modKernel32Win.NewProc("GetCurrentProcess")
@@ -97,11 +105,111 @@ type winMsg struct {
 	PtY     int32
 }
 
-var (
-	winOnce       sync.Once
-	winHWND       uintptr
-	winHWNDAtomic atomic.Uintptr
+type winRect struct {
+	Left, Top, Right, Bottom int32
+}
+
+type winPoint struct {
+	X, Y int32
+}
+
+type winPlacement struct {
+	Length         uint32
+	Flags          uint32
+	ShowCmd        uint32
+	MinPosition    winPoint
+	MaxPosition    winPoint
+	NormalPosition winRect
+}
+
+type winMonitorInfo struct {
+	Size    uint32
+	Monitor winRect
+	Work    winRect
+	Flags   uint32
+}
+
+const (
+	wmAppToggleFullscreen = 0x8001 // WM_APP + 1
+	vkF11                 = 0x7A
+	vkReturn              = 0x0D
 )
+
+var (
+	winOnce           sync.Once
+	winHWND           uintptr
+	winHWNDAtomic     atomic.Uintptr
+	winFullscreen     atomic.Bool
+	winSavedStyle     uintptr
+	winSavedPlacement winPlacement
+)
+
+// IsWindowFullscreen indique si la fenêtre ASTRAL est actuellement en plein écran sans bordure.
+func IsWindowFullscreen() bool {
+	return winFullscreen.Load()
+}
+
+// ToggleWindowFullscreen bascule la fenêtre principale ASTRAL entre fenêtré et plein écran sans bordure.
+func ToggleWindowFullscreen() {
+	if hwnd := winHWNDAtomic.Load(); hwnd != 0 {
+		_, _, _ = procPostMessage.Call(hwnd, wmAppToggleFullscreen, 0, 0)
+	}
+}
+
+func toggleFullscreenOnWindow(hwnd uintptr) {
+	if hwnd == 0 {
+		return
+	}
+	const (
+		gwlStyle           = ^uintptr(15) // -16 (GWL_STYLE)
+		wsOverlappedWindow = uintptr(0x00CF0000)
+		monitorNearest     = uintptr(2)
+		swpNoSize          = uintptr(0x0001)
+		swpNoMove          = uintptr(0x0002)
+		swpNoZOrder        = uintptr(0x0004)
+		swpFrameChanged    = uintptr(0x0020)
+		swpShowWindow      = uintptr(0x0040)
+		swpNoOwnerZOrder   = uintptr(0x0200)
+	)
+	if !winFullscreen.Load() {
+		style, _, _ := procGetWindowLongPtr.Call(hwnd, gwlStyle)
+		winSavedStyle = style
+		winSavedPlacement.Length = uint32(unsafe.Sizeof(winSavedPlacement))
+		_, _, _ = procGetWindowPlacement.Call(hwnd, uintptr(unsafe.Pointer(&winSavedPlacement)))
+
+		hMon, _, _ := procMonitorFromWindow.Call(hwnd, monitorNearest)
+		var mi winMonitorInfo
+		mi.Size = uint32(unsafe.Sizeof(mi))
+		if ok, _, _ := procGetMonitorInfo.Call(hMon, uintptr(unsafe.Pointer(&mi))); ok != 0 {
+			_, _, _ = procSetWindowLongPtr.Call(hwnd, gwlStyle, style&^wsOverlappedWindow)
+			monW := uintptr(mi.Monitor.Right - mi.Monitor.Left)
+			monH := uintptr(mi.Monitor.Bottom - mi.Monitor.Top)
+			_, _, _ = procSetWindowPos.Call(
+				hwnd, 0,
+				uintptr(mi.Monitor.Left), uintptr(mi.Monitor.Top),
+				monW, monH,
+				swpNoOwnerZOrder|swpFrameChanged|swpShowWindow,
+			)
+			winFullscreen.Store(true)
+			slog.Info("Fenêtre ASTRAL basculée en plein écran sans bordure", "w", monW, "h", monH)
+		}
+	} else {
+		style := winSavedStyle
+		if style == 0 {
+			style = 0x10CF0000 // WS_OVERLAPPEDWINDOW | WS_VISIBLE
+		}
+		_, _, _ = procSetWindowLongPtr.Call(hwnd, gwlStyle, style)
+		if winSavedPlacement.Length != 0 {
+			_, _, _ = procSetWindowPlacement.Call(hwnd, uintptr(unsafe.Pointer(&winSavedPlacement)))
+		}
+		_, _, _ = procSetWindowPos.Call(
+			hwnd, 0, 0, 0, 0, 0,
+			swpNoMove|swpNoSize|swpNoZOrder|swpNoOwnerZOrder|swpFrameChanged,
+		)
+		winFullscreen.Store(false)
+		slog.Info("Fenêtre ASTRAL revenue en mode fenêtré")
+	}
+}
 
 // MainWindowHWND retourne le HWND de la fenêtre principale ASTRAL si elle est déjà créée.
 func MainWindowHWND() uintptr {
@@ -145,21 +253,40 @@ func EnsureWindow(title string, width, height int) uintptr {
 							ToggleLoadingAudio()
 							return 0
 						}
+						if IsPointInFullscreenButton(bx, by, width, height) {
+							toggleFullscreenOnWindow(hwnd)
+							return 0
+						}
 					}
 				case 0x0200: // WM_MOUSEMOVE
 					if !IsIntroReached() {
 						bx, by := clientToBackbuf(hwnd, lParam)
-						if IsPointInAudioButton(bx, by, width, height) && hCurHand != 0 {
+						if (IsPointInAudioButton(bx, by, width, height) || IsPointInFullscreenButton(bx, by, width, height)) && hCurHand != 0 {
 							_, _, _ = procSetCursorWin.Call(hCurHand)
 						} else if hCurArrow != 0 {
 							_, _, _ = procSetCursorWin.Call(hCurArrow)
 						}
 					}
 				case 0x0100: // WM_KEYDOWN
-					if !IsIntroReached() && wParam == 'M' {
+					isRepeat := (lParam & (1 << 30)) != 0
+					if wParam == vkF11 && !isRepeat {
+						toggleFullscreenOnWindow(hwnd)
+						return 0
+					}
+					if !IsIntroReached() && wParam == 'M' && !isRepeat {
 						ToggleLoadingAudio()
 						return 0
 					}
+				case 0x0104: // WM_SYSKEYDOWN (Alt+Entrée)
+					isRepeat := (lParam & (1 << 30)) != 0
+					altDown := (lParam & (1 << 29)) != 0
+					if wParam == vkReturn && altDown && !isRepeat {
+						toggleFullscreenOnWindow(hwnd)
+						return 0
+					}
+				case wmAppToggleFullscreen:
+					toggleFullscreenOnWindow(hwnd)
+					return 0
 				case 0x0002: // WM_DESTROY
 					StopLoadingAudio()
 					_, _, _ = procPostQuitMsg.Call(0)
