@@ -353,17 +353,16 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 	} else if len(outputs) == 0 {
 		b.WriteString("    o.pos = exp_pos;\n")
 	} else {
-		paramIdx := 0
+		regToParam := paramSlotMap(outputs)
 		for idx, el := range outputs {
 			up := strings.ToUpper(el.SemanticName)
 			if up == "SV_POSITION" {
 				b.WriteString(fmt.Sprintf("    o.out%d = %s;\n", idx, swizzleForMask("exp_pos", el)))
 			} else {
-				p := paramIdx
+				p := regToParam[el.Register]
 				if p >= 8 {
 					p = 7
 				}
-				paramIdx++
 				b.WriteString(fmt.Sprintf("    o.out%d = %s;\n", idx, swizzleForMask(fmt.Sprintf("exp_param[%d]", p), el)))
 			}
 		}
@@ -409,6 +408,25 @@ func emitSingleInst(b *strings.Builder, gi GFX10Inst, isPS, isCS bool, inputs []
 		}
 		b.WriteString(fmt.Sprintf("%s// unimpl %04x %s %08x %08x\n", indent, gi.PC, gi.Encoding, gi.Word0, gi.Word1))
 	}
+}
+
+// paramSlotMap attribue un slot matériel exp_param / v_interp séquentiel (0, 1, ...)
+// à chaque Register distinct non-SV_Position d'une signature DXBC (ISG1 / OSG1).
+// Cela préserve le packing DXBC où deux float2 (ex. TEXCOORD0 .xy et TEXCOORD1 .zw)
+// partagent le même Register matériel.
+func paramSlotMap(elems []SigElement) map[uint32]int {
+	m := make(map[uint32]int, len(elems))
+	next := 0
+	for _, el := range elems {
+		if strings.ToUpper(el.SemanticName) == "SV_POSITION" {
+			continue
+		}
+		if _, exists := m[el.Register]; !exists {
+			m[el.Register] = next
+			next++
+		}
+	}
+	return m
 }
 
 func swizzleForMask(expr string, el SigElement) string {
@@ -908,25 +926,32 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement, texIdx
 			}
 			return fmt.Sprintf("v[%d] = 0u;", vdst), true
 		}
-		// Recherche de l'attribut `attr` parmi les entrées non-SV_Position
-		pIdx := uint32(0)
+		// Recherche de l'attribut `attr` parmi les registres non-SV_Position (supporte le packing ISG1, ex. TEXCOORD0 .xy + TEXCOORD1 .zw dans Register 0)
+		regToParam := paramSlotMap(inputs)
 		for idx, el := range inputs {
 			if strings.ToUpper(el.SemanticName) == "SV_POSITION" {
 				continue
 			}
-			if pIdx == attr {
-				comps := el.ComponentCount()
-				if el.Mask&(1<<attrChan) != 0 {
-					if comps == 1 {
-						return fmt.Sprintf("v[%d] = asuint(inp.in%d);", vdst, idx), true
-					}
-					if int(attrChan) < comps {
-						return fmt.Sprintf("v[%d] = asuint(inp.in%d.%c);", vdst, idx, ch), true
-					}
-				}
-				return fmt.Sprintf("v[%d] = 0u;", vdst), true
+			if uint32(regToParam[el.Register]) != attr {
+				continue
 			}
-			pIdx++
+			if el.Mask&(1<<attrChan) == 0 {
+				continue
+			}
+			comps := el.ComponentCount()
+			if comps == 1 {
+				return fmt.Sprintf("v[%d] = asuint(inp.in%d);", vdst, idx), true
+			}
+			chIdx := 0
+			for b := uint32(0); b < attrChan; b++ {
+				if el.Mask&(1<<b) != 0 {
+					chIdx++
+				}
+			}
+			if chIdx < comps {
+				return fmt.Sprintf("v[%d] = asuint(inp.in%d.%c);", vdst, idx, "xyzw"[chIdx]), true
+			}
+			return fmt.Sprintf("v[%d] = 0u;", vdst), true
 		}
 		return fmt.Sprintf("v[%d] = 0u;", vdst), true
 
@@ -946,14 +971,19 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement, texIdx
 		if !isPS {
 			return "", false
 		}
-		if vdata < 64 && vaddr+1 < 64 {
+		vaddrU := vaddr
+		vaddrV := vaddr + 1
+		if gi.NSACount > 0 {
+			vaddrV = gi.NSA[0] & 0xFF
+		}
+		if vdata < 64 && vaddrU < 64 && vaddrV < 64 {
 			dmask := (w0 >> 8) & 0xF
 			if dmask == 0 {
 				dmask = 0xF
 			}
 			chs := [4]byte{'x', 'y', 'z', 'w'}
 			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("{ float4 _t = Tex%d.Sample(Samp0, float2(asfloat(v[%d]), asfloat(v[%d])));", texIdx, vaddr, vaddr+1))
+			sb.WriteString(fmt.Sprintf("{ float4 _t = Tex%d.Sample(Samp0, float2(asfloat(v[%d]), asfloat(v[%d])));", texIdx, vaddrU, vaddrV))
 			dstReg := vdata
 			for c := uint32(0); c < 4; c++ {
 				if dmask&(1<<c) != 0 && dstReg < 64 {

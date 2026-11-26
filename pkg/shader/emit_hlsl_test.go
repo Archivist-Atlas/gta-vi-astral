@@ -126,3 +126,101 @@ func TestEmitHLSLStructuredBranch(t *testing.T) {
 		t.Fatalf("structure de branchement absente :\n%s", out.Source)
 	}
 }
+
+func buildSigPart(elems []SigElement) []byte {
+	hdrSize := 8 + len(elems)*32
+	buf := make([]byte, hdrSize)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(elems)))
+	binary.LittleEndian.PutUint32(buf[4:8], 8)
+	for i, el := range elems {
+		nameOff := uint32(len(buf))
+		buf = append(buf, []byte(el.SemanticName)...)
+		buf = append(buf, 0)
+		off := 8 + i*32
+		binary.LittleEndian.PutUint32(buf[off+0:off+4], el.Stream)
+		binary.LittleEndian.PutUint32(buf[off+4:off+8], nameOff)
+		binary.LittleEndian.PutUint32(buf[off+8:off+12], el.SemanticIndex)
+		binary.LittleEndian.PutUint32(buf[off+12:off+16], el.SystemValue)
+		binary.LittleEndian.PutUint32(buf[off+16:off+20], el.ComponentType)
+		binary.LittleEndian.PutUint32(buf[off+20:off+24], el.Register)
+		buf[off+24] = el.Mask
+		buf[off+25] = el.ReadWriteMask
+	}
+	return buf
+}
+
+func TestEmitHLSLPackedStageAndMIMGNSA(t *testing.T) {
+	// Signature DXBC packée : TEXCOORD0 (.xy) + TEXCOORD1 (.zw) dans Register 0, COLOR0 (.xyzw) dans Register 1
+	packedElems := []SigElement{
+		{SemanticName: "TEXCOORD", SemanticIndex: 0, ComponentType: 3, Register: 0, Mask: 0x3},
+		{SemanticName: "TEXCOORD", SemanticIndex: 1, ComponentType: 3, Register: 0, Mask: 0xC},
+		{SemanticName: "COLOR", SemanticIndex: 0, ComponentType: 3, Register: 1, Mask: 0xF},
+	}
+
+	// 1) VS StageOut avec OSG1 packé + SV_Position
+	vsElems := append(append([]SigElement{}, packedElems...), SigElement{
+		SemanticName: "SV_Position", SemanticIndex: 0, ComponentType: 3, Register: 2, Mask: 0xF,
+	})
+	vsCont := &Container{Parts: []Part{{FourCC: FourCCOSG1, Data: buildSigPart(vsElems)}}}
+	vsCode := make([]byte, 0, 8)
+	var b4 [4]byte
+	binary.LittleEndian.PutUint32(b4[:], (0b101111111<<23)|(0x01<<16)) // s_endpgm
+	vsCode = append(vsCode, b4[:]...)
+	vsOut, err := EmitHLSL(vsCont, NativeProgram{Stage: StageVS, Code: vsCode})
+	if err != nil {
+		t.Fatalf("EmitHLSL VS packé échoué : %v", err)
+	}
+	for _, want := range []string{
+		"o.out0 = exp_param[0].xy;",
+		"o.out1 = exp_param[0].zw;",
+		"o.out2 = exp_param[1].xyzw;",
+		"o.out3 = exp_pos.xyzw;",
+	} {
+		if !strings.Contains(vsOut.Source, want) {
+			t.Fatalf("sortie VS packée attendue %q absente :\n%s", want, vsOut.Source)
+		}
+	}
+
+	// 2) PS EncVINTRP packé + MIMG NSA (dwords=1 -> vaddrU=8, vaddrV=15)
+	psCont := &Container{Parts: []Part{{FourCC: FourCCISG1, Data: buildSigPart(packedElems)}}}
+	psCode := make([]byte, 0, 40)
+	w := func(u uint32) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], u)
+		psCode = append(psCode, b[:]...)
+	}
+	vintrp := func(vdst, attr, chanIdx uint32) uint32 {
+		return (0b110010 << 26) | (vdst << 18) | (attr << 10) | (chanIdx << 8)
+	}
+	w(vintrp(8, 0, 0))  // TEXCOORD0.x -> inp.in0.x
+	w(vintrp(15, 0, 1)) // TEXCOORD0.y -> inp.in0.y
+	w(vintrp(6, 0, 2))  // TEXCOORD1.x -> inp.in1.x
+	w(vintrp(7, 0, 3))  // TEXCOORD1.y -> inp.in1.y
+	w(vintrp(11, 1, 3)) // COLOR0.w    -> inp.in2.w
+	// MIMG: op=0x20 (image_sample), dmask=0x8 (w), dwords=1 (NSA -> bits[2:1]=1), vdata=0, vaddr0=8, NSA[0]=15
+	w((0b111100 << 26) | (0x20 << 18) | (0x8 << 8) | (1 << 1))
+	w((0 << 8) | 8)
+	w(15)
+	// s_endpgm
+	w((0b101111111 << 23) | (0x01 << 16))
+
+	psOut, err := EmitHLSL(psCont, NativeProgram{Stage: StagePS, Code: psCode})
+	if err != nil {
+		t.Fatalf("EmitHLSL PS packé/NSA échoué : %v", err)
+	}
+	if psOut.UnsupportedOps != 0 {
+		t.Fatalf("ops non supportés inattendus dans PS NSA : %v\n%s", psOut.MissingOps, psOut.Source)
+	}
+	for _, want := range []string{
+		"v[8] = asuint(inp.in0.x);",
+		"v[15] = asuint(inp.in0.y);",
+		"v[6] = asuint(inp.in1.x);",
+		"v[7] = asuint(inp.in1.y);",
+		"v[11] = asuint(inp.in2.w);",
+		"Tex0.Sample(Samp0, float2(asfloat(v[8]), asfloat(v[15])))",
+	} {
+		if !strings.Contains(psOut.Source, want) {
+			t.Fatalf("ligne PS packée/NSA attendue %q absente :\n%s", want, psOut.Source)
+		}
+	}
+}

@@ -1135,6 +1135,14 @@ func newD3D12XDevice() uintptr {
 		if gp.blend != nil {
 			blendDesc = fmt.Sprintf("en=%v src=%d dst=%d op=%d", gp.blend.BlendEnable, gp.blend.SrcBlend, gp.blend.DestBlend, gp.blend.BlendOp)
 		}
+		ilDescStr := "none"
+		if len(gp.inputElems) > 0 {
+			var parts []string
+			for _, el := range gp.inputElems {
+				parts = append(parts, fmt.Sprintf("%s%d:fmt%d@%d/s%d", el.SemanticName, el.SemanticIndex, el.Format, el.AlignedByteOffset, el.InputSlot))
+			}
+			ilDescStr = strings.Join(parts, ",")
+		}
 		slog.Info("PSO RDNA2 recompilé en ID3D12PipelineState matériel",
 			"guestPSO", fmt.Sprintf("0x%X", psoObj),
 			"hostPSO", fmt.Sprintf("0x%X", hPSO),
@@ -1142,7 +1150,7 @@ func newD3D12XDevice() uintptr {
 			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
 			"missingPS", psOut.MissingOps,
 			"blend", blendDesc,
-			"guestIL", len(gp.inputElems),
+			"guestIL", ilDescStr,
 			"vsCBSlot", vsOut.CBDescriptorSlot,
 			"psCBSlot", psOut.CBDescriptorSlot,
 			"psSRVs", psOut.SRVDescriptorSlots,

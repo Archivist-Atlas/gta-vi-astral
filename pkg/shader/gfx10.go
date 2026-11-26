@@ -76,10 +76,12 @@ func (e GFX10Encoding) String() string {
 // GFX10Inst représente une instruction RDNA2 décodée depuis le flux machine.
 type GFX10Inst struct {
 	PC       uint32
-	Size     uint8 // 4, 8 ou 12 octets
+	Size     uint8 // 4, 8, 12, 16 ou 20 octets
 	Encoding GFX10Encoding
 	Word0    uint32
 	Word1    uint32
+	NSACount uint8     // nombre de dwords NSA additionnels pour MIMG (0..3)
+	NSA      [3]uint32 // dwords NSA (adresses VGPR non séquentielles pour MIMG)
 	Literal  uint32
 	HasLit   bool
 	IsEndPgm bool
@@ -115,6 +117,17 @@ func DecodeGFX10(code []byte) []GFX10Inst {
 					inst.Literal = binary.LittleEndian.Uint32(code[pc+8 : pc+12])
 					inst.HasLit = true
 					inst.Size = 12
+				}
+			}
+			// GFX10/RDNA2 : MIMG peut utiliser NSA (Non-Sequential Address, w0[2:1] = 1..3 dwords supplémentaires)
+			if inst.Encoding == EncMIMG {
+				nsa := (w0 >> 1) & 0x3
+				if nsa > 0 && pc+8+int(nsa)*4 <= len(code) {
+					inst.NSACount = uint8(nsa)
+					for i := uint32(0); i < nsa; i++ {
+						inst.NSA[i] = binary.LittleEndian.Uint32(code[pc+8+int(i)*4 : pc+12+int(i)*4])
+					}
+					inst.Size = uint8(8 + nsa*4)
 				}
 			}
 		} else if inst.Size == 8 {
