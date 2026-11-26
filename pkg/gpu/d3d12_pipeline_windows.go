@@ -512,7 +512,10 @@ func CompileHostPSO(vsHLSL, vsEntry, psHLSL, psEntry string, inputElems []HostIn
 func RegisterGammaCompositePSO(pso uintptr) {
 	hostMu.Lock()
 	if hostInstance != nil {
-		hostInstance.GammaCompositePSO = pso
+		if hostInstance.GammaCompositePSOs == nil {
+			hostInstance.GammaCompositePSOs = make(map[uintptr]bool)
+		}
+		hostInstance.GammaCompositePSOs[pso] = true
 	}
 	hostMu.Unlock()
 }
