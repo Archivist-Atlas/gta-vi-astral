@@ -277,6 +277,11 @@ func CompileHLSL(source, entryPoint, target string) ([]byte, error) {
 	srcBytes := []byte(source)
 	entryBytes := append([]byte(entryPoint), 0)
 	targetBytes := append([]byte(target), 0)
+	var flags1 uintptr
+	if len(source) > 16384 {
+		// Évite 5-10s de blocage D3DCompile sur les gros Compute Shaders (2000+ ins) -> prévient le watchdog RAGE.
+		flags1 = (1 << 2) | (1 << 14) // D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_OPTIMIZATION_LEVEL0
+	}
 	var codeBlob, errBlob uintptr
 	hr, _, _ := procD3DCompile.Call(
 		uintptr(unsafe.Pointer(&srcBytes[0])),
@@ -284,7 +289,7 @@ func CompileHLSL(source, entryPoint, target string) ([]byte, error) {
 		0, 0, 0,
 		uintptr(unsafe.Pointer(&entryBytes[0])),
 		uintptr(unsafe.Pointer(&targetBytes[0])),
-		0, 0,
+		flags1, 0,
 		uintptr(unsafe.Pointer(&codeBlob)),
 		uintptr(unsafe.Pointer(&errBlob)),
 	)

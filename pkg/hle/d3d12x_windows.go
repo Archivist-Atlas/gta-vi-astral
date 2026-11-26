@@ -1012,34 +1012,38 @@ func newD3D12XDevice() uintptr {
 			if len(csData) < 32 {
 				return
 			}
-			csC, err := shader.ParseDXBC(csData)
-			if err != nil {
-				return
-			}
-			csProgs, err := shader.ExtractNativePrograms(csC)
-			if err != nil || len(csProgs) == 0 {
-				return
-			}
-			csOut, err := shader.EmitHLSL(csC, csProgs[0])
-			if err != nil {
-				return
-			}
-			if dumpFrame {
-				_ = os.WriteFile(fmt.Sprintf("%s\\astral_cs_%X.hlsl", os.TempDir(), psoObj), []byte(csOut.Source), 0o644)
-			}
-			hPSO, cerr := gpu.CompileHostComputePSO(csOut.Source, csOut.EntryPoint)
-			if cerr != nil {
-				slog.Warn("Recompilation Compute PSO RDNA2->HLSL->D3D12 échouée", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
-				return
-			}
-			st.mu.Lock()
-			gp.hostPSO = hPSO
-			st.mu.Unlock()
-			slog.Info("Compute PSO RDNA2 recompilé en ID3D12PipelineState matériel",
-				"guestPSO", fmt.Sprintf("0x%X", psoObj),
-				"hostPSO", fmt.Sprintf("0x%X", hPSO),
-				"cs", fmt.Sprintf("%d/%d ins", csOut.LoweredInsts, csOut.TotalInsts),
-			)
+			// Compile les Compute PSO en arrière-plan : ne jamais bloquer le thread de rendu du jeu
+			// pendant 15-20s sur D3DCompile (déclenchait le watchdog RAGE 0x4D8BD421).
+			go func(psoObj uintptr, gp *guestPSO, csData []byte) {
+				csC, err := shader.ParseDXBC(csData)
+				if err != nil {
+					return
+				}
+				csProgs, err := shader.ExtractNativePrograms(csC)
+				if err != nil || len(csProgs) == 0 {
+					return
+				}
+				csOut, err := shader.EmitHLSL(csC, csProgs[0])
+				if err != nil {
+					return
+				}
+				if dumpFrame {
+					_ = os.WriteFile(fmt.Sprintf("%s\\astral_cs_%X.hlsl", os.TempDir(), psoObj), []byte(csOut.Source), 0o644)
+				}
+				hPSO, cerr := gpu.CompileHostComputePSO(csOut.Source, csOut.EntryPoint)
+				if cerr != nil {
+					slog.Warn("Recompilation Compute PSO RDNA2->HLSL->D3D12 échouée", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
+					return
+				}
+				st.mu.Lock()
+				gp.hostPSO = hPSO
+				st.mu.Unlock()
+				slog.Info("Compute PSO RDNA2 recompilé en ID3D12PipelineState matériel",
+					"guestPSO", fmt.Sprintf("0x%X", psoObj),
+					"hostPSO", fmt.Sprintf("0x%X", hPSO),
+					"cs", fmt.Sprintf("%d/%d ins", csOut.LoweredInsts, csOut.TotalInsts),
+				)
+			}(psoObj, gp, csData)
 			return
 		}
 		if !gp.hasVS || !gp.hasPS {
