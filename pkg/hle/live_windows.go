@@ -1642,6 +1642,47 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 		t.bind(dll, "OutputDebugStringW", cbOutDbgW)
 	}
 
+	// --- 3f. Capture des sorties forcées du titre (ExitProcess / TerminateProcess / RaiseFailFastException) ---
+	k32ExitProc := k32.NewProc("ExitProcess")
+	k32TermProc := k32.NewProc("TerminateProcess")
+	k32FailFast := k32.NewProc("RaiseFailFastException")
+	cbExitProcess := syscall.NewCallback(func(code uintptr) uintptr {
+		slog.Error("TITLE ExitProcess appelé", "exitCode", fmt.Sprintf("0x%X (%d)", uint32(code), int32(code)))
+		_, _, _ = k32ExitProc.Call(code)
+		return 0
+	})
+	cbTerminateProcess := syscall.NewCallback(func(hProc, code uintptr) uintptr {
+		slog.Error("TITLE TerminateProcess appelé", "hProc", fmt.Sprintf("0x%X", hProc), "exitCode", fmt.Sprintf("0x%X (%d)", uint32(code), int32(code)))
+		r, _, _ := k32TermProc.Call(hProc, code)
+		return r
+	})
+	cbFailFast := syscall.NewCallback(func(pExRec, pCtx, flags uintptr) uintptr {
+		var exCode uint32
+		var exAddr uintptr
+		if pExRec >= 0x10000 {
+			exCode = *(*uint32)(osPtr(pExRec))
+			exAddr = *(*uintptr)(osPtr(pExRec + 16))
+		}
+		slog.Error("TITLE RaiseFailFastException appelé", "code", fmt.Sprintf("0x%08X", exCode), "addr", fmt.Sprintf("0x%X", exAddr), "flags", flags)
+		_, _, _ = k32FailFast.Call(pExRec, pCtx, flags)
+		return 0
+	})
+	for _, dll := range []string{
+		"kernel32.dll",
+		"kernelbase.dll",
+		"api-ms-win-core-processthreads-l1-1-0.dll",
+		"api-ms-win-core-processthreads-l1-1-1.dll",
+		"api-ms-win-core-processthreads-l1-1-2.dll",
+		"api-ms-win-core-processthreads-l1-1-3.dll",
+		"api-ms-win-core-errorhandling-l1-1-0.dll",
+		"api-ms-win-core-errorhandling-l1-1-1.dll",
+		"api-ms-win-core-errorhandling-l1-1-3.dll",
+	} {
+		t.bind(dll, "ExitProcess", cbExitProcess)
+		t.bind(dll, "TerminateProcess", cbTerminateProcess)
+		t.bind(dll, "RaiseFailFastException", cbFailFast)
+	}
+
 	// --- 4. Isolation réseau hors-ligne (ws2_32 & winhttp) ---
 	ws2DLL := syscall.NewLazyDLL("ws2_32.dll")
 	ws2SetLastErr := ws2DLL.NewProc("WSASetLastError")

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -41,6 +42,7 @@ func main() {
 	if os.Args[1] == "run" {
 		if lf, lerr := os.Create(filepath.Join(os.TempDir(), "astral_last.log")); lerr == nil {
 			defer lf.Close()
+			_ = debug.SetCrashOutput(lf, debug.CrashOptions{})
 			core.InitLogger(io.MultiWriter(lf, os.Stderr))
 		} else {
 			core.InitLogger(os.Stderr)
