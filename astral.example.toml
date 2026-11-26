@@ -25,6 +25,10 @@ mode = 'normal'
 # (également basculable en un clic via l'icône haut-parleur en haut à droite ou la touche M)
 loading_sound = true
 
+# Affichage de la fenêtre en plein écran sans bordure au démarrage : true ou false
+# (également basculable à tout moment via F11, Alt+Entrée ou le bouton en haut à droite du splashscreen)
+fullscreen = false
+
 # Profil matériel Xbox annoncé au jeu via l'API HLE (XSystemGetDeviceType, RAM dispo, profil graphique) :
 # - "series-x" : Xbox Series X (recommandé, profil 4K / 16 Go)
 # - "series-s" : Xbox Series S (profil plus léger / 10 Go)

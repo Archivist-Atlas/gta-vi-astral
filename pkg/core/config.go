@@ -57,6 +57,7 @@ const (
 type RuntimeConfig struct {
 	Mode           LauncherMode
 	LoadingSound   bool
+	Fullscreen     bool
 	ConsoleProfile ConsoleProfile
 	GPUBackend     GPUBackend
 	Unimplemented  UnimplementedPolicy
@@ -152,6 +153,9 @@ func LoadConfig(explicitPath string) (Config, error) {
 	if v := os.Getenv("ASTRAL_LOADING_SOUND"); v != "" {
 		cfg.Runtime.LoadingSound = parseBoolLoose(v, true)
 	}
+	if v := os.Getenv("ASTRAL_FULLSCREEN"); v != "" {
+		cfg.Runtime.Fullscreen = parseBoolLoose(v, false)
+	}
 	if v := os.Getenv("ASTRAL_CONSOLE"); v != "" {
 		cfg.Runtime.ConsoleProfile = ConsoleProfile(strings.ToLower(v))
 	}
@@ -191,10 +195,12 @@ func SaveLauncherConfig(gameDir string, mode LauncherMode) (string, error) {
 		mode = ModeNormal
 	}
 	loadingSound := true
+	fullscreen := false
 	if cur, err := LoadConfig(""); err == nil {
 		loadingSound = cur.Runtime.LoadingSound
+		fullscreen = cur.Runtime.Fullscreen
 	}
-	return writeLocalConfig(gameDir, mode, loadingSound)
+	return writeLocalConfig(gameDir, mode, loadingSound, fullscreen)
 }
 
 // SaveLoadingSound mémorise l'état du son de chargement (activé / coupé) dans astral.toml.
@@ -204,11 +210,22 @@ func SaveLoadingSound(enabled bool) error {
 	if mode != ModeDev {
 		mode = ModeNormal
 	}
-	_, err := writeLocalConfig(cur.Paths.GameDir, mode, enabled)
+	_, err := writeLocalConfig(cur.Paths.GameDir, mode, enabled, cur.Runtime.Fullscreen)
 	return err
 }
 
-func writeLocalConfig(gameDir string, mode LauncherMode, loadingSound bool) (string, error) {
+// SaveFullscreen mémorise l'état plein écran (activé / fenêtré) dans astral.toml.
+func SaveFullscreen(enabled bool) error {
+	cur, _ := LoadConfig("")
+	mode := cur.Runtime.Mode
+	if mode != ModeDev {
+		mode = ModeNormal
+	}
+	_, err := writeLocalConfig(cur.Paths.GameDir, mode, cur.Runtime.LoadingSound, enabled)
+	return err
+}
+
+func writeLocalConfig(gameDir string, mode LauncherMode, loadingSound, fullscreen bool) (string, error) {
 	target := "astral.toml"
 	if exe, err := os.Executable(); err == nil {
 		target = filepath.Join(filepath.Dir(exe), "astral.toml")
@@ -217,8 +234,8 @@ func writeLocalConfig(gameDir string, mode LauncherMode, loadingSound bool) (str
 		"# Configuration locale générée par gta-vi-astral (ignorée par Git)\n"+
 			"# Passez mode = 'dev' pour afficher le lanceur complet avec les outils de diagnostic.\n\n"+
 			"[paths]\ngame_dir = '%s'\n\n"+
-			"[runtime]\nmode = '%s'\nloading_sound = %t\n",
-		gameDir, mode, loadingSound,
+			"[runtime]\nmode = '%s'\nloading_sound = %t\nfullscreen = %t\n",
+		gameDir, mode, loadingSound, fullscreen,
 	)
 	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
 		return "", err
@@ -308,6 +325,8 @@ func parseSimpleTOML(path string, cfg *Config) error {
 				}
 			case "loading_sound":
 				cfg.Runtime.LoadingSound = parseBoolLoose(val, true)
+			case "fullscreen":
+				cfg.Runtime.Fullscreen = parseBoolLoose(val, false)
 			case "console_profile":
 				cfg.Runtime.ConsoleProfile = ConsoleProfile(strings.ToLower(val))
 			case "gpu_backend":

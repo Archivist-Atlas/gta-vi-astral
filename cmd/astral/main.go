@@ -505,7 +505,7 @@ func cmdRun(args []string) error {
 	}
 
 	if *execute {
-		openGameWindowEarly(cfg.Runtime.LoadingSound)
+		openGameWindowEarly(cfg.Runtime.LoadingSound, cfg.Runtime.Fullscreen)
 	}
 
 	// Mappage natif Windows (LoadLibraryExW + redirection TLS statique + binding IAT réel)

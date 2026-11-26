@@ -140,9 +140,21 @@ var (
 	winHWND           uintptr
 	winHWNDAtomic     atomic.Uintptr
 	winFullscreen     atomic.Bool
+	winStartFull      atomic.Bool
 	winSavedStyle     uintptr
 	winSavedPlacement winPlacement
+	winFSMu           sync.Mutex
+	winFSOnChange     func(bool)
 )
+
+// ConfigureWindowFullscreen définit l'état plein écran initial (lu depuis astral.toml)
+// et le callback appelé à chaque bascule utilisateur pour le mémoriser.
+func ConfigureWindowFullscreen(initial bool, onChange func(bool)) {
+	winStartFull.Store(initial)
+	winFSMu.Lock()
+	winFSOnChange = onChange
+	winFSMu.Unlock()
+}
 
 // IsWindowFullscreen indique si la fenêtre ASTRAL est actuellement en plein écran sans bordure.
 func IsWindowFullscreen() bool {
@@ -157,6 +169,10 @@ func ToggleWindowFullscreen() {
 }
 
 func toggleFullscreenOnWindow(hwnd uintptr) {
+	applyFullscreenOnWindow(hwnd, true)
+}
+
+func applyFullscreenOnWindow(hwnd uintptr, persist bool) {
 	if hwnd == 0 {
 		return
 	}
@@ -171,6 +187,7 @@ func toggleFullscreenOnWindow(hwnd uintptr) {
 		swpShowWindow      = uintptr(0x0040)
 		swpNoOwnerZOrder   = uintptr(0x0200)
 	)
+	newState := false
 	if !winFullscreen.Load() {
 		style, _, _ := procGetWindowLongPtr.Call(hwnd, gwlStyle)
 		winSavedStyle = style
@@ -191,7 +208,10 @@ func toggleFullscreenOnWindow(hwnd uintptr) {
 				swpNoOwnerZOrder|swpFrameChanged|swpShowWindow,
 			)
 			winFullscreen.Store(true)
+			newState = true
 			slog.Info("Fenêtre ASTRAL basculée en plein écran sans bordure", "w", monW, "h", monH)
+		} else {
+			return
 		}
 	} else {
 		style := winSavedStyle
@@ -207,7 +227,16 @@ func toggleFullscreenOnWindow(hwnd uintptr) {
 			swpNoMove|swpNoSize|swpNoZOrder|swpNoOwnerZOrder|swpFrameChanged,
 		)
 		winFullscreen.Store(false)
+		newState = false
 		slog.Info("Fenêtre ASTRAL revenue en mode fenêtré")
+	}
+	if persist {
+		winFSMu.Lock()
+		cb := winFSOnChange
+		winFSMu.Unlock()
+		if cb != nil {
+			go cb(newState)
+		}
 	}
 }
 
@@ -335,6 +364,9 @@ func EnsureWindow(title string, width, height int) uintptr {
 					_, _, _ = procSendMessage.Call(hwnd, wmSetIcon, 0 /* ICON_SMALL */, hIconSmall)
 				}
 				_, _, _ = procShowWindow.Call(hwnd, 5 /* SW_SHOW */)
+				if winStartFull.Load() {
+					applyFullscreenOnWindow(hwnd, false)
+				}
 				_, _, _ = procUpdateWindow.Call(hwnd)
 				slog.Info("fenêtre Win32 ASTRAL ouverte", "hwnd", hwnd, "width", width, "height", height, "icon", hIconBig != 0)
 			}
