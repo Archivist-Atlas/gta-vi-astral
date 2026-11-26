@@ -326,8 +326,25 @@ type d3d12InputElementDesc struct {
 	InstanceDataStepRate uint32
 }
 
+// HostBlendState décrit l'état de fusion (RenderTarget[0]) extrait du PSO invité.
+type HostBlendState struct {
+	BlendEnable    bool
+	SrcBlend       uint32
+	DestBlend      uint32
+	BlendOp        uint32
+	SrcBlendAlpha  uint32
+	DestBlendAlpha uint32
+	BlendOpAlpha   uint32
+	WriteMask      uint8
+}
+
 // CompileGraphicsPSO compile une paire HLSL (VS + PS) et crée un ID3D12PipelineState matériel sur h.Device.
 func (h *HostD3D12) CompileGraphicsPSO(vsHLSL, vsEntry, psHLSL, psEntry string, inputElems []HostInputElement) (uintptr, error) {
+	return h.CompileGraphicsPSOWithBlend(vsHLSL, vsEntry, psHLSL, psEntry, inputElems, nil)
+}
+
+// CompileGraphicsPSOWithBlend compile une paire HLSL (VS + PS) avec l'état de fusion invité (ou alpha blending par défaut).
+func (h *HostD3D12) CompileGraphicsPSOWithBlend(vsHLSL, vsEntry, psHLSL, psEntry string, inputElems []HostInputElement, blend *HostBlendState) (uintptr, error) {
 	if h == nil || h.Device == 0 || h.ReplayRootSig == 0 {
 		return 0, fmt.Errorf("HostD3D12 non initialisé")
 	}
@@ -339,10 +356,10 @@ func (h *HostD3D12) CompileGraphicsPSO(vsHLSL, vsEntry, psHLSL, psEntry string, 
 	if err != nil {
 		return 0, err
 	}
-	return h.createGraphicsPSOFromDXBC(vsBC, psBC, inputElems)
+	return h.createGraphicsPSOFromDXBC(vsBC, psBC, inputElems, blend)
 }
 
-func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []HostInputElement) (uintptr, error) {
+func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []HostInputElement, blend *HostBlendState) (uintptr, error) {
 	var rawDescs []d3d12InputElementDesc
 	var nameBufs [][]byte
 	if len(inputElems) > 0 {
@@ -391,15 +408,36 @@ func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []Ho
 		NumRenderTargets:      1,
 		SampleDesc:            d3d12SampleDesc{Count: 1, Quality: 0},
 	}
-	psoDesc.BlendState.RenderTarget[0] = d3d12RenderTargetBlendDesc{
-		BlendEnable:           1, // Alpha blending standard (SRC_ALPHA / INV_SRC_ALPHA) pour les passes UI/intro
-		SrcBlend:              5, // D3D12_BLEND_SRC_ALPHA
-		DestBlend:             6, // D3D12_BLEND_INV_SRC_ALPHA
-		BlendOp:               1, // ADD
-		SrcBlendAlpha:         2, // ONE
-		DestBlendAlpha:        6, // INV_SRC_ALPHA
-		BlendOpAlpha:          1, // ADD
-		RenderTargetWriteMask: 0x0F,
+	if blend != nil {
+		en := int32(0)
+		if blend.BlendEnable {
+			en = 1
+		}
+		mask := blend.WriteMask
+		if mask == 0 {
+			mask = 0x0F
+		}
+		psoDesc.BlendState.RenderTarget[0] = d3d12RenderTargetBlendDesc{
+			BlendEnable:           en,
+			SrcBlend:              blend.SrcBlend,
+			DestBlend:             blend.DestBlend,
+			BlendOp:               blend.BlendOp,
+			SrcBlendAlpha:         blend.SrcBlendAlpha,
+			DestBlendAlpha:        blend.DestBlendAlpha,
+			BlendOpAlpha:          blend.BlendOpAlpha,
+			RenderTargetWriteMask: mask,
+		}
+	} else {
+		psoDesc.BlendState.RenderTarget[0] = d3d12RenderTargetBlendDesc{
+			BlendEnable:           1, // Alpha blending standard (SRC_ALPHA / INV_SRC_ALPHA) par défaut
+			SrcBlend:              5, // D3D12_BLEND_SRC_ALPHA
+			DestBlend:             6, // D3D12_BLEND_INV_SRC_ALPHA
+			BlendOp:               1, // ADD
+			SrcBlendAlpha:         2, // ONE
+			DestBlendAlpha:        6, // INV_SRC_ALPHA
+			BlendOpAlpha:          1, // ADD
+			RenderTargetWriteMask: 0x0F,
+		}
 	}
 	psoDesc.RTVFormats[0] = 28 // DXGI_FORMAT_R8G8B8A8_UNORM
 
@@ -468,13 +506,17 @@ func CompileHostComputePSO(csHLSL, csEntry string) (uintptr, error) {
 
 // CompileHostPSO compile une paire HLSL (VS+PS) en ID3D12PipelineState sur l'instance HostD3D12 globale.
 func CompileHostPSO(vsHLSL, vsEntry, psHLSL, psEntry string, inputElems []HostInputElement) (uintptr, error) {
+	return CompileHostPSOWithBlend(vsHLSL, vsEntry, psHLSL, psEntry, inputElems, nil)
+}
+
+func CompileHostPSOWithBlend(vsHLSL, vsEntry, psHLSL, psEntry string, inputElems []HostInputElement, blend *HostBlendState) (uintptr, error) {
 	hostMu.Lock()
 	h := hostInstance
 	hostMu.Unlock()
 	if h == nil {
 		return 0, fmt.Errorf("HostD3D12 inactif")
 	}
-	return h.CompileGraphicsPSO(vsHLSL, vsEntry, psHLSL, psEntry, inputElems)
+	return h.CompileGraphicsPSOWithBlend(vsHLSL, vsEntry, psHLSL, psEntry, inputElems, blend)
 }
 
 // initReplayPipeline crée la RootSignature hôte (b0 16 uints + t0 SRV + s0 static sampler),

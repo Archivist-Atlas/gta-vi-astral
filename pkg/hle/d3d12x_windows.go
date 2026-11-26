@@ -23,6 +23,7 @@ type guestPSO struct {
 	hasVS      bool
 	hasPS      bool
 	hasCS      bool
+	blend      *gpu.HostBlendState
 	vsCBSlot   uint32
 	psCBSlot   uint32
 	psSRVSlots [4]uint32
@@ -976,7 +977,7 @@ func newD3D12XDevice() uintptr {
 				Format:        el.DXGIFormat(),
 			})
 		}
-		hPSO, cerr := gpu.CompileHostPSO(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems)
+		hPSO, cerr := gpu.CompileHostPSOWithBlend(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems, gp.blend)
 		if cerr != nil {
 			slog.Warn("Recompilation PSO RDNA2->HLSL->D3D12 échouée (repli actif)", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
 			return
@@ -993,12 +994,17 @@ func newD3D12XDevice() uintptr {
 			gp.psSRVSlots[i] = psOut.SRVDescriptorSlots[i]
 		}
 		st.mu.Unlock()
+		blendDesc := "default"
+		if gp.blend != nil {
+			blendDesc = fmt.Sprintf("en=%v src=%d dst=%d op=%d", gp.blend.BlendEnable, gp.blend.SrcBlend, gp.blend.DestBlend, gp.blend.BlendOp)
+		}
 		slog.Info("PSO RDNA2 recompilé en ID3D12PipelineState matériel",
 			"guestPSO", fmt.Sprintf("0x%X", psoObj),
 			"hostPSO", fmt.Sprintf("0x%X", hPSO),
 			"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
 			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
 			"missingPS", psOut.MissingOps,
+			"blend", blendDesc,
 			"vsCBSlot", vsOut.CBDescriptorSlot,
 			"psCBSlot", psOut.CBDescriptorSlot,
 			"psSRVs", psOut.SRVDescriptorSlots,
@@ -1581,6 +1587,38 @@ func newD3D12XDevice() uintptr {
 		st.mu.Unlock()
 		return h, true
 	}
+	parseRT0Blend := func(blendDescPtr uintptr) *gpu.HostBlendState {
+		rt0 := blendDescPtr + 8
+		en := *(*int32)(osPtr(rt0 + 0))
+		logicEn := *(*int32)(osPtr(rt0 + 4))
+		src := *(*uint32)(osPtr(rt0 + 8))
+		dst := *(*uint32)(osPtr(rt0 + 12))
+		op := *(*uint32)(osPtr(rt0 + 16))
+		srcA := *(*uint32)(osPtr(rt0 + 20))
+		dstA := *(*uint32)(osPtr(rt0 + 24))
+		opA := *(*uint32)(osPtr(rt0 + 28))
+		mask := *(*uint8)(osPtr(rt0 + 36))
+		if (en != 0 && en != 1) || (logicEn != 0 && logicEn != 1) {
+			return nil
+		}
+		if src < 1 || src > 19 || dst < 1 || dst > 19 || op < 1 || op > 5 ||
+			srcA < 1 || srcA > 19 || dstA < 1 || dstA > 19 || opA < 1 || opA > 5 {
+			return nil
+		}
+		if mask == 0 {
+			mask = 0x0F
+		}
+		return &gpu.HostBlendState{
+			BlendEnable:    en != 0,
+			SrcBlend:       src,
+			DestBlend:      dst,
+			BlendOp:        op,
+			SrcBlendAlpha:  srcA,
+			DestBlendAlpha: dstA,
+			BlendOpAlpha:   opA,
+			WriteMask:      mask,
+		}
+	}
 	storeGraphicsPSODesc := func(psoObj, desc uintptr) {
 		if desc < 0x10000 {
 			return
@@ -1589,7 +1627,7 @@ func newD3D12XDevice() uintptr {
 		vsLen := *(*uint64)(osPtr(desc + 0x10))
 		psPtr := *(*uintptr)(osPtr(desc + 0x18))
 		psLen := *(*uint64)(osPtr(desc + 0x20))
-		gp := &guestPSO{}
+		gp := &guestPSO{blend: parseRT0Blend(desc + 0x78)}
 		if h, ok := storeDXBCBlob(vsPtr, vsLen); ok {
 			gp.vsHash, gp.hasVS = h, true
 		}
@@ -1648,6 +1686,13 @@ func newD3D12XDevice() uintptr {
 				// (1=VS, 2=PS, 6=CS) aligné sur 8 octets, suivi de { pShaderBytecode u64, BytecodeLength u64 }.
 				for i := 1; i+1 < len(q); i++ {
 					tag := uint32(q[i-1])
+					if tag == 8 && gp.blend == nil {
+						offBytes := uintptr(i-1)*8 + 4
+						if offBytes+48 <= uintptr(sz) {
+							gp.blend = parseRT0Blend(sub + offBytes)
+						}
+						continue
+					}
 					if tag != 1 && tag != 2 && tag != 6 {
 						continue
 					}

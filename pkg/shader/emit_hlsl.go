@@ -491,8 +491,12 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement, texIdx
 		su := gfx10SrcU32(src0, gi.Literal, gi.HasLit)
 		sf := fmt.Sprintf("asfloat(%s)", su)
 		switch op {
+		case 0x00: // v_nop
+			return "", true
 		case 0x01: // v_mov_b32
 			return fmt.Sprintf("v[%d] = %s;", vdst, su), true
+		case 0x02: // v_readfirstlane_b32
+			return fmt.Sprintf("s[%d] = %s;", vdst, su), true
 		case 0x05: // v_cvt_f32_i32
 			return fmt.Sprintf("v[%d] = asuint((float)asint(%s));", vdst, su), true
 		case 0x06: // v_cvt_f32_u32
@@ -665,17 +669,21 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement, texIdx
 		s0f := fmt.Sprintf("asfloat(%s)", s0u)
 		s1u := fmt.Sprintf("v[%d]", vsrc1)
 		s1f := fmt.Sprintf("asfloat(v[%d])", vsrc1)
-		// v_cmp_*_f32 (0x10..0x1F), v_cmp_*_i32 (0x80..0x87), v_cmp_*_u32 (0xC0..0xC7)
-		cond := cmpCond(op&0x7)
+		// v_cmp_*_f32 (0x00..0x0F), v_cmpx_*_f32 (0x10..0x1F), v_cmp_*_i32 (0x80..0x87), v_cmp_*_u32 (0xC0..0xC7)
+		cond := cmpCond(op & 0x7)
 		if cond != "" {
 			switch {
-			case op >= 0x10 && op < 0x20:
+			case op < 0x20:
 				return fmt.Sprintf("vcc = (%s %s %s);", s0f, cond, s1f), true
 			case op >= 0x80 && op < 0x88:
 				return fmt.Sprintf("vcc = (asint(%s) %s asint(%s));", s0u, cond, s1u), true
 			case op >= 0xC0 && op < 0xC8:
 				return fmt.Sprintf("vcc = (%s %s %s);", s0u, cond, s1u), true
 			}
+		} else if op == 0x00 || op == 0x08 || op == 0x10 || op == 0x18 {
+			return "vcc = false;", true
+		} else if op == 0x07 || op == 0x0F || op == 0x17 || op == 0x1F {
+			return "vcc = true;", true
 		}
 
 	case EncSOPC:
