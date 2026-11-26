@@ -155,6 +155,32 @@ func buildAxisLUT(kind int, bpeLog2, blockLog2 uint32) (xLUT, yLUT []uint32, til
 	return xLUT, yLUT, tileW, tileH
 }
 
+// TiledSizeBytes retourne la taille minimale en octets de la surface en mémoire invité
+// en tenant compte de l'alignement de tuile RDNA2 (ou de l'alignement 256 o en linéaire).
+func TiledSizeBytes(width, height, bpe, block, swizzle uint32) uint64 {
+	if width == 0 || height == 0 || bpe == 0 || block == 0 {
+		return 0
+	}
+	bw := (width + block - 1) / block
+	bh := (height + block - 1) / block
+	linearRow := uint64(bw) * uint64(bpe)
+	kind, blockLog2, tiled := rdna2SwizzleInfo(swizzle)
+	if !tiled {
+		if bh > 1 {
+			linearRow = (linearRow + 255) &^ 255
+		}
+		return linearRow * uint64(bh)
+	}
+	var bpeLog2 uint32
+	for (uint32(1) << bpeLog2) < bpe && bpeLog2 < 4 {
+		bpeLog2++
+	}
+	_, _, tileW, tileH := buildAxisLUT(kind, bpeLog2, blockLog2)
+	tilesX := uint64((bw + tileW - 1) / tileW)
+	tilesY := uint64((bh + tileH - 1) / tileH)
+	return tilesX * tilesY * (uint64(1) << blockLog2)
+}
+
 // DetileRDNA2 convertit une texture 2D Xbox Series (linéaire ou tuilée RDNA2 SW_256B/4KB/64KB S/D)
 // en disposition linéaire rangée par rangée prête pour CopyTextureRegion sur le GPU hôte.
 func DetileRDNA2(src []byte, width, height, bpe, block, swizzle uint32) []byte {

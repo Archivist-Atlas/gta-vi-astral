@@ -736,16 +736,7 @@ func newD3D12XDevice() uintptr {
 				tx := *src
 				if tx.GuestVA >= 0x10000 && tx.Width > 0 && tx.Height > 0 && tx.Width <= 4096 && tx.Height <= 4096 {
 					bpe, block, _ := gpu.DXGIFormatMetrics(tx.Format)
-					bw := (uint64(tx.Width) + uint64(block) - 1) / uint64(block)
-					bh := (uint64(tx.Height) + uint64(block) - 1) / uint64(block)
-					rowBytes := bw * uint64(bpe)
-					if tx.Swizzle&0xFF == 0 && bh > 1 {
-						rowBytes = (rowBytes + 255) &^ 255
-					}
-					sz := rowBytes * bh
-					if sz < 4096 && tx.Swizzle&0xFF != 0 {
-						sz = 4096
-					}
+					sz := gpu.TiledSizeBytes(tx.Width, tx.Height, bpe, block, tx.Swizzle)
 					if sz > 0 && sz <= (16<<20) && isGuestReadable(uintptr(tx.GuestVA), sz) {
 						pix := make([]byte, sz)
 						copy(pix, unsafe.Slice((*byte)(osPtr(uintptr(tx.GuestVA))), sz))
@@ -1007,6 +998,7 @@ func newD3D12XDevice() uintptr {
 			"hostPSO", fmt.Sprintf("0x%X", hPSO),
 			"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
 			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
+			"missingPS", psOut.MissingOps,
 			"vsCBSlot", vsOut.CBDescriptorSlot,
 			"psCBSlot", psOut.CBDescriptorSlot,
 			"psSRVs", psOut.SRVDescriptorSlots,
