@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -15,6 +16,44 @@ import (
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/gpu"
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/shader"
 )
+
+func buildFullscreenCompositeVS(psC *shader.Container) string {
+	var inputs []shader.SigElement
+	if psC != nil {
+		if p, ok := psC.Part(shader.FourCCISG1); ok {
+			inputs, _ = shader.ParseSignature(p.Data)
+		}
+	}
+	var b strings.Builder
+	b.WriteString("struct StageOut {\n")
+	if len(inputs) == 0 {
+		b.WriteString("    float4 pos : SV_Position;\n    float2 uv0 : TEXCOORD0;\n};\n")
+		b.WriteString("StageOut VSMain(uint id : SV_VertexID) {\n    StageOut o;\n    float2 uv = float2((id << 1) & 2, id & 2);\n    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n    o.uv0 = uv;\n    return o;\n}\n")
+		return b.String()
+	}
+	for idx, el := range inputs {
+		b.WriteString(fmt.Sprintf("    %s out%d : %s;\n", el.HLSLType(), idx, el.HLSLSemantic()))
+	}
+	b.WriteString("};\nStageOut VSMain(uint id : SV_VertexID) {\n    StageOut o;\n    float2 uv = float2((id << 1) & 2, id & 2);\n")
+	for idx, el := range inputs {
+		if strings.EqualFold(el.SemanticName, "SV_Position") {
+			b.WriteString(fmt.Sprintf("    o.out%d = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n", idx))
+		} else {
+			switch el.ComponentCount() {
+			case 1:
+				b.WriteString(fmt.Sprintf("    o.out%d = uv.x;\n", idx))
+			case 2:
+				b.WriteString(fmt.Sprintf("    o.out%d = uv;\n", idx))
+			case 3:
+				b.WriteString(fmt.Sprintf("    o.out%d = float3(uv, 0.0);\n", idx))
+			default:
+				b.WriteString(fmt.Sprintf("    o.out%d = float4(uv, 0.0, 1.0);\n", idx))
+			}
+		}
+	}
+	b.WriteString("    return o;\n}\n")
+	return b.String()
+}
 
 type guestPSO struct {
 	vsHash     [16]byte
@@ -682,21 +721,71 @@ func newD3D12XDevice() uintptr {
 				VBStride:      st.activeVBStride,
 				IBFormat:      st.activeIBFormat,
 			}
-			if st.activeVBVA >= 0x10000 && st.activeVBSize > 0 {
-				cpLen := st.activeVBSize
-				if cpLen > (1 << 20) {
-					cpLen = 1 << 20
-				}
-				pass.VBData = make([]byte, cpLen)
-				copy(pass.VBData, unsafe.Slice((*byte)(osPtr(st.activeVBVA)), cpLen))
+			var ibElemSize uint32 = 2
+			if st.activeIBFormat == 42 { // DXGI_FORMAT_R32_UINT
+				ibElemSize = 4
 			}
+			var maxVtxIdx uint64
+			hasMaxVtx := false
 			if indexed && st.activeIBVA >= 0x10000 && st.activeIBSize > 0 {
 				cpLen := st.activeIBSize
+				if count > 0 {
+					needIB := (uint64(startLoc) + uint64(count)) * uint64(ibElemSize)
+					if needIB > 0 && needIB < uint64(cpLen) {
+						cpLen = uint32(needIB)
+					}
+				}
 				if cpLen > (1 << 20) {
 					cpLen = 1 << 20
 				}
 				pass.IBData = make([]byte, cpLen)
 				copy(pass.IBData, unsafe.Slice((*byte)(osPtr(st.activeIBVA)), cpLen))
+				// Calcule l'indice de sommet maximal réellement référencé pour ne copier que la tranche utile du VB
+				// (évite de copier 800 KiB de ring-buffer par draw et de déborder UploadVB 32 MiB -> triangles qui scintillent).
+				startByte := uint64(startLoc) * uint64(ibElemSize)
+				endByte := startByte + uint64(count)*uint64(ibElemSize)
+				if count > 0 && endByte <= uint64(len(pass.IBData)) {
+					if ibElemSize == 2 {
+						for o := startByte; o+2 <= endByte; o += 2 {
+							idx := uint64(pass.IBData[o]) | (uint64(pass.IBData[o+1]) << 8)
+							if idx > maxVtxIdx {
+								maxVtxIdx = idx
+							}
+						}
+					} else {
+						for o := startByte; o+4 <= endByte; o += 4 {
+							idx := uint64(pass.IBData[o]) | (uint64(pass.IBData[o+1]) << 8) | (uint64(pass.IBData[o+2]) << 16) | (uint64(pass.IBData[o+3]) << 24)
+							if idx > maxVtxIdx {
+								maxVtxIdx = idx
+							}
+						}
+					}
+					hasMaxVtx = true
+				}
+			}
+			if st.activeVBVA >= 0x10000 && st.activeVBSize > 0 {
+				cpLen := st.activeVBSize
+				if st.activeVBStride > 0 {
+					if !indexed && count > 0 {
+						needVB := (uint64(startLoc) + uint64(count)) * uint64(st.activeVBStride)
+						if needVB > 0 && needVB < uint64(cpLen) {
+							cpLen = uint32(needVB)
+						}
+					} else if indexed && hasMaxVtx {
+						topVtx := int64(baseVtx) + int64(maxVtxIdx) + 1
+						if topVtx > 0 {
+							needVB := uint64(topVtx) * uint64(st.activeVBStride)
+							if needVB > 0 && needVB < uint64(cpLen) {
+								cpLen = uint32(needVB)
+							}
+						}
+					}
+				}
+				if cpLen > (1 << 20) {
+					cpLen = 1 << 20
+				}
+				pass.VBData = make([]byte, cpLen)
+				copy(pass.VBData, unsafe.Slice((*byte)(osPtr(st.activeVBVA)), cpLen))
 			}
 			readCB := func(slot uint32) []byte {
 				cbVA := st.activeRootVA
@@ -977,7 +1066,25 @@ func newD3D12XDevice() uintptr {
 				Format:        el.DXGIFormat(),
 			})
 		}
-		hPSO, cerr := gpu.CompileHostPSOWithBlend(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems, gp.blend)
+		var hPSO uintptr
+		var cerr error
+		isGammaComposite := vsOut.TotalInsts == 45 && psOut.TotalInsts >= 60 && len(psOut.SRVDescriptorSlots) == 1
+		if isGammaComposite {
+			// Le VS 45/45 lit une 2e matrice CBV absente ; on l'associe à un VS triangle plein écran
+			// tout en exécutant le vrai PS 70/70 recompilé (courbe gamma / luminosité).
+			fsVS := buildFullscreenCompositeVS(psC)
+			opaqueBlend := &gpu.HostBlendState{
+				BlendEnable: false, SrcBlend: 2, DestBlend: 1, BlendOp: 1,
+				SrcBlendAlpha: 2, DestBlendAlpha: 1, BlendOpAlpha: 1, WriteMask: 0x0F,
+			}
+			hPSO, cerr = gpu.CompileHostPSOWithBlend(fsVS, "VSMain", psOut.Source, psOut.EntryPoint, nil, opaqueBlend)
+			if cerr == nil && hPSO != 0 {
+				gpu.RegisterGammaCompositePSO(hPSO)
+				slog.Info("PSO composite gamma/luminosité plein écran activé (PS réel 70/70)", "guestPSO", fmt.Sprintf("0x%X", psoObj), "hostPSO", fmt.Sprintf("0x%X", hPSO))
+			}
+		} else {
+			hPSO, cerr = gpu.CompileHostPSOWithBlend(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems, gp.blend)
+		}
 		if cerr != nil {
 			slog.Warn("Recompilation PSO RDNA2->HLSL->D3D12 échouée (repli actif)", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
 			return

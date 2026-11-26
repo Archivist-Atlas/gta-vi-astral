@@ -119,9 +119,10 @@ type HostD3D12 struct {
 	UploadTex      uintptr
 	UploadTexPtr   uintptr
 	texUploadOff   uint64
-	ReplayRootSig  uintptr
-	ReplayPSO      uintptr
-	YUVPSO         uintptr
+	ReplayRootSig     uintptr
+	ReplayPSO         uintptr
+	YUVPSO            uintptr
+	GammaCompositePSO uintptr
 	ComputeRootSig uintptr
 	ComputeUAVBuf  uintptr
 	ComputeUAVGPU  uint64
@@ -748,7 +749,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 							// Si ce draw est un composite plein écran (3 sommets) vers le backbuffer hôte OU un autre RT offscreen
 							// (ex: vidéo 4K YUV 0xB58000000 -> 0x105B7A0000 -> backbuffer), copier directement srcRT -> dstRes
 							// par CopyResource (évite la matrice de projection manquante du 2e CBV dans les VS 45/45 ins).
-							if !d.Indexed && d.VertexCount == 3 {
+							if !d.Indexed && d.VertexCount == 3 && (h.GammaCompositePSO == 0 || d.HostPSO != h.GammaCompositePSO) {
 								var dstRes uintptr
 								var dstRT *hostRTEntry
 								if curTargetVA == 0 {
@@ -810,6 +811,27 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						if h.SRVGPUStart != 0 {
 							_ = comCall(h.CmdList, 32, paramIdx, h.SRVGPUStart)
 						}
+					}
+					if h.GammaCompositePSO != 0 && d.HostPSO == h.GammaCompositePSO && !d.Indexed && d.VertexCount == 3 {
+						if curTargetVA == 0 && yuvRenderedThisFrame {
+							continue
+						}
+						if h.UploadCBPtr != 0 && (len(d.PSCBData) > 0 || len(d.CBData) > 0) {
+							cbAll := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 16<<20)
+							psSlot := uint64((idxPass*2+1)%1024) * 16384
+							dstPS := cbAll[psSlot : psSlot+16384]
+							clear(dstPS)
+							if len(d.PSCBData) > 0 {
+								copy(dstPS, d.PSCBData)
+							} else {
+								copy(dstPS, d.CBData)
+							}
+							_ = comCall(h.CmdList, 38, 2, uintptr(h.UploadCBGPU+psSlot)) // b1 (PS)
+						}
+						_ = comCall(h.CmdList, 20, 4)                   // TRIANGLELIST
+						_ = comCall(h.CmdList, 25, h.GammaCompositePSO) // SetPipelineState(GammaCompositePSO)
+						_ = comCall(h.CmdList, 12, 3, 1, 0, 0)          // DrawInstanced(3, 1, 0, 0)
+						continue
 					}
 					// Passe vidéo Bink2 4K YUV420p (Y=t0 3840x2160, U=t1 1920x1080, V=t2 1920x1080 en R8_UNORM) :
 					// utiliser notre PSO BT.709 matériel dédié pour garantir un décodage couleur complet sans
