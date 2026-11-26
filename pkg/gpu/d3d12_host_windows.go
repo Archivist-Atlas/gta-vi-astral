@@ -138,6 +138,7 @@ type HostD3D12 struct {
 	ReadbackPitch   uint32
 	introFrameCount uint32
 	introReached    bool
+	introLogged     bool
 	splashBuf       []byte
 	splashFrame     uint64
 	splashPct       float32
@@ -619,14 +620,14 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					if d.HostPSO != 0 {
 						hasRealPSO = true
 					}
-					if isBackbuffer(d.TargetVA) {
+					if d.TargetVA != 0 && isBackbuffer(d.TargetVA) {
 						hasPresentTarget = true
 					}
 				}
 				// Si l'UI est déjà active et qu'aucun draw de cette trame ne cible le backbuffer,
 				// ne pas effacer ni présenter un backbuffer noir : mettre à jour uniquement les RT offscreen.
 				skipHostPresent = h.introReached && len(h.PresentVAs) > 0 && !hasPresentTarget
-				if len(draws) > 0 && draws[0].FrameNumber%120 == 0 {
+				if len(draws) > 0 && (draws[0].FrameNumber%120 == 0 || (h.introReached && !h.introLogged)) {
 					slog.Info("HostD3D12 PresentClear",
 						"frame", draws[0].FrameNumber,
 						"draws", len(draws),
@@ -635,6 +636,25 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						"hasPresentTarget", hasPresentTarget,
 						"skipHostPresent", skipHostPresent,
 					)
+					if h.introReached && !h.introLogged {
+						h.introLogged = true
+						for i, d := range draws {
+							if i >= 24 {
+								break
+							}
+							slog.Info("HostD3D12 IntroDraw",
+								"i", i,
+								"pso", fmt.Sprintf("0x%X", d.HostPSO),
+								"tgt", fmt.Sprintf("0x%X", d.TargetVA),
+								"srv", fmt.Sprintf("0x%X", d.SRVGuestVA),
+								"cnt", d.VertexCount,
+								"vb", len(d.VBData),
+								"cb", len(d.CBData),
+								"pscb", len(d.PSCBData),
+								"hasTex", d.SRVTex != nil,
+							)
+						}
+					}
 				}
 				// N'active les RenderTargets offscreen que si des backbuffers swapchain sont connus
 				useOffscreenRT := len(h.PresentVAs) > 0 && (hasPresentTarget || skipHostPresent)
