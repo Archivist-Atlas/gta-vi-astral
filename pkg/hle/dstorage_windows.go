@@ -597,12 +597,12 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			return
 		}
 		qs.mu.Lock()
-		if len(qs.unsubmitted) > 0 {
-			qs.submitted = append(qs.submitted, qs.unsubmitted)
-			qs.unsubmitted = nil
-			qs.cond.Signal()
-		}
+		batch := qs.unsubmitted
+		qs.unsubmitted = nil
 		qs.mu.Unlock()
+		if len(batch) > 0 {
+			runBatch(batch)
+		}
 	}
 	enqueueCmd := func(q uintptr, cmd dsPendingCmd) {
 		qs := getQueue(q)
@@ -610,20 +610,8 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			return
 		}
 		qs.mu.Lock()
-		if qs.closed {
-			qs.mu.Unlock()
-			return
-		}
-		qs.unsubmitted = append(qs.unsubmitted, cmd)
-		// Auto-submit Xbox Series dès que la moitié de la capacité de la file est atteinte
-		autoThresh := qs.capacity / 2
-		if autoThresh < 1 {
-			autoThresh = 1
-		}
-		if len(qs.unsubmitted) >= autoThresh {
-			qs.submitted = append(qs.submitted, qs.unsubmitted)
-			qs.unsubmitted = nil
-			qs.cond.Signal()
+		if !qs.closed {
+			qs.unsubmitted = append(qs.unsubmitted, cmd)
 		}
 		qs.mu.Unlock()
 	}
