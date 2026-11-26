@@ -1065,7 +1065,8 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 			}
 
 			wantSnap := false
-			if h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && h.introReached {
+			dumpSnap := os.Getenv("ASTRAL_DUMP_FRAME") == "1"
+			if dumpSnap && h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && h.introReached {
 				h.introFrameCount++
 				if h.introFrameCount == 1 || h.introFrameCount == 90 {
 					wantSnap = true
@@ -1114,7 +1115,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 			slog.Error("Host D3D12 SwapChain::Present échoué", "hr", fmt.Sprintf("0x%08X", uint32(hrPres)), "removedReason", fmt.Sprintf("0x%08X", h.DeviceRemovedReason()))
 		}
 		h.waitGPU()
-		if h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && (h.introFrameCount == 1 || h.introFrameCount == 90) && h.introReached {
+		if os.Getenv("ASTRAL_DUMP_FRAME") == "1" && h.ReadbackBuf != 0 && h.ReadbackPtr != 0 && (h.introFrameCount == 1 || h.introFrameCount == 90) && h.introReached {
 			h.saveReadbackPNG(fmt.Sprintf("%s\\astral_intro_%d.png", os.TempDir(), h.introFrameCount))
 		}
 		return

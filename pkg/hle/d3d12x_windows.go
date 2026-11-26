@@ -246,6 +246,7 @@ func newD3D12XDevice() uintptr {
 	dumpFrame := os.Getenv("ASTRAL_DUMP_FRAME") == "1"
 	var introDumped atomic.Bool
 	var nextScreenDumped atomic.Bool
+	var scene3DDumped atomic.Bool
 	var listSlotHits [160]atomic.Uint64
 
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
@@ -550,6 +551,33 @@ func newD3D12XDevice() uintptr {
 			}
 			_ = os.WriteFile(os.TempDir()+"\\astral_intro_frame.txt", []byte(sb), 0o644)
 			slog.Info("ASTRAL_DUMP_FRAME capturée", "frame", n, "draws", len(draws), "dispatches", len(dispatches))
+		}
+		// Capture diagnostique automatique d'une trame 3D (>= 80 draws) pour analyser le pipeline RAGE 9
+		// (ExecuteIndirect, DispatchMesh, MRT, Depth, PSOs, slots CommandListX actifs).
+		if len(draws) >= 80 && scene3DDumped.CompareAndSwap(false, true) {
+			var slotsSummary string
+			for s := 8; s < 160; s++ {
+				if c := listSlotHits[s].Load(); c > 0 {
+					slotsSummary += fmt.Sprintf(" #%d(0x%X)=%d", s, s*8, c)
+				}
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "=== 3D SCENE FRAME %d: %d draws, %d dispatches, presentVA=0x%X ===\n", n, len(draws), len(dispatches), presentVA)
+			fmt.Fprintf(&sb, "SLOTS:%s\n", slotsSummary)
+			for i, d := range draws {
+				if i >= 64 {
+					break
+				}
+				var texStr string
+				if d.SRVTex != nil {
+					texStr = fmt.Sprintf("tex=%dx%d/fmt%d", d.SRVTex.Width, d.SRVTex.Height, d.SRVTex.Format)
+				}
+				fmt.Fprintf(&sb, "  draw[%02d]: clr=%v idx=%v topo=%d cnt=%d inst=%d pso=0x%X stride=%d vb=%d ib=%d cb=%d tgt=0x%X srv=0x%X %s\n",
+					i, d.IsClear, d.Indexed, d.Topology, d.VertexCount, d.InstanceCount, d.HostPSO, d.VBStride, len(d.VBData), len(d.IBData), len(d.CBData), d.TargetVA, d.SRVGuestVA, texStr)
+			}
+			dumpPath := os.TempDir() + "\\astral_3d_frame.txt"
+			_ = os.WriteFile(dumpPath, []byte(sb.String()), 0o644)
+			slog.Info("ASTRAL_3D_FRAME capturée", "frame", n, "draws", len(draws), "path", dumpPath, "slots", slotsSummary)
 		}
 		gpu.PresentHostFrame(0, clr, presentVA, nil, 0, 0, 0, dispatches, draws...)
 		return hresultOK
