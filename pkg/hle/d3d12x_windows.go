@@ -125,6 +125,7 @@ type d3d12xState struct {
 	activeSRVTex    *gpu.HostTextureUpload
 	frameDispatches []gpu.HostDispatchPass
 	frameDraws      []gpu.HostDrawPass
+	listDraws       map[uintptr][]gpu.HostDrawPass
 	lastClearColor  [4]float32
 	hasClearColor   bool
 	queuesCreated   atomic.Int64
@@ -148,6 +149,7 @@ func newD3D12XDevice() uintptr {
 		rtvResources:   make(map[uintptr]uintptr),
 		psos:           make(map[uintptr]*guestPSO),
 		dxbcBlobs:      make(map[[16]byte][]byte),
+		listDraws:      make(map[uintptr][]gpu.HostDrawPass),
 		lastClearColor: [4]float32{0.04, 0.05, 0.09, 1.0},
 	}
 	st.nextHeapBase.Store(0x0000100000000000)
@@ -320,7 +322,25 @@ func newD3D12XDevice() uintptr {
 	})
 	var presents atomic.Uint64
 	cbQueueExecuteLists := syscall.NewCallback(func(this, numLists, listsPtr uintptr) uintptr {
-		st.execListsCount.Add(uint64(uint32(numLists)))
+		n := uint32(numLists)
+		st.execListsCount.Add(uint64(n))
+		if n > 0 && n <= 64 && listsPtr >= 0x10000 && listsPtr < 0x800000000000 {
+			lists := unsafe.Slice((*uintptr)(osPtr(listsPtr)), n)
+			st.mu.Lock()
+			for _, cl := range lists {
+				if draws, ok := st.listDraws[cl]; ok && len(draws) > 0 {
+					rem := 512 - len(st.frameDraws)
+					if rem > 0 {
+						if len(draws) > rem {
+							draws = draws[:rem]
+						}
+						st.frameDraws = append(st.frameDraws, draws...)
+					}
+					delete(st.listDraws, cl)
+				}
+			}
+			st.mu.Unlock()
+		}
 		return hresultOK
 	})
 	cbQueuePresentX := syscall.NewCallback(func(this, numPlanes, planes, params uintptr) uintptr {
@@ -590,9 +610,9 @@ func newD3D12XDevice() uintptr {
 			return hresultOK
 		})
 	}
-	recordDrawPass := func(indexed bool, count, instCount, startLoc uint32, baseVtx int32, startInst uint32) {
+	recordDrawPass := func(cmdList uintptr, indexed bool, count, instCount, startLoc uint32, baseVtx int32, startInst uint32) {
 		st.mu.Lock()
-		if len(st.frameDraws) < 512 {
+		if len(st.listDraws[cmdList]) < 512 {
 			pass := gpu.HostDrawPass{
 				Indexed:       indexed,
 				Topology:      st.activeTopology,
@@ -696,14 +716,21 @@ func newD3D12XDevice() uintptr {
 			} else if st.activeSRVTex != nil {
 				pass.SRVTex = cloneSRV(st.activeSRVTex)
 			}
-			st.frameDraws = append(st.frameDraws, pass)
+			st.listDraws[cmdList] = append(st.listDraws[cmdList], pass)
 		}
 		st.mu.Unlock()
 	}
+	cbListReset := syscall.NewCallback(func(this, alloc, pso uintptr) uintptr {
+		listSlotHits[10].Add(1)
+		st.mu.Lock()
+		delete(st.listDraws, this)
+		st.mu.Unlock()
+		return hresultOK
+	})
 	cbListDrawInst := syscall.NewCallback(func(this, vtxCount, instCount, startVtx, startInst uintptr) uintptr {
 		listSlotHits[12].Add(1)
 		n := st.drawCalls.Add(1)
-		recordDrawPass(false, uint32(vtxCount), uint32(instCount), uint32(startVtx), 0, uint32(startInst))
+		recordDrawPass(this, false, uint32(vtxCount), uint32(instCount), uint32(startVtx), 0, uint32(startInst))
 		if gpuTrace && n <= 12 {
 			slog.Info("GPU_TRACE DrawInstanced", "n", n, "vtx", uint32(vtxCount), "inst", uint32(instCount), "startVtx", uint32(startVtx), "startInst", uint32(startInst))
 		}
@@ -712,7 +739,7 @@ func newD3D12XDevice() uintptr {
 	cbListDrawIdx := syscall.NewCallback(func(this, idxCount, instCount, startIdx, baseVtx, startInst uintptr) uintptr {
 		listSlotHits[13].Add(1)
 		n := st.drawCalls.Add(1)
-		recordDrawPass(true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
+		recordDrawPass(this, true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
 		if gpuTrace && n <= 12 {
 			slog.Info("GPU_TRACE DrawIndexedInstanced", "n", n, "idx", uint32(idxCount), "inst", uint32(instCount), "startIdx", uint32(startIdx), "baseVtx", int32(baseVtx))
 		}
@@ -721,7 +748,7 @@ func newD3D12XDevice() uintptr {
 	cbListDrawIdxX := syscall.NewCallback(func(this, idxCount, instCount, startIdx, baseVtx, startInst uintptr) uintptr {
 		listSlotHits[81].Add(1)
 		n := st.drawCalls.Add(1)
-		recordDrawPass(true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
+		recordDrawPass(this, true, uint32(idxCount), uint32(instCount), uint32(startIdx), int32(baseVtx), uint32(startInst))
 		if gpuTrace && n <= 12 {
 			slog.Info("GPU_TRACE DrawIndexedX", "n", n, "idx", uint32(idxCount), "inst", uint32(instCount), "startIdx", uint32(startIdx))
 		}
@@ -1159,6 +1186,7 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
+	cmdListSlots[10] = cbListReset               // Reset
 	cmdListSlots[12] = cbListDrawInst            // DrawInstanced
 	cmdListSlots[13] = cbListDrawIdx             // DrawIndexedInstanced
 	cmdListSlots[14] = cbListDispatch            // Dispatch

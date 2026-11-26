@@ -463,6 +463,10 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 	defer h.mu.Unlock()
 
 	if h.Ready {
+		// Après l'apparition de l'UI (introReached), ne jamais écraser l'écran par un Present vide tout noir
+		if h.introReached && len(draws) == 0 && len(srcRGBA) == 0 {
+			return
+		}
 		idx := comCall(h.SwapChain3, 36) & 1 // GetCurrentBackBufferIndex
 		bb := h.BackBuffers[idx]
 		rtv := h.RTVStart + idx*h.RTVStride
