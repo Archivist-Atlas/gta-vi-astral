@@ -5,8 +5,15 @@ package gpu
 import (
 	"fmt"
 	"log/slog"
+	"runtime"
+	"sync"
 	"syscall"
 	"unsafe"
+)
+
+var (
+	d3dCompileMu sync.Mutex
+	psoCreateMu  sync.Mutex
 )
 
 var (
@@ -283,6 +290,9 @@ func CompileHLSL(source, entryPoint, target string) ([]byte, error) {
 		flags1 = (1 << 2) | (1 << 14) // D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_OPTIMIZATION_LEVEL0
 	}
 	var codeBlob, errBlob uintptr
+	// d3dcompiler_47.dll (FXC) n'est pas thread-safe sous forte concurrence sur de gros shaders (5000+ ins) :
+	// sérialisation stricte + KeepAlive pour éviter les déréférencements NULL internes (0xC0000005).
+	d3dCompileMu.Lock()
 	hr, _, _ := procD3DCompile.Call(
 		uintptr(unsafe.Pointer(&srcBytes[0])),
 		uintptr(len(srcBytes)),
@@ -293,6 +303,10 @@ func CompileHLSL(source, entryPoint, target string) ([]byte, error) {
 		uintptr(unsafe.Pointer(&codeBlob)),
 		uintptr(unsafe.Pointer(&errBlob)),
 	)
+	d3dCompileMu.Unlock()
+	runtime.KeepAlive(srcBytes)
+	runtime.KeepAlive(entryBytes)
+	runtime.KeepAlive(targetBytes)
 	if errBlob != 0 {
 		defer comCall(errBlob, 2) // Release
 	}
@@ -456,8 +470,14 @@ func (h *HostD3D12) createGraphicsPSOFromDXBC(vsBC, psBC []byte, inputElems []Ho
 
 	var pso uintptr
 	// ID3D12Device::CreateGraphicsPipelineState = slot 10
+	psoCreateMu.Lock()
 	hr := comCall(h.Device, 10, uintptr(unsafe.Pointer(&psoDesc)), uintptr(unsafe.Pointer(&guidID3D12PipelineState[0])), uintptr(unsafe.Pointer(&pso)))
-	_ = nameBufs
+	psoCreateMu.Unlock()
+	runtime.KeepAlive(vsBC)
+	runtime.KeepAlive(psBC)
+	runtime.KeepAlive(rawDescs)
+	runtime.KeepAlive(nameBufs)
+	runtime.KeepAlive(&psoDesc)
 	if int32(hr) < 0 || pso == 0 {
 		h.dumpDebugMessages()
 		return 0, fmt.Errorf("CreateGraphicsPipelineState échoué (0x%08X, removedReason=0x%08X, inElems=%d)", uint32(hr), h.DeviceRemovedReason(), len(inputElems))
@@ -615,8 +635,8 @@ func (h *HostD3D12) initReplayPipeline() {
 	}
 	h.ReplayRootSig = rootSig
 
-	// Heap SRV shader-visible (256 descripteurs : slot 0 = null-descriptor par défaut, slots 1..255 = textures 2D hôtes)
-	srvHeapDesc := d3d12DescriptorHeapDesc{Type: 0 /* CBV_SRV_UAV */, NumDescriptors: 256, Flags: 1 /* SHADER_VISIBLE */}
+	// Heap SRV shader-visible (2048 descripteurs : slot 0 = null-descriptor par défaut, slots 1..2047 = textures 2D & RT hôtes)
+	srvHeapDesc := d3d12DescriptorHeapDesc{Type: 0 /* CBV_SRV_UAV */, NumDescriptors: 2048, Flags: 1 /* SHADER_VISIBLE */}
 	if int32(comCall(h.Device, 14, uintptr(unsafe.Pointer(&srvHeapDesc)), uintptr(unsafe.Pointer(&guidID3D12DescriptorHeap[0])), uintptr(unsafe.Pointer(&h.SRVHeap)))) >= 0 && h.SRVHeap != 0 {
 		var cpuStart, gpuStart uintptr
 		retCPU := comCall(h.SRVHeap, 9, uintptr(unsafe.Pointer(&cpuStart)))  // GetCPUDescriptorHandleForHeapStart
@@ -840,7 +860,7 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 		}
 		return e.srvGPU
 	}
-	if h.NextSRVSlot >= 256 {
+	if h.NextSRVSlot >= 2048 {
 		return h.SRVGPUStart
 	}
 	bw := (tx.Width + block - 1) / block
@@ -922,7 +942,7 @@ func (h *HostD3D12) ensureHostRT(guestVA uint64) *hostRTEntry {
 	if e, ok := h.RTCache[guestVA]; ok {
 		return e
 	}
-	if h.NextRTVSlot >= 64 || h.NextSRVSlot >= 256 {
+	if h.NextRTVSlot >= 256 || h.NextSRVSlot >= 2048 {
 		return nil
 	}
 	heapProps := d3d12HeapProperties{Type: 1 /* DEFAULT */, CreationNodeMask: 1, VisibleNodeMask: 1}

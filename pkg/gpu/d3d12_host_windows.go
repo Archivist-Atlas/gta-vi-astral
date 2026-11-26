@@ -339,8 +339,8 @@ func (h *HostD3D12) initPresentPipeline() {
 	if h.Device == 0 || h.SwapChain3 == 0 {
 		return
 	}
-	// 1. Heap RTV (64 descripteurs : 0..1 = double-buffering SwapChain, 2..63 = RenderTargets offscreen)
-	rtvDesc := d3d12DescriptorHeapDesc{Type: 2 /* RTV */, NumDescriptors: 64}
+	// 1. Heap RTV (256 descripteurs : 0..1 = double-buffering SwapChain, 2..255 = RenderTargets offscreen)
+	rtvDesc := d3d12DescriptorHeapDesc{Type: 2 /* RTV */, NumDescriptors: 256}
 	if int32(comCall(h.Device, 14, uintptr(unsafe.Pointer(&rtvDesc)), uintptr(unsafe.Pointer(&guidID3D12DescriptorHeap[0])), uintptr(unsafe.Pointer(&h.RTVHeap)))) < 0 || h.RTVHeap == 0 {
 		return
 	}
