@@ -140,7 +140,7 @@ type HostD3D12 struct {
 	introFrameCount uint32
 	introReached    bool
 	introLogged     bool
-	yuvLogged       bool
+	yuvFrameCount   uint32
 	splashBuf       []byte
 	splashFrame     uint64
 	splashPct       float32
@@ -809,17 +809,38 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					if h.YUVPSO != 0 && d.SRVTex != nil && d.ExtraSRVs[0] != nil && d.ExtraSRVs[1] != nil &&
 						d.SRVTex.Format == 61 && d.SRVTex.Width >= 1920 &&
 						d.ExtraSRVs[0].Width == d.SRVTex.Width/2 && d.ExtraSRVs[1].Width == d.SRVTex.Width/2 {
-						if !h.yuvLogged {
-							h.yuvLogged = true
+						h.yuvFrameCount++
+						if h.yuvFrameCount == 1 || h.yuvFrameCount == 60 {
+							var yMin, yMax byte = 255, 0
+							var yNonZero int
+							for k := 0; k < len(d.SRVTex.Pixels); k += 64 {
+								v := d.SRVTex.Pixels[k]
+								if v < yMin {
+									yMin = v
+								}
+								if v > yMax {
+									yMax = v
+								}
+								if v != 0 {
+									yNonZero++
+								}
+							}
 							slog.Info("HostD3D12 Bink2 4K YUV vidéo actif (PSO BT.709)",
+								"yuvFrame", h.yuvFrameCount,
 								"y", fmt.Sprintf("%dx%d", d.SRVTex.Width, d.SRVTex.Height),
-								"u", fmt.Sprintf("%dx%d", d.ExtraSRVs[0].Width, d.ExtraSRVs[0].Height),
-								"v", fmt.Sprintf("%dx%d", d.ExtraSRVs[1].Width, d.ExtraSRVs[1].Height),
+								"yMin", yMin, "yMax", yMax, "yNonZeroSample", yNonZero,
 								"tgt", fmt.Sprintf("0x%X", curTargetVA))
 						}
 						_ = comCall(h.CmdList, 20, 4)        // TRIANGLELIST
 						_ = comCall(h.CmdList, 25, h.YUVPSO) // SetPipelineState(YUVPSO)
 						_ = comCall(h.CmdList, 12, 3, 1, 0, 0)
+						// Affiche aussi directement la vidéo 4K sur le backbuffer hôte (rtv) pour éviter
+						// toute perte sur les passes de post-traitement / composite intermédiaires.
+						if curTargetVA != 0 {
+							_ = comCall(h.CmdList, 46, 1, uintptr(unsafe.Pointer(&rtv)), 0, 0)
+							_ = comCall(h.CmdList, 12, 3, 1, 0, 0)
+							_ = comCall(h.CmdList, 46, 1, uintptr(unsafe.Pointer(&curRTV)), 0, 0)
+						}
 						continue
 					}
 					topo := d.Topology
