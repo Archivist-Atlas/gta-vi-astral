@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -97,9 +98,15 @@ type winMsg struct {
 }
 
 var (
-	winOnce sync.Once
-	winHWND uintptr
+	winOnce       sync.Once
+	winHWND       uintptr
+	winHWNDAtomic atomic.Uintptr
 )
+
+// MainWindowHWND retourne le HWND de la fenêtre principale ASTRAL si elle est déjà créée.
+func MainWindowHWND() uintptr {
+	return winHWNDAtomic.Load()
+}
 
 // EnsureWindow crée (une seule fois) la fenêtre Win32 native d'affichage pour le backend GPU
 // sur un thread OS dédié qui pompe les messages Windows.
@@ -192,6 +199,7 @@ func EnsureWindow(title string, width, height int) uintptr {
 				0, 0, hInst, 0,
 			)
 			if hwnd != 0 {
+				winHWNDAtomic.Store(hwnd)
 				const wmSetIcon = 0x0080
 				if hIconBig != 0 {
 					_, _, _ = procSendMessage.Call(hwnd, wmSetIcon, 1 /* ICON_BIG */, hIconBig)

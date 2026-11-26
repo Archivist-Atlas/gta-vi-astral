@@ -3,38 +3,66 @@
 package gpu
 
 import (
-	"fmt"
+	"bytes"
+	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/Archivist-Atlas/gta-vi-astral/assets"
+	mp3 "github.com/hajimehoshi/go-mp3"
 )
 
 var (
-	modWinMM          = syscall.NewLazyDLL("winmm.dll")
-	procMCISendString = modWinMM.NewProc("mciSendStringW")
+	modWinMM                = syscall.NewLazyDLL("winmm.dll")
+	procWaveOutOpen         = modWinMM.NewProc("waveOutOpen")
+	procWaveOutPrepareHdr   = modWinMM.NewProc("waveOutPrepareHeader")
+	procWaveOutUnprepareHdr = modWinMM.NewProc("waveOutUnprepareHeader")
+	procWaveOutWrite        = modWinMM.NewProc("waveOutWrite")
+	procWaveOutPause        = modWinMM.NewProc("waveOutPause")
+	procWaveOutRestart      = modWinMM.NewProc("waveOutRestart")
+	procWaveOutReset        = modWinMM.NewProc("waveOutReset")
+	procWaveOutClose        = modWinMM.NewProc("waveOutClose")
 )
 
+type waveFormatEx struct {
+	FormatTag      uint16
+	Channels       uint16
+	SamplesPerSec  uint32
+	AvgBytesPerSec uint32
+	BlockAlign     uint16
+	BitsPerSample  uint16
+	Size           uint16
+}
+
+type waveHdr struct {
+	Data          uintptr
+	BufferLength  uint32
+	BytesRecorded uint32
+	User          uintptr
+	Flags         uint32
+	Loops         uint32
+	Next          uintptr
+	Reserved      uintptr
+}
+
 const (
-	audioCmdPlay  = 1
-	audioCmdPause = 2
-	audioCmdStop  = 3
+	whdrDone     = 0x00000001
+	whdrPrepared = 0x00000002
+	waveMapper   = 0xFFFFFFFF
 )
 
 var (
 	loadingAudioOnce     sync.Once
-	loadingAudioCh       chan int
 	loadingAudioEnabled  atomic.Bool
 	loadingAudioStopped  atomic.Bool
 	introReachedAtomic   atomic.Bool
 	loadingAudioMu       sync.Mutex
 	loadingAudioOnToggle func(bool)
+	loadingWaveOut       atomic.Uintptr
 )
 
 func init() {
@@ -57,94 +85,136 @@ func markIntroReached() {
 	}
 }
 
-func mciExec(cmd string) uintptr {
-	ptr, err := syscall.UTF16PtrFromString(cmd)
-	if err != nil {
-		return 1
-	}
-	r, _, _ := procMCISendString.Call(uintptr(unsafe.Pointer(ptr)), 0, 0, 0)
-	return r
-}
-
-func ensureLoadingMP3File() (string, error) {
-	if len(assets.LoadingMP3) == 0 {
-		return "", fmt.Errorf("piste loading.mp3 vide")
-	}
-	dst := filepath.Join(os.TempDir(), "astral_loading.mp3")
-	if st, err := os.Stat(dst); err == nil && st.Size() == int64(len(assets.LoadingMP3)) {
-		return dst, nil
-	}
-	if err := os.WriteFile(dst, assets.LoadingMP3, 0o644); err != nil {
-		return "", err
-	}
-	return dst, nil
-}
-
-func ensureAudioWorker() {
+func startWaveOutLoop() {
 	loadingAudioOnce.Do(func() {
-		loadingAudioCh = make(chan int, 16)
 		go func() {
-			// MCI exige que toutes les commandes pour un même alias proviennent du même thread OS.
-			runtime.LockOSThread()
-			defer runtime.UnlockOSThread()
+			if len(assets.LoadingMP3) == 0 {
+				return
+			}
+			dec, err := mp3.NewDecoder(bytes.NewReader(assets.LoadingMP3))
+			if err != nil {
+				slog.Warn("décodage loading.mp3 échoué", "err", err)
+				return
+			}
+			sampleRate := uint32(dec.SampleRate())
+			if sampleRate == 0 {
+				sampleRate = 44100
+			}
+			wfx := waveFormatEx{
+				FormatTag:      1, // WAVE_FORMAT_PCM
+				Channels:       2, // go-mp3 produit toujours du PCM 16-bit stéréo
+				SamplesPerSec:  sampleRate,
+				BlockAlign:     4,
+				BitsPerSample:  16,
+				AvgBytesPerSec: sampleRate * 4,
+			}
 
-			opened := false
-			playing := false
-			mp3Path := ""
+			var hwo uintptr
+			r, _, _ := procWaveOutOpen.Call(
+				uintptr(unsafe.Pointer(&hwo)),
+				waveMapper,
+				uintptr(unsafe.Pointer(&wfx)),
+				0, 0, 0,
+			)
+			if r != 0 || hwo == 0 {
+				slog.Warn("waveOutOpen loading.mp3 échoué", "code", r)
+				return
+			}
+			loadingWaveOut.Store(hwo)
+			defer func() {
+				loadingWaveOut.Store(0)
+				_, _, _ = procWaveOutReset.Call(hwo)
+				_, _, _ = procWaveOutClose.Call(hwo)
+			}()
 
-			for cmd := range loadingAudioCh {
-				switch cmd {
-				case audioCmdPlay:
-					if loadingAudioStopped.Load() || introReachedAtomic.Load() {
-						continue
+			paused := false
+			if !loadingAudioEnabled.Load() {
+				_, _, _ = procWaveOutPause.Call(hwo)
+				paused = true
+			}
+
+			const numBufs = 4
+			const bufSize = 32768 // ~185 ms à 44.1 kHz stéréo 16-bit
+			bufs := make([][]byte, numBufs)
+			hdrs := make([]waveHdr, numBufs)
+			inFlight := make([]bool, numBufs)
+			for i := 0; i < numBufs; i++ {
+				bufs[i] = make([]byte, bufSize)
+			}
+
+			readPCM := func(dst []byte) int {
+				total := 0
+				for total < len(dst) {
+					n, rerr := dec.Read(dst[total:])
+					total += n
+					if rerr == io.EOF {
+						if _, serr := dec.Seek(0, io.SeekStart); serr != nil {
+							break
+						}
+						if n == 0 && total == 0 {
+							break
+						}
+					} else if rerr != nil {
+						break
 					}
-					if !opened {
-						p, err := ensureLoadingMP3File()
-						if err != nil {
-							slog.Warn("impossible d'extraire loading.mp3", "err", err)
+				}
+				return total
+			}
+
+			defer func() {
+				_, _, _ = procWaveOutReset.Call(hwo)
+				for i := 0; i < numBufs; i++ {
+					if hdrs[i].Flags&whdrPrepared != 0 {
+						_, _, _ = procWaveOutUnprepareHdr.Call(hwo, uintptr(unsafe.Pointer(&hdrs[i])), unsafe.Sizeof(hdrs[i]))
+					}
+				}
+			}()
+
+			for !loadingAudioStopped.Load() && !introReachedAtomic.Load() {
+				wantPlay := loadingAudioEnabled.Load()
+				if !wantPlay && !paused {
+					_, _, _ = procWaveOutPause.Call(hwo)
+					paused = true
+				} else if wantPlay && paused {
+					_, _, _ = procWaveOutRestart.Call(hwo)
+					paused = false
+				}
+
+				if paused {
+					time.Sleep(30 * time.Millisecond)
+					continue
+				}
+
+				submitted := false
+				for i := 0; i < numBufs; i++ {
+					if inFlight[i] {
+						if hdrs[i].Flags&whdrDone == 0 {
 							continue
 						}
-						mp3Path = p
-						_ = mciExec("close astral_bgm")
-						if r := mciExec(fmt.Sprintf(`open "%s" type mpegvideo alias astral_bgm`, mp3Path)); r != 0 {
-							slog.Warn("MCI open loading.mp3 échoué", "code", r)
-							continue
+						_, _, _ = procWaveOutUnprepareHdr.Call(hwo, uintptr(unsafe.Pointer(&hdrs[i])), unsafe.Sizeof(hdrs[i]))
+						inFlight[i] = false
+					}
+					n := readPCM(bufs[i])
+					if n <= 0 {
+						break
+					}
+					hdrs[i] = waveHdr{
+						Data:         uintptr(unsafe.Pointer(&bufs[i][0])),
+						BufferLength: uint32(n),
+					}
+					if pr, _, _ := procWaveOutPrepareHdr.Call(hwo, uintptr(unsafe.Pointer(&hdrs[i])), unsafe.Sizeof(hdrs[i])); pr == 0 {
+						if wr, _, _ := procWaveOutWrite.Call(hwo, uintptr(unsafe.Pointer(&hdrs[i])), unsafe.Sizeof(hdrs[i])); wr == 0 {
+							inFlight[i] = true
+							submitted = true
 						}
-						opened = true
 					}
-					if !playing {
-						if r := mciExec("play astral_bgm repeat"); r != 0 {
-							_ = mciExec("play astral_bgm")
-						}
-						playing = true
-					}
-				case audioCmdPause:
-					if opened && playing {
-						_ = mciExec("pause astral_bgm")
-						playing = false
-					}
-				case audioCmdStop:
-					if opened {
-						_ = mciExec("stop astral_bgm")
-						_ = mciExec("close astral_bgm")
-						opened = false
-						playing = false
-					}
-					return
+				}
+				if !submitted {
+					time.Sleep(25 * time.Millisecond)
 				}
 			}
 		}()
 	})
-}
-
-func sendAudioCmd(cmd int) {
-	if loadingAudioCh == nil {
-		return
-	}
-	select {
-	case loadingAudioCh <- cmd:
-	default:
-	}
 }
 
 // StartLoadingAudio initialise et lance (si enabled=true) la musique de chargement en boucle.
@@ -158,10 +228,7 @@ func StartLoadingAudio(enabled bool, onToggle func(bool)) {
 	if loadingAudioStopped.Load() || introReachedAtomic.Load() {
 		return
 	}
-	ensureAudioWorker()
-	if enabled {
-		sendAudioCmd(audioCmdPlay)
-	}
+	startWaveOutLoop()
 }
 
 // ToggleLoadingAudio active ou coupe le son de chargement, mémorise le choix et rafraîchit le splash.
@@ -169,13 +236,15 @@ func ToggleLoadingAudio() bool {
 	if introReachedAtomic.Load() {
 		return loadingAudioEnabled.Load()
 	}
-	ensureAudioWorker()
 	next := !loadingAudioEnabled.Load()
 	loadingAudioEnabled.Store(next)
-	if next {
-		sendAudioCmd(audioCmdPlay)
-	} else {
-		sendAudioCmd(audioCmdPause)
+	startWaveOutLoop()
+	if hwo := loadingWaveOut.Load(); hwo != 0 {
+		if next {
+			_, _, _ = procWaveOutRestart.Call(hwo)
+		} else {
+			_, _, _ = procWaveOutPause.Call(hwo)
+		}
 	}
 
 	loadingAudioMu.Lock()
@@ -196,6 +265,8 @@ func ToggleLoadingAudio() bool {
 // StopLoadingAudio arrête définitivement et libère la musique de chargement.
 func StopLoadingAudio() {
 	if loadingAudioStopped.CompareAndSwap(false, true) {
-		sendAudioCmd(audioCmdStop)
+		if hwo := loadingWaveOut.Load(); hwo != 0 {
+			_, _, _ = procWaveOutReset.Call(hwo)
+		}
 	}
 }

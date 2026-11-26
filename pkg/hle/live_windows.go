@@ -1732,13 +1732,19 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			slog.Info("Fenêtre Win32 unique du titre configurée (1280x720, focus natif)", "hwnd", fmt.Sprintf("0x%X", hwnd))
 		}
 	}
+	const wsVisible = 0x10000000
 	cbTitleCreateWinW := syscall.NewCallback(func(exStyle, cls, title, style, x, y, w, h, parent, menu, inst, param uintptr) uintptr {
 		if parent == 0 && (int32(w) > winTargetW || int32(h) > winTargetH) {
 			cx, cy := centerWinPos(winTargetW, winTargetH)
 			x, y, w, h = uintptr(cx), uintptr(cy), winTargetW, winTargetH
 		}
+		// Si la fenêtre principale ASTRAL existe déjà, créer la fenêtre invitée en mode caché
+		// pour éviter tout flash d'une seconde fenêtre dans la barre des tâches.
+		if parent == 0 && gpu.MainWindowHWND() != 0 {
+			style &^= wsVisible
+		}
 		r, _, _ := u32CreateWinW.Call(exStyle, cls, title, style, x, y, w, h, parent, menu, inst, param)
-		if parent == 0 {
+		if parent == 0 && gpu.MainWindowHWND() == 0 {
 			brandTitleWindow(r)
 		}
 		return r
@@ -1748,14 +1754,23 @@ func NewLiveTable(profile core.ConsoleProfile, vfs *VirtualFS) *LiveTable {
 			cx, cy := centerWinPos(winTargetW, winTargetH)
 			x, y, w, h = uintptr(cx), uintptr(cy), winTargetW, winTargetH
 		}
+		if parent == 0 && gpu.MainWindowHWND() != 0 {
+			style &^= wsVisible
+		}
 		r, _, _ := u32CreateWinA.Call(exStyle, cls, title, style, x, y, w, h, parent, menu, inst, param)
-		if parent == 0 {
+		if parent == 0 && gpu.MainWindowHWND() == 0 {
 			brandTitleWindow(r)
 		}
 		return r
 	})
 	cbTitleShowWin := syscall.NewCallback(func(hwnd, cmdShow uintptr) uintptr {
-		brandTitleWindow(hwnd)
+		if mainHWND := gpu.MainWindowHWND(); mainHWND != 0 && hwnd != mainHWND {
+			if cmdShow != 0 /* SW_HIDE */ {
+				return 1
+			}
+		} else {
+			brandTitleWindow(hwnd)
+		}
 		r, _, _ := u32ShowWin.Call(hwnd, cmdShow)
 		return r
 	})
