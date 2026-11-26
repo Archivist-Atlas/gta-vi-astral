@@ -1093,10 +1093,10 @@ func newD3D12XDevice() uintptr {
 		}
 		var hPSO uintptr
 		var cerr error
-		isGammaComposite := vsOut.TotalInsts == 45 && psOut.TotalInsts >= 35 && len(psOut.SRVDescriptorSlots) == 1
+		isGammaComposite := vsOut.TotalInsts == 45 && psOut.TotalInsts >= 60 && len(psOut.SRVDescriptorSlots) == 1
 		if isGammaComposite {
 			// Le VS 45/45 lit une 2e matrice CBV absente ; on l'associe à un VS triangle plein écran
-			// tout en exécutant le vrai PS recompilé (39/39 ou 70/70 : courbe gamma / luminosité).
+			// tout en exécutant le vrai PS 70/70 recompilé (courbe gamma / luminosité).
 			fsVS := buildFullscreenCompositeVS(psC)
 			opaqueBlend := &gpu.HostBlendState{
 				BlendEnable: false, SrcBlend: 2, DestBlend: 1, BlendOp: 1,
@@ -1105,7 +1105,7 @@ func newD3D12XDevice() uintptr {
 			hPSO, cerr = gpu.CompileHostPSOWithBlend(fsVS, "VSMain", psOut.Source, psOut.EntryPoint, nil, opaqueBlend)
 			if cerr == nil && hPSO != 0 {
 				gpu.RegisterGammaCompositePSO(hPSO)
-				slog.Info("PSO composite gamma/luminosité plein écran activé", "psIns", psOut.TotalInsts, "guestPSO", fmt.Sprintf("0x%X", psoObj), "hostPSO", fmt.Sprintf("0x%X", hPSO))
+				slog.Info("PSO composite gamma/luminosité plein écran activé (PS réel 70/70)", "guestPSO", fmt.Sprintf("0x%X", psoObj), "hostPSO", fmt.Sprintf("0x%X", hPSO))
 			}
 		} else {
 			hPSO, cerr = gpu.CompileHostPSOWithBlend(vsOut.Source, vsOut.EntryPoint, psOut.Source, psOut.EntryPoint, inElems, gp.blend)
