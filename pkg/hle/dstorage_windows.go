@@ -63,7 +63,7 @@ type dstorageState struct {
 	fileNames     map[uintptr]string
 	statuses      map[uintptr]*dstorageStatus
 	pending       map[uintptr][]dsPendingCmd
-	lastChunk     dsChunkCache
+	lastChunks    map[uintptr][]dsChunkCache
 	readCount     atomic.Uint64
 	bytesRead     atomic.Uint64
 	pageWrites    atomic.Uint64
@@ -80,11 +80,12 @@ type dstorageStatus struct {
 
 func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 	ds := &dstorageState{
-		vfs:       vfs,
-		files:     make(map[uintptr]*os.File),
-		fileNames: make(map[uintptr]string),
-		statuses:  make(map[uintptr]*dstorageStatus),
-		pending:   make(map[uintptr][]dsPendingCmd),
+		vfs:        vfs,
+		files:      make(map[uintptr]*os.File),
+		fileNames:  make(map[uintptr]string),
+		statuses:   make(map[uintptr]*dstorageStatus),
+		pending:    make(map[uintptr][]dsPendingCmd),
+		lastChunks: make(map[uintptr][]dsChunkCache),
 	}
 
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
@@ -184,27 +185,27 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		return obj
 	}
 
-	var zlibPool sync.Pool
-	openZlib := func(r io.Reader) (io.ReadCloser, error) {
-		if v := zlibPool.Get(); v != nil {
-			zr := v.(io.ReadCloser)
-			if err := zr.(zlib.Resetter).Reset(r, nil); err == nil {
-				return zr, nil
+	recordChunk := func(srcPtr uintptr, opts, srcOff uint64, srcSize uint32) {
+		ds.mu.Lock()
+		list := ds.lastChunks[srcPtr]
+		for i := range list {
+			if list[i].srcOff == srcOff && list[i].srcSize == srcSize && list[i].opts == opts {
+				ds.mu.Unlock()
+				return
 			}
-			_ = zr.Close()
 		}
-		return zlib.NewReader(r)
-	}
-	putZlib := func(zr io.ReadCloser) {
-		if zr != nil {
-			zlibPool.Put(zr)
+		if len(list) >= 16 {
+			list = list[1:]
 		}
+		list = append(list, dsChunkCache{srcPtr: srcPtr, opts: opts, srcOff: srcOff, srcSize: srcSize})
+		ds.lastChunks[srcPtr] = list
+		ds.mu.Unlock()
 	}
 
-	execDSReq := func(r dsPendingCmd) {
+	execDSReq := func(r dsPendingCmd) uint32 {
 		opts, dstPtr, pageOff, dstSize, srcPtr, srcOff, srcSize, interSize := r.opts, r.dstPtr, r.pageOff, r.dstSize, r.srcPtr, r.srcOff, r.srcSize, r.intermediateSize
 		if dstPtr == 0 || dstSize == 0 || srcPtr == 0 {
-			return
+			return uint32(hresultOK)
 		}
 		const (
 			optZlib    = uint64(1)
@@ -233,7 +234,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		}
 		if len(raw) == 0 {
 			slog.Warn("IDStorageQueueX!EnqueueRequest raw vide", "opts", fmt.Sprintf("0x%x", opts), "srcSize", srcSize, "dstSize", dstSize)
-			return
+			return 0x80070026 // ERROR_HANDLE_EOF
 		}
 		bcFmt := (opts & optBCPack) >> 1
 		isPageDst := (opts & optPageDst) != 0
@@ -249,23 +250,32 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			}
 			return hex.EncodeToString(b)
 		}
-		// Helper de continuation multi-pages : quand un bloc compressé > 64 KiB est divisé en
-		// requêtes de 64 KiB à srcOff + k*65536 avec le même srcSize, on décompresse le bloc entier
-		// depuis baseOff une seule fois et on sert la tranche [delta : delta+dstSize].
+		// Helper de continuation multi-pages (par fichier, jusqu'à 16 chunks en vol par archive) :
+		// quand un bloc compressé > 64 KiB est divisé en requêtes de 64 KiB à srcOff + k*65536
+		// avec le même srcSize, on décompresse le bloc entier depuis baseOff une seule fois.
 		tryChunkContinuation := func() bool {
 			ds.mu.Lock()
-			lc := ds.lastChunk
+			list := ds.lastChunks[srcPtr]
+			matchIdx := -1
+			var lc dsChunkCache
+			for i := len(list) - 1; i >= 0; i-- {
+				c := list[i]
+				if c.opts == opts && c.srcSize == srcSize && srcOff > c.srcOff {
+					delta := srcOff - c.srcOff
+					if delta%65536 == 0 && delta <= (4<<20) {
+						lc = c
+						matchIdx = i
+						break
+					}
+				}
+			}
 			ds.mu.Unlock()
-			if lc.srcPtr != srcPtr || lc.opts != opts || lc.srcSize != srcSize || srcOff <= lc.srcOff {
+			if matchIdx < 0 {
 				return false
 			}
 			delta := srcOff - lc.srcOff
-			if delta%65536 != 0 || delta > (4<<20) {
-				return false
-			}
 			needEnd := int(delta) + int(dstSize)
 			if len(lc.decoded) < needEnd {
-				// Décompresse le bloc complet depuis lc.srcOff (taille arrondie aux 64 KiB supérieurs)
 				fullSize := ((int(srcSize) + 65535) &^ 65535)
 				if fullSize < needEnd {
 					fullSize = needEnd
@@ -314,7 +324,13 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 					return false
 				}
 				ds.mu.Lock()
-				ds.lastChunk.decoded = fullDec
+				curList := ds.lastChunks[srcPtr]
+				for i := range curList {
+					if curList[i].srcOff == lc.srcOff && curList[i].srcSize == lc.srcSize && curList[i].opts == lc.opts {
+						curList[i].decoded = fullDec
+						break
+					}
+				}
 				lc.decoded = fullDec
 				ds.mu.Unlock()
 			}
@@ -324,18 +340,25 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			}
 			return true
 		}
+		fileName := func() string {
+			ds.mu.Lock()
+			nm := ds.fileNames[srcPtr]
+			ds.mu.Unlock()
+			return nm
+		}
 		var written int
+		resHR := uint32(hresultOK)
 		if bcFmt != 0 {
 			// Ordre matériel Xbox Series : ZLIB d'abord (si combiné), puis BCPack (BC1/BC3/BC4/BC5/BC6H/BC7)
 			packed := raw
 			zlibOK := true
 			if opts&optZlib != 0 {
-				zr, err := openZlib(bytes.NewReader(raw))
+				zr, err := zlib.NewReader(bytes.NewReader(raw))
 				if err != nil {
 					zlibOK = false
 					if ds.bcpackWarns.Add(1) <= 8 {
 						slog.Warn("IDStorageQueueX!BCPack+ZLIB en-tête zlib invalide",
-							"opts", fmt.Sprintf("0x%x", opts), "bcFmt", bcFmt, "srcSize", len(raw),
+							"file", fileName(), "opts", fmt.Sprintf("0x%x", opts), "bcFmt", bcFmt, "srcSize", len(raw),
 							"interSize", interSize, "dstSize", dstSize, "srcOff", srcOff, "head", headHex(raw), "err", err)
 					}
 				} else {
@@ -355,7 +378,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 							zlibOK = false
 						}
 					}
-					putZlib(zr)
+					_ = zr.Close()
 				}
 			}
 			if zlibOK {
@@ -363,9 +386,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 					written = int(dstSize)
 					ds.bytesRead.Add(uint64(written))
 					if srcSize > dstSize {
-						ds.mu.Lock()
-						ds.lastChunk = dsChunkCache{srcPtr: srcPtr, opts: opts, srcOff: srcOff, srcSize: srcSize}
-						ds.mu.Unlock()
+						recordChunk(srcPtr, opts, srcOff, srcSize)
 					}
 					if n := ds.bcpackDecoded.Add(1); n == 1 || n%250 == 0 {
 						slog.Info("IDStorageQueueX!BCPack décodage matériel pur Go actif", "count", n, "bcFmt", bcFmt, "srcSize", len(packed), "dstSize", dstSize)
@@ -376,7 +397,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				} else {
 					if ds.bcpackWarns.Add(1) <= 8 {
 						slog.Warn("IDStorageQueueX!EnqueueRequest BCPack erreur décodage (repli zéro)",
-							"opts", fmt.Sprintf("0x%x", opts), "bcFmt", bcFmt, "srcSize", len(packed),
+							"file", fileName(), "opts", fmt.Sprintf("0x%x", opts), "bcFmt", bcFmt, "srcSize", len(packed),
 							"interSize", interSize, "dstSize", dstSize, "srcOff", srcOff, "head", headHex(packed), "err", err)
 					}
 					clear(dst)
@@ -390,29 +411,28 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				written = int(dstSize)
 			}
 		} else if opts&optZlib != 0 { // ZLIB (RFC 1950)
-			if zr, err := openZlib(bytes.NewReader(raw)); err == nil {
+			if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
 				var rerr error
 				written, rerr = io.ReadFull(zr, dst)
-				putZlib(zr)
+				_ = zr.Close()
 				ds.bytesRead.Add(uint64(written))
 				if srcSize > dstSize {
-					ds.mu.Lock()
-					ds.lastChunk = dsChunkCache{srcPtr: srcPtr, opts: opts, srcOff: srcOff, srcSize: srcSize}
-					ds.mu.Unlock()
+					recordChunk(srcPtr, opts, srcOff, srcSize)
 				}
 				if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
 					if ds.zlibWarns.Add(1) <= 8 {
 						slog.Warn("IDStorageQueueX!EnqueueRequest zlib read err",
-							"opts", fmt.Sprintf("0x%x", opts), "err", rerr, "written", written, "dstSize", dstSize)
+							"file", fileName(), "opts", fmt.Sprintf("0x%x", opts), "err", rerr, "written", written, "dstSize", dstSize)
 					}
 				}
 			} else if tryChunkContinuation() {
 				written = int(dstSize)
 				ds.bytesRead.Add(uint64(written))
 			} else {
+				resHR = 0x8007000D // ERROR_INVALID_DATA
 				if ds.zlibWarns.Add(1) <= 8 {
 					slog.Warn("IDStorageQueueX!EnqueueRequest zlib err",
-						"opts", fmt.Sprintf("0x%x", opts), "err", err, "srcSize", srcSize, "dstSize", dstSize,
+						"file", fileName(), "opts", fmt.Sprintf("0x%x", opts), "err", err, "srcSize", srcSize, "dstSize", dstSize,
 						"interSize", interSize, "srcOff", srcOff, "head", headHex(raw))
 				}
 			}
@@ -440,6 +460,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		if rc <= 5 || rc%500 == 0 {
 			slog.Info("IDStorageQueueX!EnqueueRequest", "count", rc, "opts", opts, "srcSize", srcSize, "dstSize", dstSize, "written", written)
 		}
+		return resHR
 	}
 	flushQueue := func(q uintptr) {
 		ds.mu.Lock()
@@ -480,14 +501,14 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 								if k >= len(batch) {
 									return
 								}
-								execDSReq(batch[k])
+								_ = execDSReq(batch[k])
 							}
 						}()
 					}
 					wg.Wait()
 				} else {
 					for k := i; k < j; k++ {
-						execDSReq(cmds[k])
+						_ = execDSReq(cmds[k])
 					}
 				}
 				i = j
