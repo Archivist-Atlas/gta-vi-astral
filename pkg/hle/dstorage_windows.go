@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -183,6 +184,23 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		return obj
 	}
 
+	var zlibPool sync.Pool
+	openZlib := func(r io.Reader) (io.ReadCloser, error) {
+		if v := zlibPool.Get(); v != nil {
+			zr := v.(io.ReadCloser)
+			if err := zr.(zlib.Resetter).Reset(r, nil); err == nil {
+				return zr, nil
+			}
+			_ = zr.Close()
+		}
+		return zlib.NewReader(r)
+	}
+	putZlib := func(zr io.ReadCloser) {
+		if zr != nil {
+			zlibPool.Put(zr)
+		}
+	}
+
 	execDSReq := func(r dsPendingCmd) {
 		opts, dstPtr, pageOff, dstSize, srcPtr, srcOff, srcSize, interSize := r.opts, r.dstPtr, r.pageOff, r.dstSize, r.srcPtr, r.srcOff, r.srcSize, r.intermediateSize
 		if dstPtr == 0 || dstSize == 0 || srcPtr == 0 {
@@ -204,11 +222,11 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			ds.mu.Lock()
 			fh := ds.files[srcPtr]
 			ds.mu.Unlock()
-			if fh != nil && srcSize > 0 {
+			if fh != nil && srcSize > 0 && srcSize <= (64<<20) {
 				raw = make([]byte, srcSize)
 				n, _ := fh.ReadAt(raw, int64(srcOff))
 				raw = raw[:n]
-			} else if srcSize > 0 && srcSize <= (64<<20) {
+			} else if fh == nil && srcSize > 0 && srcSize <= (64<<20) {
 				raw = make([]byte, srcSize)
 				copy(raw, unsafe.Slice((*byte)(osPtr(srcPtr)), srcSize))
 			}
@@ -312,7 +330,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			packed := raw
 			zlibOK := true
 			if opts&optZlib != 0 {
-				zr, err := zlib.NewReader(bytes.NewReader(raw))
+				zr, err := openZlib(bytes.NewReader(raw))
 				if err != nil {
 					zlibOK = false
 					if ds.bcpackWarns.Add(1) <= 8 {
@@ -337,7 +355,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 							zlibOK = false
 						}
 					}
-					_ = zr.Close()
+					putZlib(zr)
 				}
 			}
 			if zlibOK {
@@ -372,10 +390,10 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				written = int(dstSize)
 			}
 		} else if opts&optZlib != 0 { // ZLIB (RFC 1950)
-			if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
+			if zr, err := openZlib(bytes.NewReader(raw)); err == nil {
 				var rerr error
 				written, rerr = io.ReadFull(zr, dst)
-				_ = zr.Close()
+				putZlib(zr)
 				ds.bytesRead.Add(uint64(written))
 				if srcSize > dstSize {
 					ds.mu.Lock()
@@ -430,10 +448,54 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			delete(ds.pending, q)
 		}
 		ds.mu.Unlock()
-		for _, c := range cmds {
+		// Exécute les lots consécutifs de lectures indépendantes en parallèle entre barrières Status/Signal
+		workers := runtime.GOMAXPROCS(0)
+		if workers > 8 {
+			workers = 8
+		}
+		for i := 0; i < len(cmds); {
+			if cmds[i].kind == dsCmdRead {
+				j := i
+				canPar := true
+				for j < len(cmds) && cmds[j].kind == dsCmdRead {
+					if cmds[j].srcSize > cmds[j].dstSize {
+						canPar = false
+					}
+					j++
+				}
+				if canPar && j-i >= 4 && workers > 1 {
+					batch := cmds[i:j]
+					var nextIdx atomic.Int32
+					var wg sync.WaitGroup
+					nw := workers
+					if nw > len(batch) {
+						nw = len(batch)
+					}
+					wg.Add(nw)
+					for w := 0; w < nw; w++ {
+						go func() {
+							defer wg.Done()
+							for {
+								k := int(nextIdx.Add(1) - 1)
+								if k >= len(batch) {
+									return
+								}
+								execDSReq(batch[k])
+							}
+						}()
+					}
+					wg.Wait()
+				} else {
+					for k := i; k < j; k++ {
+						execDSReq(cmds[k])
+					}
+				}
+				i = j
+				continue
+			}
+			c := cmds[i]
+			i++
 			switch c.kind {
-			case dsCmdRead:
-				execDSReq(c)
 			case dsCmdStatus:
 				ds.mu.Lock()
 				s := ds.statuses[c.statusArr]
