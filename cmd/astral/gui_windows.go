@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -237,6 +238,7 @@ func openGameWindowEarly(loadingSound, fullscreen bool) {
 func launchDirectGame(gameDir string) {
 	if lf, lerr := os.Create(filepath.Join(os.TempDir(), "astral_last.log")); lerr == nil {
 		defer lf.Close()
+		_ = debug.SetCrashOutput(lf, debug.CrashOptions{})
 		// En mode windowsgui, os.Stderr n'est pas attaché à une console : écrire directement dans lf
 		// (io.MultiWriter(os.Stderr, lf) échouerait sur os.Stderr avant d'écrire dans lf).
 		core.InitLogger(lf)
