@@ -219,6 +219,15 @@ func hideStandaloneConsole() {
 	}
 }
 
+// openGameWindowEarly ouvre la fenêtre Win32 ASTRAL + le splash D3D12 dès le lancement
+// (avant le mappage PE de game_scarlett_master.exe) pour afficher immédiatement l'icône
+// dans la barre des tâches et l'écran de chargement.
+func openGameWindowEarly() {
+	if hwnd := gpu.EnsureWindow("gta-vi-astral — GTA VI (Xbox Series)", 1280, 720); hwnd != 0 {
+		_, _ = gpu.InitHostD3D12(hwnd, 1280, 720)
+	}
+}
+
 func launchDirectGame(gameDir string) {
 	if lf, lerr := os.Create(filepath.Join(os.TempDir(), "astral_last.log")); lerr == nil {
 		defer lf.Close()
@@ -226,6 +235,7 @@ func launchDirectGame(gameDir string) {
 	} else {
 		core.InitLogger(os.Stderr)
 	}
+	openGameWindowEarly()
 	exePath := filepath.Join(gameDir, game.ExpectedExecutable)
 	if err := cmdRun([]string{"-execute", "-unimplemented", "log", exePath}); err != nil {
 		titlePtr, _ := syscall.UTF16PtrFromString("GTA VI Astral — Erreur")

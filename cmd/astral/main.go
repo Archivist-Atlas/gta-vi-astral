@@ -504,6 +504,10 @@ func cmdRun(args []string) error {
 		return nil
 	}
 
+	if *execute {
+		openGameWindowEarly()
+	}
+
 	// Mappage natif Windows (LoadLibraryExW + redirection TLS statique + binding IAT réel)
 	sess, err := loader.MapAndBind(loader.MapOptions{
 		ExePath:       exePath,

@@ -5,6 +5,7 @@ package gpu
 import (
 	_ "embed"
 	"log/slog"
+	"os"
 	"runtime"
 	"sync"
 	"syscall"
@@ -37,6 +38,8 @@ var (
 	procSendMessage         = modUser32.NewProc("SendMessageW")
 	procGetModuleHandle     = modKernel32Win.NewProc("GetModuleHandleW")
 	procGetCurrentProcessId = modKernel32Win.NewProc("GetCurrentProcessId")
+	procGetCurrentProcess   = modKernel32Win.NewProc("GetCurrentProcess")
+	procTerminateProcess    = modKernel32Win.NewProc("TerminateProcess")
 )
 
 func createIconFromPNG(pngData []byte) uintptr {
@@ -172,6 +175,17 @@ func EnsureWindow(title string, width, height int) uintptr {
 				_, _, _ = procTranslateMsg.Call(uintptr(unsafe.Pointer(&m)))
 				_, _, _ = procDispatchMsg.Call(uintptr(unsafe.Pointer(&m)))
 			}
+			// La fenêtre principale ASTRAL a été fermée par l'utilisateur : terminer
+			// proprement et immédiatement le processus (avec sécurité TerminateProcess
+			// si un thread invité bloque ExitProcess) afin qu'astral.exe ne reste jamais
+			// actif en arrière-plan.
+			slog.Info("fenêtre Win32 ASTRAL fermée — arrêt du processus")
+			go func() {
+				time.Sleep(250 * time.Millisecond)
+				curProc, _, _ := procGetCurrentProcess.Call()
+				_, _, _ = procTerminateProcess.Call(curProc, 0)
+			}()
+			os.Exit(0)
 		}()
 		winHWND = <-ready
 	})
