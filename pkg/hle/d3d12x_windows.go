@@ -1513,13 +1513,18 @@ func newD3D12XDevice() uintptr {
 
 	newDescriptorHeap := func(descPtr uintptr) uintptr {
 		st.heapsCreated.Add(1)
-		// D3D12_DESCRIPTOR_HEAP_DESC fait exactement 16 octets : { Type u32, NumDescriptors u32, Flags u32, NodeMask u32 }.
-		// Ne JAMAIS lire +16 (mémoire pile arbitraire -> faux baseAddr non mappé -> crash 0xC0000005 à la copie de descripteurs).
+		// D3D12_DESCRIPTOR_HEAP_DESC : { Type u32, NumDescriptors u32, Flags u32, NodeMask u32 }
+		// Suivi sur Xbox Series (GTA VI) d'un Placement optionnel { Address u64 (+16), Size u64 (+24) }.
+		var baseAddr uintptr
 		numDescs := uintptr(4096)
 		stride := uintptr(128)
+		var placementAddr uint64
 		if descPtr != 0 {
 			heapType := *(*uint32)(osPtr(descPtr))
 			n := *(*uint32)(osPtr(descPtr + 4))
+			if isGuestReadable(descPtr+16, 8) {
+				placementAddr = *(*uint64)(osPtr(descPtr + 16))
+			}
 			if n > 0 && n <= 1_048_576 {
 				numDescs = uintptr(n)
 			}
@@ -1536,9 +1541,14 @@ func newD3D12XDevice() uintptr {
 		if bytes < 65536 {
 			bytes = 65536
 		}
-		baseAddr, _, _ := k32VirtualAlloc.Call(0, bytes, 0x3000 /* COMMIT|RESERVE */, 0x04 /* PAGE_READWRITE */)
+		if placementAddr >= 0x10000 && placementAddr < 0x800000000000 && isGuestReadable(uintptr(placementAddr), uint64(bytes)) {
+			baseAddr = uintptr(placementAddr)
+		}
 		if baseAddr == 0 {
-			baseAddr = uintptr(st.nextHeapBase.Add(0x1000000))
+			baseAddr, _, _ = k32VirtualAlloc.Call(0, bytes, 0x3000 /* COMMIT|RESERVE */, 0x04 /* PAGE_READWRITE */)
+			if baseAddr == 0 {
+				baseAddr = uintptr(st.nextHeapBase.Add(0x1000000))
+			}
 		}
 		obj, _, _ := k32VirtualAlloc.Call(0, 0x20, 0x3000, 0x04)
 		if obj != 0 {
