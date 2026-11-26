@@ -102,6 +102,108 @@ func initSplashLogo() {
 	})
 }
 
+// drawSplashLogoBase remplit le buffer en noir pur opaque et centre le logo 1:1 sans redimensionnement.
+func drawSplashLogoBase(buf []byte, w, ht int) {
+	clear(buf)
+	for i := 3; i < len(buf); i += 4 {
+		buf[i] = 255
+	}
+	if len(splashLogoPix) > 0 && splashLogoW > 0 && splashLogoH > 0 {
+		dstX0 := (w - splashLogoW) / 2
+		dstY0 := (ht-splashLogoH)/2 - 34
+		if dstY0 < 16 {
+			dstY0 = 16
+		}
+		for y := 0; y < splashLogoH; y++ {
+			dy := dstY0 + y
+			if dy < 0 || dy >= ht {
+				continue
+			}
+			for x := 0; x < splashLogoW; x++ {
+				dx := dstX0 + x
+				if dx < 0 || dx >= w {
+					continue
+				}
+				sOff := (y*splashLogoW + x) * 4
+				dOff := (dy*w + dx) * 4
+				buf[dOff+0] = splashLogoPix[sOff+0]
+				buf[dOff+1] = splashLogoPix[sOff+1]
+				buf[dOff+2] = splashLogoPix[sOff+2]
+				buf[dOff+3] = 255
+			}
+		}
+	}
+}
+
+// drawSynthwaveProgressBar dessine exactement la même barre néon synthwave (560x12)
+// que l'écran splash initial et retourne sa coordonnée basse (barY + barH).
+func drawSynthwaveProgressBar(buf []byte, w, ht int, pct float32, frame uint64) int {
+	barW := 560
+	if barW > w-80 {
+		barW = w - 80
+	}
+	barH := 12
+	barX := (w - barW) / 2
+	barY := (ht+splashLogoH)/2 - 12
+	if barY+barH+48 >= ht {
+		barY = ht - barH - 64
+	}
+	fillW := int(float32(barW-4) * pct)
+	sweepX := int((frame * 9) % uint64(barW+160)) - 80
+
+	for y := barY - 2; y <= barY+barH+1; y++ {
+		if y < 0 || y >= ht {
+			continue
+		}
+		for x := barX - 2; x <= barX+barW+1; x++ {
+			if x < 0 || x >= w {
+				continue
+			}
+			dOff := (y*w + x) * 4
+			isBorder := x < barX || x >= barX+barW || y < barY || y >= barY+barH
+			if isBorder {
+				buf[dOff+0] = 88
+				buf[dOff+1] = 42
+				buf[dOff+2] = 138
+				buf[dOff+3] = 255
+				continue
+			}
+			lx := x - barX - 2
+			ly := y - barY - 2
+			insideTrack := lx >= 0 && lx < barW-4 && ly >= 0 && ly < barH-4
+			if insideTrack && lx < fillW {
+				t := float32(lx) / float32(barW-4)
+				var r, g, bl float32
+				if t < 0.55 {
+					u := t / 0.55
+					// #9D4EDD (157, 78, 221) -> #FF2A85 (255, 42, 133)
+					r = 157 + u*(255-157)
+					g = 78 + u*(42-78)
+					bl = 221 + u*(133-221)
+				} else {
+					u := (t - 0.55) / 0.45
+					// #FF2A85 (255, 42, 133) -> #FF8C42 (255, 140, 66)
+					r = 255
+					g = 42 + u*(140-42)
+					bl = 133 + u*(66-133)
+				}
+				dist := float64(lx - sweepX)
+				glow := float32(math.Exp(-(dist * dist) / 1400.0))
+				buf[dOff+0] = clampByte(r + glow*80)
+				buf[dOff+1] = clampByte(g + glow*80)
+				buf[dOff+2] = clampByte(bl + glow*90)
+				buf[dOff+3] = 255
+			} else {
+				buf[dOff+0] = 20
+				buf[dOff+1] = 16
+				buf[dOff+2] = 32
+				buf[dOff+3] = 255
+			}
+		}
+	}
+	return barY + barH
+}
+
 // renderSplashRGBA génère une trame RGBA8 (w x h) contenant le logo GTA VI Astral centré
 // sur fond noir pur et une barre de progression néon synthwave animée.
 func (h *HostD3D12) renderSplashRGBA() []byte {
@@ -113,35 +215,7 @@ func (h *HostD3D12) renderSplashRGBA() []byte {
 	need := w * ht * 4
 	if len(h.splashBuf) != need {
 		h.splashBuf = make([]byte, need)
-		// Fond noir opaque + logo copié une seule fois (seule la zone barre est redessinée par trame)
-		for i := 3; i < need; i += 4 {
-			h.splashBuf[i] = 255
-		}
-		if len(splashLogoPix) > 0 && splashLogoW > 0 && splashLogoH > 0 {
-			dstX0 := (w - splashLogoW) / 2
-			dstY0 := (ht-splashLogoH)/2 - 34
-			if dstY0 < 16 {
-				dstY0 = 16
-			}
-			for y := 0; y < splashLogoH; y++ {
-				dy := dstY0 + y
-				if dy < 0 || dy >= ht {
-					continue
-				}
-				for x := 0; x < splashLogoW; x++ {
-					dx := dstX0 + x
-					if dx < 0 || dx >= w {
-						continue
-					}
-					sOff := (y*splashLogoW + x) * 4
-					dOff := (dy*w + dx) * 4
-					h.splashBuf[dOff+0] = splashLogoPix[sOff+0]
-					h.splashBuf[dOff+1] = splashLogoPix[sOff+1]
-					h.splashBuf[dOff+2] = splashLogoPix[sOff+2]
-					h.splashBuf[dOff+3] = 255
-				}
-			}
-		}
+		drawSplashLogoBase(h.splashBuf, w, ht)
 	}
 
 	h.splashFrame++
@@ -168,77 +242,8 @@ func (h *HostD3D12) renderSplashRGBA() []byte {
 		}
 	}
 
-	// Géométrie de la barre de progression néon sous le logo
-	barW := 560
-	if barW > w-80 {
-		barW = w - 80
-	}
-	barH := 12
-	barX := (w - barW) / 2
-	barY := (ht+splashLogoH)/2 - 12
-	if barY+barH+16 >= ht {
-		barY = ht - barH - 28
-	}
-	fillW := int(float32(barW-4) * h.splashPct)
-	sweepX := int((h.splashFrame * 9) % uint64(barW+160)) - 80
+	drawSynthwaveProgressBar(h.splashBuf, w, ht, h.splashPct, h.splashFrame)
 
-	// Dessin du cadre + piste + remplissage dégradé synthwave (violet -> magenta -> corail) + reflet animé
-	for y := barY - 2; y <= barY+barH+1; y++ {
-		if y < 0 || y >= ht {
-			continue
-		}
-		for x := barX - 2; x <= barX+barW+1; x++ {
-			if x < 0 || x >= w {
-				continue
-			}
-			dOff := (y*w + x) * 4
-			// Bordure extérieure néon violet doux
-			isBorder := x < barX || x >= barX+barW || y < barY || y >= barY+barH
-			if isBorder {
-				h.splashBuf[dOff+0] = 88
-				h.splashBuf[dOff+1] = 42
-				h.splashBuf[dOff+2] = 138
-				h.splashBuf[dOff+3] = 255
-				continue
-			}
-			lx := x - barX - 2
-			ly := y - barY - 2
-			insideTrack := lx >= 0 && lx < barW-4 && ly >= 0 && ly < barH-4
-			if insideTrack && lx < fillW {
-				t := float32(lx) / float32(barW-4)
-				var r, g, bl float32
-				if t < 0.55 {
-					u := t / 0.55
-					// #9D4EDD (157, 78, 221) -> #FF2A85 (255, 42, 133)
-					r = 157 + u*(255-157)
-					g = 78 + u*(42-78)
-					bl = 221 + u*(133-221)
-				} else {
-					u := (t - 0.55) / 0.45
-					// #FF2A85 (255, 42, 133) -> #FF8C42 (255, 140, 66)
-					r = 255
-					g = 42 + u*(140-42)
-					bl = 133 + u*(66-133)
-				}
-				// Reflet lumineux glissant le long de la barre
-				dist := float64(lx - sweepX)
-				glow := float32(math.Exp(-(dist * dist) / 1400.0))
-				r += glow * 80
-				g += glow * 80
-				bl += glow * 90
-				h.splashBuf[dOff+0] = clampByte(r)
-				h.splashBuf[dOff+1] = clampByte(g)
-				h.splashBuf[dOff+2] = clampByte(bl)
-				h.splashBuf[dOff+3] = 255
-			} else {
-				// Piste sombre
-				h.splashBuf[dOff+0] = 20
-				h.splashBuf[dOff+1] = 16
-				h.splashBuf[dOff+2] = 32
-				h.splashBuf[dOff+3] = 255
-			}
-		}
-	}
 	// Boutons synthwave en haut à droite : Plein écran (F11) et Audio (M)
 	drawFullscreenButton(h.splashBuf, w, ht, IsWindowFullscreen())
 	drawAudioButton(h.splashBuf, w, ht, IsLoadingAudioEnabled())
@@ -246,8 +251,8 @@ func (h *HostD3D12) renderSplashRGBA() []byte {
 	return h.splashBuf
 }
 
-// renderWorldLoadingRGBA remplace l'écran gris vide pendant le streaming de story000 par un écran
-// de chargement GTA VI Astral informatif : barre néon synthwave en direct + pourcentage + télémétrie.
+// renderWorldLoadingRGBA réutilise exactement le même logo 1:1 et la même barre néon synthwave
+// que l'écran splash initial pendant le chargement de story000, avec le texte de progression dessous.
 func (h *HostD3D12) renderWorldLoadingRGBA() []byte {
 	initSplashLogo()
 	w, ht := int(h.Width), int(h.Height)
@@ -258,13 +263,8 @@ func (h *HostD3D12) renderWorldLoadingRGBA() []byte {
 	if len(h.splashBuf) != need {
 		h.splashBuf = make([]byte, need)
 	}
-	// Fond noir pur identique au fond du logo (aucune bordure carrée visible)
-	for i := 0; i < need; i += 4 {
-		h.splashBuf[i+0] = 0
-		h.splashBuf[i+1] = 0
-		h.splashBuf[i+2] = 0
-		h.splashBuf[i+3] = 255
-	}
+	drawSplashLogoBase(h.splashBuf, w, ht)
+
 	h.splashFrame++
 	curReads := bootDSReads.Load()
 	baseReads := worldLoadBaseReads.Load()
@@ -281,103 +281,9 @@ func (h *HostD3D12) renderWorldLoadingRGBA() []byte {
 		pct = 0.02
 	}
 
-	// Logo GTA VI Astral centré légèrement plus haut pour laisser place au texte de statut
-	if len(splashLogoPix) > 0 && splashLogoW > 0 && splashLogoH > 0 {
-		maxW := int(float64(w) * 0.56)
-		maxH := int(float64(ht) * 0.56)
-		scale := math.Min(float64(maxW)/float64(splashLogoW), float64(maxH)/float64(splashLogoH))
-		dstW := int(float64(splashLogoW) * scale)
-		dstH := int(float64(splashLogoH) * scale)
-		offX := (w - dstW) / 2
-		offY := (ht-dstH)/2 - ht/10
-		if offY < 16 {
-			offY = 16
-		}
-		for y := 0; y < dstH; y++ {
-			sy := y * splashLogoH / dstH
-			dy := offY + y
-			if dy < 0 || dy >= ht {
-				continue
-			}
-			for x := 0; x < dstW; x++ {
-				sx := x * splashLogoW / dstW
-				dx := offX + x
-				if dx < 0 || dx >= w {
-					continue
-				}
-				sOff := (sy*splashLogoW + sx) * 4
-				dOff := (dy*w + dx) * 4
-				h.splashBuf[dOff+0] = splashLogoPix[sOff+0]
-				h.splashBuf[dOff+1] = splashLogoPix[sOff+1]
-				h.splashBuf[dOff+2] = splashLogoPix[sOff+2]
-				h.splashBuf[dOff+3] = 255
-			}
-		}
-	}
-
-	// Barre de progression néon synthwave animée
-	barW := w * 46 / 100
-	barH := 16
-	barX := (w - barW) / 2
-	barY := ht * 74 / 100
-	fillW := int(float32(barW-4) * pct)
-	if fillW < 6 {
-		fillW = 6
-	}
-	sweepX := int((h.splashFrame * 8) % uint64(barW+160)) - 80
-
-	for y := barY - 2; y <= barY+barH+1; y++ {
-		if y < 0 || y >= ht {
-			continue
-		}
-		for x := barX - 2; x <= barX+barW+1; x++ {
-			if x < 0 || x >= w {
-				continue
-			}
-			dOff := (y*w + x) * 4
-			isBorder := x < barX || x >= barX+barW || y < barY || y >= barY+barH
-			if isBorder {
-				h.splashBuf[dOff+0] = 96
-				h.splashBuf[dOff+1] = 48
-				h.splashBuf[dOff+2] = 152
-				h.splashBuf[dOff+3] = 255
-				continue
-			}
-			lx := x - barX - 2
-			ly := y - barY - 2
-			insideTrack := lx >= 0 && lx < barW-4 && ly >= 0 && ly < barH-4
-			if insideTrack && lx < fillW {
-				t := float32(lx) / float32(barW-4)
-				var r, g, bl float32
-				if t < 0.55 {
-					u := t / 0.55
-					r = 157 + u*(255-157)
-					g = 78 + u*(42-78)
-					bl = 221 + u*(133-221)
-				} else {
-					u := (t - 0.55) / 0.45
-					r = 255
-					g = 42 + u*(140-42)
-					bl = 133 + u*(66-133)
-				}
-				dist := float64(lx - sweepX)
-				glow := float32(math.Exp(-(dist * dist) / 1400.0))
-				h.splashBuf[dOff+0] = clampByte(r + glow*80)
-				h.splashBuf[dOff+1] = clampByte(g + glow*80)
-				h.splashBuf[dOff+2] = clampByte(bl + glow*90)
-				h.splashBuf[dOff+3] = 255
-			} else {
-				h.splashBuf[dOff+0] = 20
-				h.splashBuf[dOff+1] = 16
-				h.splashBuf[dOff+2] = 32
-				h.splashBuf[dOff+3] = 255
-			}
-		}
-	}
-
-	// Texte de statut centré sous la barre : uniquement le texte de chargement et le pourcentage
+	barBottom := drawSynthwaveProgressBar(h.splashBuf, w, ht, pct, h.splashFrame)
 	title := fmt.Sprintf("CHARGEMENT DU MONDE  %d%%", int(pct*100))
-	drawSplashTextCentered(h.splashBuf, w, ht, w/2, barY+barH+26, 3, title, 245, 240, 255)
+	drawSplashTextCentered(h.splashBuf, w, ht, w/2, barBottom+24, 3, title, 245, 240, 255)
 
 	return h.splashBuf
 }
