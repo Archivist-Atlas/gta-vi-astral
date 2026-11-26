@@ -916,9 +916,14 @@ func newD3D12XDevice() uintptr {
 				if tx.GuestVA >= 0x10000 && tx.Width > 0 && tx.Height > 0 && tx.Width <= 4096 && tx.Height <= 4096 {
 					bpe, block, _ := gpu.DXGIFormatMetrics(tx.Format)
 					sz := gpu.TiledSizeBytes(tx.Width, tx.Height, bpe, block, tx.Swizzle)
-					if sz > 0 && sz <= (16<<20) && isGuestReadable(uintptr(tx.GuestVA), sz) {
+					mip0Off := gpu.Mip0OffsetRDNA2(tx.Width, tx.Height, tx.MipLevels, bpe, block, tx.Swizzle)
+					srcAddr := uintptr(tx.GuestVA + mip0Off)
+					if mip0Off > 0 && !isGuestReadable(srcAddr, sz) {
+						srcAddr = uintptr(tx.GuestVA)
+					}
+					if sz > 0 && sz <= (16<<20) && isGuestReadable(srcAddr, sz) {
 						pix := make([]byte, sz)
-						copy(pix, unsafe.Slice((*byte)(osPtr(uintptr(tx.GuestVA))), sz))
+						copy(pix, unsafe.Slice((*byte)(osPtr(srcAddr)), sz))
 						tx.Pixels = pix
 						st.frameTexCache[src.GuestVA] = &tx
 						return &tx
@@ -1290,17 +1295,20 @@ func newD3D12XDevice() uintptr {
 					w := *(*uint32)(osPtr(slotPtr + 16))
 					h := *(*uint32)(osPtr(slotPtr + 20))
 					fmtID := *(*uint32)(osPtr(slotPtr + 4))
-					swz := *(*uint32)(osPtr(slotPtr + 28))
+					rawSwz := *(*uint32)(osPtr(slotPtr + 28))
+					swz := rawSwz & 0xFFFF
+					mipLevels := rawSwz >> 16
 					if (dim == 2 || dim == 3) && va >= 0x10000 && va < 0x800000000000 && w > 0 {
 						if h == 0 {
 							h = 1
 						}
 						tx := &gpu.HostTextureUpload{
-							GuestVA: va,
-							Width:   w,
-							Height:  h,
-							Format:  fmtID,
-							Swizzle: swz,
+							GuestVA:   va,
+							Width:     w,
+							Height:    h,
+							MipLevels: mipLevels,
+							Format:    fmtID,
+							Swizzle:   swz,
 						}
 						st.activeSRVSlots[s] = tx
 						if !foundSRV {
@@ -2490,7 +2498,7 @@ func newD3D12XDevice() uintptr {
 				fmtID = vf
 			}
 		}
-		writeSRV2(handle, va, uint32(d.Width), d.Height, fmtID, d.Dimension, d.Layout)
+		writeSRV2(handle, va, uint32(d.Width), d.Height, fmtID, d.Dimension, (d.Layout&0xFFFF)|(uint32(d.Mips)<<16))
 		return 0
 	})
 	cbCreatePlacedSRV := syscall.NewCallback(func(this, resDescPtr, srvDescPtr, handle uintptr) uintptr {
@@ -2508,7 +2516,7 @@ func newD3D12XDevice() uintptr {
 		if gpuTrace && n <= 6 && d.Dimension == 3 {
 			slog.Info("GPU_TRACE CreatePlacedSRV(Tex2D)", "n", n, "va", fmt.Sprintf("0x%X", va), "w", d.Width, "h", d.Height, "fmt", d.Format, "layout", fmt.Sprintf("0x%X", d.Layout))
 		}
-		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension, d.Layout)
+		writeSRV2(handle, va, uint32(d.Width), d.Height, d.Format, d.Dimension, (d.Layout&0xFFFF)|(uint32(d.Mips)<<16))
 		return 0
 	})
 	cbCreateUAV := syscall.NewCallback(func(this, res, counter, descPtr, handle uintptr) uintptr {

@@ -155,6 +155,74 @@ func buildAxisLUT(kind int, bpeLog2, blockLog2 uint32) (xLUT, yLUT []uint32, til
 	return xLUT, yLUT, tileW, tileH
 }
 
+// Mip0OffsetRDNA2 calcule l'offset en octets du mip 0 dans une texture 2D tuilée RDNA2 (Xbox Series).
+// Sur RDNA2, la chaîne de mipmaps est stockée en ordre inverse : bloc mip-tail en 0, puis les mips
+// du plus petit au plus grand, avec le mip 0 à la toute fin.
+func Mip0OffsetRDNA2(width, height, mipLevels, bpe, block, swizzle uint32) uint64 {
+	if width == 0 || height == 0 || mipLevels <= 1 || bpe == 0 || block == 0 {
+		return 0
+	}
+	kind, blockLog2, tiled := rdna2SwizzleInfo(swizzle)
+	if !tiled {
+		return 0
+	}
+	var bpeLog2 uint32
+	for (uint32(1) << bpeLog2) < bpe && bpeLog2 < 4 {
+		bpeLog2++
+	}
+	_, _, tileW, tileH := buildAxisLUT(kind, bpeLog2, blockLog2)
+	blockBytes := uint64(1) << blockLog2
+	tailMaxW := tileW >> 1
+	if tailMaxW < 1 {
+		tailMaxW = 1
+	}
+	tailMaxH := tileH
+	var maxInTail uint32
+	switch {
+	case blockLog2 == 8:
+		maxInTail = 0
+	case blockLog2 >= 9 && blockLog2 <= 11:
+		maxInTail = 1 + (1 << (blockLog2 - 9))
+	default:
+		maxInTail = blockLog2 - 4
+	}
+	paddedDim := func(dim, mip uint32) uint32 {
+		v := dim >> mip
+		if v < 1 {
+			v = 1
+		}
+		blocks := (v + block - 1) / block
+		// Arrondit à la puissance de 2 supérieure (padded_dim GFX10)
+		p := uint32(1)
+		for p < blocks {
+			p <<= 1
+		}
+		return p
+	}
+	firstTailMip := mipLevels
+	sizes := make([]uint64, 0, mipLevels)
+	for i := uint32(0); i < mipLevels; i++ {
+		w := paddedDim(width, i)
+		h := paddedDim(height, i)
+		if w <= tailMaxW && h <= tailMaxH && mipLevels-i <= maxInTail {
+			firstTailMip = i
+			break
+		}
+		pitch := ((w + tileW - 1) / tileW) * tileW
+		rows := ((h + tileH - 1) / tileH) * tileH
+		sizes = append(sizes, uint64(pitch)*uint64(rows)*uint64(bpe))
+	}
+	var off uint64
+	if firstTailMip < mipLevels {
+		off = blockBytes
+	}
+	// Somme des mips 1..(firstTailMip-1) stockés avant le mip 0
+	for i := int(firstTailMip) - 1; i >= 1; i-- {
+		off += sizes[i]
+	}
+	return off
+}
+
 // TiledSizeBytes retourne la taille minimale en octets de la surface en mémoire invité
 // en tenant compte de l'alignement de tuile RDNA2 (ou de l'alignement 256 o en linéaire).
 func TiledSizeBytes(width, height, bpe, block, swizzle uint32) uint64 {

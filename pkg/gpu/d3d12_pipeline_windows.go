@@ -35,12 +35,13 @@ var (
 
 // HostTextureUpload décrit une texture 2D invitée à uploader dans un SRV t0 hôte.
 type HostTextureUpload struct {
-	GuestVA uint64
-	Width   uint32
-	Height  uint32
-	Format  uint32 // DXGI_FORMAT
-	Swizzle uint32 // Layout RDNA2 (0=linéaire, 0x105=SW_4KB_S, 0x109+=SW_64KB_*)
-	Pixels  []byte
+	GuestVA   uint64
+	Width     uint32
+	Height    uint32
+	MipLevels uint32
+	Format    uint32 // DXGI_FORMAT
+	Swizzle   uint32 // Layout RDNA2 (0=linéaire, 0x105=SW_4KB_S, 0x109+=SW_64KB_*)
+	Pixels    []byte
 }
 
 // HostDrawPass décrit un appel DrawInstanced ou DrawIndexedInstanced rejoué sur le GPU hôte.
