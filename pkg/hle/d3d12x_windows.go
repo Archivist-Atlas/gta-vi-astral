@@ -51,29 +51,37 @@ type winMemBasicInfo struct {
 	_pad1             uint32
 }
 
-func isGuestReadable(addr uintptr, sz uint64) bool {
-	if addr < 0x10000 || addr >= 0x800000000000 || sz == 0 {
-		return false
+// guestReadableLen retourne le nombre d'octets lisibles contigus (jusqu'à maxSz) à partir de addr.
+func guestReadableLen(addr uintptr, maxSz uint64) uint64 {
+	if addr < 0x10000 || addr >= 0x800000000000 || maxSz == 0 {
+		return 0
 	}
-	targetEnd := addr + uintptr(sz)
+	targetEnd := addr + uintptr(maxSz)
 	cur := addr
 	for steps := 0; cur < targetEnd && steps < 512; steps++ {
 		var mbi winMemBasicInfo
 		r, _, _ := k32VirtualQuery.Call(cur, uintptr(unsafe.Pointer(&mbi)), unsafe.Sizeof(mbi))
 		if r == 0 || mbi.State != 0x1000 /* MEM_COMMIT */ {
-			return false
+			break
 		}
 		prot := mbi.Protect & 0xFF
 		if prot == 0x01 /* NOACCESS */ || mbi.Protect&0x100 /* PAGE_GUARD */ != 0 {
-			return false
+			break
 		}
 		end := mbi.BaseAddress + mbi.RegionSize
 		if end <= cur {
-			return false
+			break
 		}
 		cur = end
 	}
-	return cur >= targetEnd
+	if cur >= targetEnd {
+		return maxSz
+	}
+	return uint64(cur - addr)
+}
+
+func isGuestReadable(addr uintptr, sz uint64) bool {
+	return guestReadableLen(addr, sz) >= sz
 }
 
 // d3d12xState centralise les objets COM Xbox Series D3D12.X créés pendant le boot.
@@ -632,11 +640,12 @@ func newD3D12XDevice() uintptr {
 				if cbLen > 16384 {
 					cbLen = 16384
 				}
-				if !isGuestReadable(cbVA, uint64(cbLen)) {
+				avail := guestReadableLen(cbVA, uint64(cbLen))
+				if avail == 0 {
 					return nil
 				}
-				buf := make([]byte, cbLen)
-				copy(buf, unsafe.Slice((*byte)(osPtr(cbVA)), cbLen))
+				buf := make([]byte, avail)
+				copy(buf, unsafe.Slice((*byte)(osPtr(cbVA)), avail))
 				return buf
 			}
 			pass.CBData = readCB(st.activeCBSlot)
@@ -943,7 +952,6 @@ func newD3D12XDevice() uintptr {
 		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
 			st.mu.Lock()
 			foundSRV := false
-			var newSRVs [16]*gpu.HostTextureUpload
 			for s := uintptr(0); s < 16; s++ {
 				slotPtr := baseDesc + s*32
 				if s >= 8 && !isGuestReadable(slotPtr, 32) {
@@ -980,7 +988,7 @@ func newD3D12XDevice() uintptr {
 							Format:  fmtID,
 							Swizzle: swz,
 						}
-						newSRVs[s] = tx
+						st.activeSRVSlots[s] = tx
 						if !foundSRV {
 							st.activeSRVVA = va
 							st.activeSRVTex = tx
@@ -988,9 +996,6 @@ func newD3D12XDevice() uintptr {
 						}
 					}
 				}
-			}
-			if foundSRV {
-				st.activeSRVSlots = newSRVs
 			}
 			st.mu.Unlock()
 		}
