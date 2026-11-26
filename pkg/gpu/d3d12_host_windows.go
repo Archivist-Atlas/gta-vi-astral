@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -422,9 +423,19 @@ func (h *HostD3D12) initPresentPipeline() {
 
 	h.initReplayPipeline()
 	h.Ready = true
-	// Affiche immédiatement le splash GTA VI Astral dès l'ouverture de la fenêtre (avant la 1re trame PresentX)
+	// Affiche immédiatement le splash GTA VI Astral et l'anime en douceur jusqu'à l'arrivée du jeu
 	if h.UploadBuf != 0 && h.UploadPtr != 0 {
-		go func() { h.Present(0) }()
+		go func() {
+			h.Present(0)
+			ticker := time.NewTicker(40 * time.Millisecond)
+			defer ticker.Stop()
+			for range ticker.C {
+				if IsIntroReached() {
+					return
+				}
+				h.Present(0)
+			}
+		}()
 	}
 }
 
@@ -479,6 +490,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 		// affiche le logo GTA VI Astral + barre de progression néon animée sur le backbuffer.
 		if len(draws) >= 8 {
 			h.introReached = true
+			markIntroReached()
 			ReportBootProgress(1.0)
 		} else if len(dispatches) > 0 {
 			ReportBootProgress(0.92)

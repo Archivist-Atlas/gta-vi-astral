@@ -4,7 +4,7 @@ package main
 
 func attachParentConsoleIfCLI() {}
 
-func openGameWindowEarly() {}
+func openGameWindowEarly(bool) {}
 
 func runDefaultUI() {
 	runInteractiveMenu()

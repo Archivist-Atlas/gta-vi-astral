@@ -56,6 +56,7 @@ const (
 // RuntimeConfig regroupe les paramètres d'exécution et de traduction.
 type RuntimeConfig struct {
 	Mode           LauncherMode
+	LoadingSound   bool
 	ConsoleProfile ConsoleProfile
 	GPUBackend     GPUBackend
 	Unimplemented  UnimplementedPolicy
@@ -81,6 +82,7 @@ func DefaultConfig() Config {
 		},
 		Runtime: RuntimeConfig{
 			Mode:           ModeNormal,
+			LoadingSound:   true,
 			ConsoleProfile: ConsoleSeriesX,
 			GPUBackend:     BackendAuto,
 			Unimplemented:  UnimplLog,
@@ -147,6 +149,9 @@ func LoadConfig(explicitPath string) (Config, error) {
 			cfg.Runtime.Mode = ModeNormal
 		}
 	}
+	if v := os.Getenv("ASTRAL_LOADING_SOUND"); v != "" {
+		cfg.Runtime.LoadingSound = parseBoolLoose(v, true)
+	}
 	if v := os.Getenv("ASTRAL_CONSOLE"); v != "" {
 		cfg.Runtime.ConsoleProfile = ConsoleProfile(strings.ToLower(v))
 	}
@@ -185,15 +190,51 @@ func SaveLauncherConfig(gameDir string, mode LauncherMode) (string, error) {
 	if mode != ModeDev {
 		mode = ModeNormal
 	}
+	loadingSound := true
+	if cur, err := LoadConfig(""); err == nil {
+		loadingSound = cur.Runtime.LoadingSound
+	}
+	return writeLocalConfig(gameDir, mode, loadingSound)
+}
+
+// SaveLoadingSound mémorise l'état du son de chargement (activé / coupé) dans astral.toml.
+func SaveLoadingSound(enabled bool) error {
+	cur, _ := LoadConfig("")
+	mode := cur.Runtime.Mode
+	if mode != ModeDev {
+		mode = ModeNormal
+	}
+	_, err := writeLocalConfig(cur.Paths.GameDir, mode, enabled)
+	return err
+}
+
+func writeLocalConfig(gameDir string, mode LauncherMode, loadingSound bool) (string, error) {
 	target := "astral.toml"
 	if exe, err := os.Executable(); err == nil {
 		target = filepath.Join(filepath.Dir(exe), "astral.toml")
 	}
-	content := fmt.Sprintf("# Configuration locale générée par gta-vi-astral (ignorée par Git)\n# Passez mode = 'dev' pour afficher le lanceur complet avec les outils de diagnostic.\n\n[paths]\ngame_dir = '%s'\n\n[runtime]\nmode = '%s'\n", gameDir, mode)
+	content := fmt.Sprintf(
+		"# Configuration locale générée par gta-vi-astral (ignorée par Git)\n"+
+			"# Passez mode = 'dev' pour afficher le lanceur complet avec les outils de diagnostic.\n\n"+
+			"[paths]\ngame_dir = '%s'\n\n"+
+			"[runtime]\nmode = '%s'\nloading_sound = %t\n",
+		gameDir, mode, loadingSound,
+	)
 	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
 		return "", err
 	}
 	return target, nil
+}
+
+func parseBoolLoose(s string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "1", "yes", "on", "oui":
+		return true
+	case "false", "0", "no", "off", "non":
+		return false
+	default:
+		return fallback
+	}
 }
 
 // ValidatePolicy vérifie qu'aucun chemin de données dérivées ne pointe dans le dépôt.
@@ -265,6 +306,8 @@ func parseSimpleTOML(path string, cfg *Config) error {
 				} else {
 					cfg.Runtime.Mode = ModeNormal
 				}
+			case "loading_sound":
+				cfg.Runtime.LoadingSound = parseBoolLoose(val, true)
 			case "console_profile":
 				cfg.Runtime.ConsoleProfile = ConsoleProfile(strings.ToLower(val))
 			case "gpu_backend":

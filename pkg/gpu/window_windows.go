@@ -36,6 +36,9 @@ var (
 	procIsWindowVisible     = modUser32.NewProc("IsWindowVisible")
 	procCreateIconFromResEx = modUser32.NewProc("CreateIconFromResourceEx")
 	procSendMessage         = modUser32.NewProc("SendMessageW")
+	procGetClientRect       = modUser32.NewProc("GetClientRect")
+	procLoadCursorWin       = modUser32.NewProc("LoadCursorW")
+	procSetCursorWin        = modUser32.NewProc("SetCursor")
 	procGetModuleHandle     = modKernel32Win.NewProc("GetModuleHandleW")
 	procGetCurrentProcessId = modKernel32Win.NewProc("GetCurrentProcessId")
 	procGetCurrentProcess   = modKernel32Win.NewProc("GetCurrentProcess")
@@ -111,8 +114,47 @@ func EnsureWindow(title string, width, height int) uintptr {
 			className, _ := syscall.UTF16PtrFromString("AstralGameWindowClass")
 			titlePtr, _ := syscall.UTF16PtrFromString(title)
 
+			hCurArrow, _, _ := procLoadCursorWin.Call(0, 32512 /* IDC_ARROW */)
+			hCurHand, _, _ := procLoadCursorWin.Call(0, 32649 /* IDC_HAND */)
+			clientToBackbuf := func(hwnd uintptr, lParam uintptr) (int, int) {
+				cx := int(int16(lParam & 0xFFFF))
+				cy := int(int16((lParam >> 16) & 0xFFFF))
+				var rc [4]int32
+				_, _, _ = procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc[0])))
+				cw := int(rc[2] - rc[0])
+				ch := int(rc[3] - rc[1])
+				if cw <= 0 || ch <= 0 {
+					return cx, cy
+				}
+				return cx * width / cw, cy * height / ch
+			}
+
 			wndProc := syscall.NewCallback(func(hwnd, msg, wParam, lParam uintptr) uintptr {
-				if msg == 0x0002 { // WM_DESTROY
+				switch msg {
+				case 0x0202: // WM_LBUTTONUP
+					if !IsIntroReached() {
+						bx, by := clientToBackbuf(hwnd, lParam)
+						if IsPointInAudioButton(bx, by, width, height) {
+							ToggleLoadingAudio()
+							return 0
+						}
+					}
+				case 0x0200: // WM_MOUSEMOVE
+					if !IsIntroReached() {
+						bx, by := clientToBackbuf(hwnd, lParam)
+						if IsPointInAudioButton(bx, by, width, height) && hCurHand != 0 {
+							_, _, _ = procSetCursorWin.Call(hCurHand)
+						} else if hCurArrow != 0 {
+							_, _, _ = procSetCursorWin.Call(hCurArrow)
+						}
+					}
+				case 0x0100: // WM_KEYDOWN
+					if !IsIntroReached() && wParam == 'M' {
+						ToggleLoadingAudio()
+						return 0
+					}
+				case 0x0002: // WM_DESTROY
+					StopLoadingAudio()
 					_, _, _ = procPostQuitMsg.Call(0)
 					return 0
 				}
