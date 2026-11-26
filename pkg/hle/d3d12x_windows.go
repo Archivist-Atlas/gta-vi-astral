@@ -17,15 +17,18 @@ import (
 )
 
 type guestPSO struct {
-	vsHash   [16]byte
-	psHash   [16]byte
-	csHash   [16]byte
-	hasVS    bool
-	hasPS    bool
-	hasCS    bool
-	vsCBSlot uint32
-	hostPSO  uintptr
-	compiled atomic.Bool
+	vsHash     [16]byte
+	psHash     [16]byte
+	csHash     [16]byte
+	hasVS      bool
+	hasPS      bool
+	hasCS      bool
+	vsCBSlot   uint32
+	psCBSlot   uint32
+	psSRVSlots [4]uint32
+	psSRVCount int
+	hostPSO    uintptr
+	compiled   atomic.Bool
 }
 
 type fenceWaiter struct {
@@ -94,10 +97,14 @@ type d3d12xState struct {
 	activeCSRootVA   uintptr
 	activeCSRootSize uint32
 	activeCBSlot     uint32
-	activeCBVSlots  [8]struct {
+	activePSCBSlot   uint32
+	activePSSRVSlots [4]uint32
+	activePSSRVCount int
+	activeCBVSlots   [16]struct {
 		va   uintptr
 		size uint32
 	}
+	activeSRVSlots  [16]*gpu.HostTextureUpload
 	activeSRVVA     uint64
 	activeSRVTex    *gpu.HostTextureUpload
 	frameDispatches []gpu.HostDispatchPass
@@ -600,13 +607,16 @@ func newD3D12XDevice() uintptr {
 				pass.IBData = make([]byte, cpLen)
 				copy(pass.IBData, unsafe.Slice((*byte)(osPtr(st.activeIBVA)), cpLen))
 			}
-			cbVA := st.activeRootVA
-			cbSz := st.activeRootSize
-			if st.activeCBSlot < 8 && st.activeCBVSlots[st.activeCBSlot].va >= 0x10000 {
-				cbVA = st.activeCBVSlots[st.activeCBSlot].va
-				cbSz = st.activeCBVSlots[st.activeCBSlot].size
-			}
-			if cbVA >= 0x10000 {
+			readCB := func(slot uint32) []byte {
+				cbVA := st.activeRootVA
+				cbSz := st.activeRootSize
+				if slot < 16 && st.activeCBVSlots[slot].va >= 0x10000 {
+					cbVA = st.activeCBVSlots[slot].va
+					cbSz = st.activeCBVSlots[slot].size
+				}
+				if cbVA < 0x10000 {
+					return nil
+				}
 				cbLen := cbSz
 				if cbLen < 1024 {
 					cbLen = 1024
@@ -614,11 +624,22 @@ func newD3D12XDevice() uintptr {
 				if cbLen > 16384 {
 					cbLen = 16384
 				}
-				pass.CBData = make([]byte, cbLen)
-				copy(pass.CBData, unsafe.Slice((*byte)(osPtr(cbVA)), cbLen))
+				if !isGuestReadable(cbVA, uint64(cbLen)) {
+					return nil
+				}
+				buf := make([]byte, cbLen)
+				copy(buf, unsafe.Slice((*byte)(osPtr(cbVA)), cbLen))
+				return buf
 			}
-			if st.activeSRVTex != nil {
-				tx := *st.activeSRVTex
+			pass.CBData = readCB(st.activeCBSlot)
+			if st.activePSCBSlot != st.activeCBSlot {
+				pass.PSCBData = readCB(st.activePSCBSlot)
+			}
+			cloneSRV := func(src *gpu.HostTextureUpload) *gpu.HostTextureUpload {
+				if src == nil {
+					return nil
+				}
+				tx := *src
 				if tx.GuestVA >= 0x10000 && tx.Width > 0 && tx.Height > 0 && tx.Width <= 4096 && tx.Height <= 4096 {
 					bpe, block, _ := gpu.DXGIFormatMetrics(tx.Format)
 					bw := (uint64(tx.Width) + uint64(block) - 1) / uint64(block)
@@ -631,9 +652,32 @@ func newD3D12XDevice() uintptr {
 						pix := make([]byte, sz)
 						copy(pix, unsafe.Slice((*byte)(osPtr(uintptr(tx.GuestVA))), sz))
 						tx.Pixels = pix
-						pass.SRVTex = &tx
+						return &tx
 					}
 				}
+				return nil
+			}
+			if st.activePSSRVCount > 0 {
+				for si := 0; si < st.activePSSRVCount && si < 4; si++ {
+					gSlot := st.activePSSRVSlots[si]
+					var src *gpu.HostTextureUpload
+					if gSlot < 16 {
+						src = st.activeSRVSlots[gSlot]
+					}
+					if si == 0 {
+						if src == nil {
+							src = st.activeSRVTex
+						}
+						if src != nil {
+							pass.SRVGuestVA = src.GuestVA
+							pass.SRVTex = cloneSRV(src)
+						}
+					} else if src != nil {
+						pass.ExtraSRVs[si-1] = cloneSRV(src)
+					}
+				}
+			} else if st.activeSRVTex != nil {
+				pass.SRVTex = cloneSRV(st.activeSRVTex)
 			}
 			st.frameDraws = append(st.frameDraws, pass)
 		}
@@ -835,6 +879,14 @@ func newD3D12XDevice() uintptr {
 		st.mu.Lock()
 		gp.hostPSO = hPSO
 		gp.vsCBSlot = vsOut.CBDescriptorSlot
+		gp.psCBSlot = psOut.CBDescriptorSlot
+		gp.psSRVCount = len(psOut.SRVDescriptorSlots)
+		if gp.psSRVCount > 4 {
+			gp.psSRVCount = 4
+		}
+		for i := 0; i < gp.psSRVCount; i++ {
+			gp.psSRVSlots[i] = psOut.SRVDescriptorSlots[i]
+		}
 		st.mu.Unlock()
 		slog.Info("PSO RDNA2 recompilé en ID3D12PipelineState matériel",
 			"guestPSO", fmt.Sprintf("0x%X", psoObj),
@@ -842,6 +894,8 @@ func newD3D12XDevice() uintptr {
 			"vs", fmt.Sprintf("%d/%d ins", vsOut.LoweredInsts, vsOut.TotalInsts),
 			"ps", fmt.Sprintf("%d/%d ins", psOut.LoweredInsts, psOut.TotalInsts),
 			"vsCBSlot", vsOut.CBDescriptorSlot,
+			"psCBSlot", psOut.CBDescriptorSlot,
+			"psSRVs", psOut.SRVDescriptorSlots,
 		)
 		if dumpFrame {
 			_ = os.WriteFile(fmt.Sprintf("%s\\astral_pso_%X_vs.hlsl", os.TempDir(), hPSO), []byte(vsOut.Source), 0o644)
@@ -867,6 +921,9 @@ func newD3D12XDevice() uintptr {
 				} else {
 					st.activeHostPSO = gp.hostPSO
 					st.activeCBSlot = gp.vsCBSlot
+					st.activePSCBSlot = gp.psCBSlot
+					st.activePSSRVSlots = gp.psSRVSlots
+					st.activePSSRVCount = gp.psSRVCount
 				}
 				st.mu.Unlock()
 			}
@@ -881,8 +938,11 @@ func newD3D12XDevice() uintptr {
 			foundSRV := false
 			srvSlots := 0
 			var srvSummary string
-			for s := uintptr(0); s < 8; s++ {
+			for s := uintptr(0); s < 16; s++ {
 				slotPtr := baseDesc + s*32
+				if s >= 8 && !isGuestReadable(slotPtr, 32) {
+					break
+				}
 				tag := *(*uint32)(osPtr(slotPtr))
 				switch tag {
 				case 0x43425631: // "CBV1" : { tag u32, _pad u32, BufferLocation u64 (+8), SizeInBytes u32 (+16) }
@@ -907,19 +967,21 @@ func newD3D12XDevice() uintptr {
 						if h == 0 {
 							h = 1
 						}
+						tx := &gpu.HostTextureUpload{
+							GuestVA: va,
+							Width:   w,
+							Height:  h,
+							Format:  fmtID,
+							Swizzle: swz,
+						}
+						st.activeSRVSlots[s] = tx
 						srvSlots++
 						if multiSRVLogCount.Load() < 12 {
 							srvSummary += fmt.Sprintf("[s%d:va=0x%X %dx%d f=%d d=%d swz=0x%X] ", s, va, w, h, fmtID, dim, swz)
 						}
 						if !foundSRV {
 							st.activeSRVVA = va
-							st.activeSRVTex = &gpu.HostTextureUpload{
-								GuestVA: va,
-								Width:   w,
-								Height:  h,
-								Format:  fmtID,
-								Swizzle: swz,
-							}
+							st.activeSRVTex = tx
 							foundSRV = true
 						}
 					}

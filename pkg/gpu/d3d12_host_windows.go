@@ -580,7 +580,10 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 				}
 				_ = comCall(h.CmdList, 30, h.ReplayRootSig) // SetGraphicsRootSignature
 				if h.SRVGPUStart != 0 {
-					_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart) // SetGraphicsRootDescriptorTable(param=1, t0)
+					_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart) // t0
+					_ = comCall(h.CmdList, 32, 3, h.SRVGPUStart) // t1
+					_ = comCall(h.CmdList, 32, 4, h.SRVGPUStart) // t2
+					_ = comCall(h.CmdList, 32, 5, h.SRVGPUStart) // t3
 				}
 				total := uint32(len(draws))
 				hasRealPSO := false
@@ -659,6 +662,19 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart)
 					}
 				srvBound:
+					// Liaison des SRV supplémentaires t1..t3 (params 3..5)
+					for ei := 0; ei < 3; ei++ {
+						paramIdx := uintptr(3 + ei)
+						if d.ExtraSRVs[ei] != nil {
+							if eg := h.ensureHostTexture(d.ExtraSRVs[ei]); eg != 0 {
+								_ = comCall(h.CmdList, 32, paramIdx, eg)
+								continue
+							}
+						}
+						if h.SRVGPUStart != 0 {
+							_ = comCall(h.CmdList, 32, paramIdx, h.SRVGPUStart)
+						}
+					}
 					topo := d.Topology
 					if topo == 0 || topo == 17 || topo >= 32 {
 						// Topologie par défaut ou Xbox RECTLIST -> TRIANGLELIST (4) sur PC
@@ -666,20 +682,30 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					}
 					_ = comCall(h.CmdList, 20, uintptr(topo)) // IASetPrimitiveTopology
 					_ = comCall(h.CmdList, 25, pso)           // SetPipelineState
-					// Upload Constant Buffer (16 KiB alignés sur 256 octets, slot = idxPass % 512)
+					// Upload Constant Buffers VS (b0, param 0) et PS (b1, param 2) : 16 KiB alignés chacun
 					if h.UploadCBPtr != 0 && h.UploadCBGPU != 0 {
-						cbSlot := uint64(idxPass%512) * 16384
-						dstCB := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 8<<20)[cbSlot : cbSlot+16384]
-						clear(dstCB)
+						cbAll := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadCBPtr))), 16<<20)
+						vsSlot := uint64((idxPass*2)%1024) * 16384
+						dstVS := cbAll[vsSlot : vsSlot+16384]
+						clear(dstVS)
 						if len(d.CBData) > 0 {
-							copy(dstCB, d.CBData)
+							copy(dstVS, d.CBData)
 						} else {
-							*(*uint32)(unsafe.Pointer(&dstCB[0])) = d.FrameNumber
-							*(*uint32)(unsafe.Pointer(&dstCB[4])) = d.PassIndex
-							*(*uint32)(unsafe.Pointer(&dstCB[8])) = total
+							*(*uint32)(unsafe.Pointer(&dstVS[0])) = d.FrameNumber
+							*(*uint32)(unsafe.Pointer(&dstVS[4])) = d.PassIndex
+							*(*uint32)(unsafe.Pointer(&dstVS[8])) = total
 						}
-						// ID3D12GraphicsCommandList::SetGraphicsRootConstantBufferView (slot 38)
-						_ = comCall(h.CmdList, 38, 0, uintptr(h.UploadCBGPU+cbSlot))
+						_ = comCall(h.CmdList, 38, 0, uintptr(h.UploadCBGPU+vsSlot)) // b0 (VS)
+
+						psSlot := uint64((idxPass*2+1)%1024) * 16384
+						dstPS := cbAll[psSlot : psSlot+16384]
+						clear(dstPS)
+						if len(d.PSCBData) > 0 {
+							copy(dstPS, d.PSCBData)
+						} else if len(d.CBData) > 0 {
+							copy(dstPS, d.CBData)
+						}
+						_ = comCall(h.CmdList, 38, 2, uintptr(h.UploadCBGPU+psSlot)) // b1 (PS)
 					}
 					// Expansion Xbox RECTLIST (topo=17, 3 sommets par rectangle -> 2 triangles = 6 sommets, tout stride >= 12)
 					// Détecte automatiquement le sommet d'angle droit (V0, V1 ou V2) via produit scalaire pour supporter tous les ordres Xbox.

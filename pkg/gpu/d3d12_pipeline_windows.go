@@ -55,7 +55,9 @@ type HostDrawPass struct {
 	IBData        []byte
 	IBFormat      uint32 // 57 = R16_UINT, 42 = R32_UINT
 	CBData        []byte
+	PSCBData      []byte
 	SRVTex        *HostTextureUpload
+	ExtraSRVs     [3]*HostTextureUpload
 }
 
 type hostRTEntry struct {
@@ -482,28 +484,25 @@ func (h *HostD3D12) initReplayPipeline() {
 		return
 	}
 
-	// Param 0 : Root CBV dans b0 (cbuffer RootData : register(b0) { uint4 RootConst[64]; })
-	// Param 1 : DescriptorTable 1 SRV dans t0 (Texture2D<float4> Tex0)
-	srvRange := d3d12DescriptorRange{
-		RangeType:                         0, // SRV
-		NumDescriptors:                    1,
-		BaseShaderRegister:                0,
-		RegisterSpace:                     0,
-		OffsetInDescriptorsFromTableStart: 0,
+	// Param 0 : Root CBV b0 (VS/CS), Param 1 : SRV t0, Param 2 : Root CBV b1 (PS),
+	// Params 3..5 : SRV t1..t3 (textures multi-plans YUV / UI / dither)
+	var srvRanges [4]d3d12DescriptorRange
+	for i := uint32(0); i < 4; i++ {
+		srvRanges[i] = d3d12DescriptorRange{
+			RangeType:                         0, // SRV
+			NumDescriptors:                    1,
+			BaseShaderRegister:                i,
+			RegisterSpace:                     0,
+			OffsetInDescriptorsFromTableStart: 0,
+		}
 	}
-	params := [2]d3d12RootParameter{
-		{
-			ParameterType:    2, // D3D12_ROOT_PARAMETER_TYPE_CBV
-			Union0:           0, // ShaderRegister=0, RegisterSpace=0
-			Union1:           0,
-			ShaderVisibility: 0, // ALL
-		},
-		{
-			ParameterType:    0, // DESCRIPTOR_TABLE
-			Union0:           1, // NumDescriptorRanges=1
-			Union1:           uint64(uintptr(unsafe.Pointer(&srvRange))),
-			ShaderVisibility: 0, // ALL
-		},
+	params := [6]d3d12RootParameter{
+		{ParameterType: 2 /* CBV */, Union0: 0 /* b0 */, ShaderVisibility: 0},
+		{ParameterType: 0 /* TABLE */, Union0: 1, Union1: uint64(uintptr(unsafe.Pointer(&srvRanges[0]))), ShaderVisibility: 0},
+		{ParameterType: 2 /* CBV */, Union0: 1 /* b1 */, ShaderVisibility: 0},
+		{ParameterType: 0 /* TABLE */, Union0: 1, Union1: uint64(uintptr(unsafe.Pointer(&srvRanges[1]))), ShaderVisibility: 0},
+		{ParameterType: 0 /* TABLE */, Union0: 1, Union1: uint64(uintptr(unsafe.Pointer(&srvRanges[2]))), ShaderVisibility: 0},
+		{ParameterType: 0 /* TABLE */, Union0: 1, Union1: uint64(uintptr(unsafe.Pointer(&srvRanges[3]))), ShaderVisibility: 0},
 	}
 	sampler := d3d12StaticSamplerDesc{
 		Filter:           0x15, // MIN_MAG_MIP_LINEAR
@@ -518,7 +517,7 @@ func (h *HostD3D12) initReplayPipeline() {
 		ShaderVisibility: 0, // ALL
 	}
 	rsDesc := d3d12RootSignatureDesc{
-		NumParameters:     2,
+		NumParameters:     6,
 		Parameters:        uintptr(unsafe.Pointer(&params[0])),
 		NumStaticSamplers: 1,
 		StaticSamplers:    uintptr(unsafe.Pointer(&sampler)),
@@ -608,10 +607,10 @@ float4 PSMain(VSOut i) : SV_Target {
 		return
 	}
 	h.ReplayPSO = pso
-	// Buffers dynamiques persistants UPLOAD pour VB (32 MiB), IB (16 MiB), CB (8 MiB = 512x16 KiB) et Staging Texture (32 MiB)
+	// Buffers dynamiques persistants UPLOAD pour VB (32 MiB), IB (16 MiB), CB (16 MiB = 1024x16 KiB) et Staging Texture (32 MiB)
 	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(32 << 20)
 	h.UploadIB, h.UploadIBPtr, h.UploadIBGPU = h.createUploadBuffer(16 << 20)
-	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(8 << 20)
+	h.UploadCB, h.UploadCBPtr, h.UploadCBGPU = h.createUploadBuffer(16 << 20)
 	h.UploadTex, h.UploadTexPtr, _ = h.createUploadBuffer(32 << 20)
 	h.initComputePipeline()
 	slog.Info("Host D3D12 Replay PSO matériel compilé (VS+PS+CS DXBC, RootCBV b0 + SRV t0x64 + UAV u0 + VB/IB)",

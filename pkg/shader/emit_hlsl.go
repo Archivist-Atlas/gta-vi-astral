@@ -9,16 +9,17 @@ import (
 // HLSLOutput contient le source HLSL SM 5.0 généré depuis un programme RDNA2 (GFX10)
 // ainsi que les statistiques de couverture d'instructions.
 type HLSLOutput struct {
-	Stage            HwStage
-	EntryPoint       string
-	Target           string // "vs_5_0" ou "ps_5_0"
-	Source           string
-	InputElements    []SigElement // éléments non-SV_* de ISG1 pour D3D12_INPUT_LAYOUT_DESC
-	CBDescriptorSlot uint32       // slot CBV (0..7) dans la DescriptorTable racine chargé par s_load_dwordx4
-	MissingOps       []string     // encodages/mots non encore abaissés (diagnostic)
-	TotalInsts       int
-	LoweredInsts     int
-	UnsupportedOps   int
+	Stage              HwStage
+	EntryPoint         string
+	Target             string // "vs_5_0" ou "ps_5_0"
+	Source             string
+	InputElements      []SigElement // éléments non-SV_* de ISG1 pour D3D12_INPUT_LAYOUT_DESC
+	CBDescriptorSlot   uint32       // slot CBV (0..15) dans la DescriptorTable racine chargé par s_load_dwordx4
+	SRVDescriptorSlots []uint32     // slots SRV (0..15) dans la DescriptorTable racine mappés vers Tex0..Tex3
+	MissingOps         []string     // encodages/mots non encore abaissés (diagnostic)
+	TotalInsts         int
+	LoweredInsts       int
+	UnsupportedOps     int
 }
 
 // EmitHLSL traduit un programme natif RDNA2 (GFX10) + ses signatures DXBC (ISG1/OSG1)
@@ -53,9 +54,15 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 	}
 
 	b.WriteString("// Généré par gta-vi-astral (RDNA2/GFX10 -> HLSL SM 5.0)\n")
-	b.WriteString("cbuffer RootData : register(b0) {\n")
-	b.WriteString("    uint4 RootConst[1024];\n")
-	b.WriteString("};\n")
+	if isPS {
+		b.WriteString("cbuffer RootDataPS : register(b1) {\n")
+		b.WriteString("    uint4 RootConst[1024];\n")
+		b.WriteString("};\n")
+	} else {
+		b.WriteString("cbuffer RootData : register(b0) {\n")
+		b.WriteString("    uint4 RootConst[1024];\n")
+		b.WriteString("};\n")
+	}
 	b.WriteString("uint _readCB(uint byteOff) {\n")
 	b.WriteString("    uint idx = (byteOff >> 4) & 1023u;\n")
 	b.WriteString("    uint comp = (byteOff >> 2) & 3u;\n")
@@ -64,6 +71,9 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 	b.WriteString("}\n")
 	if isPS {
 		b.WriteString("Texture2D<float4> Tex0 : register(t0);\n")
+		b.WriteString("Texture2D<float4> Tex1 : register(t1);\n")
+		b.WriteString("Texture2D<float4> Tex2 : register(t2);\n")
+		b.WriteString("Texture2D<float4> Tex3 : register(t3);\n")
 		b.WriteString("SamplerState Samp0 : register(s0);\n")
 	} else if isCS {
 		b.WriteString("RWByteAddressBuffer UAV0 : register(u0);\n")
@@ -182,31 +192,50 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 		}
 	}
 
-	// Détection du slot CBV dans la DescriptorTable racine (s_load_dwordx4 -> s_buffer_load_dword*)
+	// Détection des slots CBV (s_load_dwordx4 -> s_buffer_load_dword*) et SRV (s_load_dwordx8 -> EncMIMG)
 	descSlotByReg := map[uint32]uint32{}
+	srvSlotByReg := map[uint32]uint32{}
+	mimgTexIdx := map[uint32]int{}
+	guestSlotToTexIdx := map[uint32]int{}
 	var fallbackCBSlot uint32
 	var hasMatchedCBSlot bool
 	for _, gi := range insts {
-		if gi.Encoding != EncSMEM {
-			continue
-		}
-		op := (gi.Word0 >> 18) & 0xFF
-		sdata := (gi.Word0 >> 6) & 0x7F
-		sbase := (gi.Word0 & 0x3F) * 2
-		off := gi.Word1 & 0x1FFFFF
-		if op == 0x02 && off <= 256 && off%16 == 0 {
-			slot := off / 32
-			if off%32 != 0 {
-				slot = off / 16
+		if gi.Encoding == EncSMEM {
+			op := (gi.Word0 >> 18) & 0xFF
+			sdata := (gi.Word0 >> 6) & 0x7F
+			sbase := (gi.Word0 & 0x3F) * 2
+			off := gi.Word1 & 0x1FFFFF
+			if op == 0x02 && off <= 512 && off%16 == 0 {
+				slot := off / 32
+				if off%32 != 0 {
+					slot = off / 16
+				}
+				descSlotByReg[sdata] = slot
+				if fallbackCBSlot == 0 && slot > 0 {
+					fallbackCBSlot = slot
+				}
+			} else if op == 0x03 && off <= 512 && off%32 == 0 { // s_load_dwordx8 (T# SRV descriptor)
+				srvSlotByReg[sdata] = off / 32
+			} else if op >= 0x08 && op <= 0x0C && !hasMatchedCBSlot {
+				if slot, ok := descSlotByReg[sbase]; ok {
+					out.CBDescriptorSlot = slot
+					hasMatchedCBSlot = true
+				}
 			}
-			descSlotByReg[sdata] = slot
-			if fallbackCBSlot == 0 && slot > 0 {
-				fallbackCBSlot = slot
-			}
-		} else if op >= 0x08 && op <= 0x0C && !hasMatchedCBSlot {
-			if slot, ok := descSlotByReg[sbase]; ok {
-				out.CBDescriptorSlot = slot
-				hasMatchedCBSlot = true
+		} else if gi.Encoding == EncMIMG && isPS {
+			srsrc := ((gi.Word1 >> 16) & 0x1F) * 4
+			if gSlot, ok := srvSlotByReg[srsrc]; ok {
+				texIdx, exists := guestSlotToTexIdx[gSlot]
+				if !exists {
+					if len(out.SRVDescriptorSlots) < 4 {
+						texIdx = len(out.SRVDescriptorSlots)
+						out.SRVDescriptorSlots = append(out.SRVDescriptorSlots, gSlot)
+						guestSlotToTexIdx[gSlot] = texIdx
+					} else {
+						texIdx = 0
+					}
+				}
+				mimgTexIdx[gi.PC] = texIdx
 			}
 		}
 	}
@@ -225,7 +254,7 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 
 	if !hasBranches {
 		for _, gi := range insts {
-			emitSingleInst(&b, gi, isPS, isCS, inputs, out, "    ")
+			emitSingleInst(&b, gi, isPS, isCS, inputs, mimgTexIdx, out, "    ")
 		}
 	} else {
 		// Découpage en blocs de base par PC cible (branches SOPP + PC suivant)
@@ -297,7 +326,7 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 					terminated = true
 					break
 				}
-				emitSingleInst(&b, gi, isPS, isCS, inputs, out, "            ")
+				emitSingleInst(&b, gi, isPS, isCS, inputs, mimgTexIdx, out, "            ")
 			}
 			if !terminated {
 				if blk.nextPC == 0xFFFFFFFF {
@@ -345,7 +374,7 @@ func EmitHLSL(c *Container, prog NativeProgram) (*HLSLOutput, error) {
 	return out, nil
 }
 
-func emitSingleInst(b *strings.Builder, gi GFX10Inst, isPS, isCS bool, inputs []SigElement, out *HLSLOutput, indent string) {
+func emitSingleInst(b *strings.Builder, gi GFX10Inst, isPS, isCS bool, inputs []SigElement, mimgTexIdx map[uint32]int, out *HLSLOutput, indent string) {
 	if isSchedulingOnly(gi) || gi.IsEndPgm {
 		out.LoweredInsts++
 		return
@@ -363,7 +392,7 @@ func emitSingleInst(b *strings.Builder, gi GFX10Inst, isPS, isCS bool, inputs []
 		out.LoweredInsts++
 		return
 	}
-	if stmt, ok := lowerGFX10ToHLSL(gi, isPS, isCS, inputs); ok {
+	if stmt, ok := lowerGFX10ToHLSL(gi, isPS, isCS, inputs, mimgTexIdx[gi.PC]); ok {
 		if stmt != "" {
 			switch gi.Encoding {
 			case EncVOP1, EncVOP2, EncVOP3, EncVOPC, EncMIMG:
@@ -449,7 +478,7 @@ func gfx10SrcF32(src uint32, lit uint32, hasLit bool) string {
 	return fmt.Sprintf("asfloat(%s)", gfx10SrcU32(src, lit, hasLit))
 }
 
-func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (string, bool) {
+func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement, texIdx int) (string, bool) {
 	w0, w1 := gi.Word0, gi.Word1
 	switch gi.Encoding {
 	case EncVOP1:
@@ -916,7 +945,7 @@ func lowerGFX10ToHLSL(gi GFX10Inst, isPS, isCS bool, inputs []SigElement) (strin
 			}
 			chs := [4]byte{'x', 'y', 'z', 'w'}
 			var sb strings.Builder
-			sb.WriteString(fmt.Sprintf("{ float4 _t = Tex0.Sample(Samp0, float2(asfloat(v[%d]), asfloat(v[%d])));", vaddr, vaddr+1))
+			sb.WriteString(fmt.Sprintf("{ float4 _t = Tex%d.Sample(Samp0, float2(asfloat(v[%d]), asfloat(v[%d])));", texIdx, vaddr, vaddr+1))
 			dstReg := vdata
 			for c := uint32(0); c < 4; c++ {
 				if dmask&(1<<c) != 0 && dstReg < 64 {
