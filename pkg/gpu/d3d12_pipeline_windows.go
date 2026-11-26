@@ -610,6 +610,32 @@ float4 PSMain(VSOut i) : SV_Target {
 		return
 	}
 	h.ReplayPSO = pso
+	yuvHLSL := `
+Texture2D<float4> TexY : register(t0);
+Texture2D<float4> TexU : register(t1);
+Texture2D<float4> TexV : register(t2);
+SamplerState Samp0 : register(s0);
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut VSMain(uint id : SV_VertexID) {
+    VSOut o;
+    o.uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+float4 PSMain(VSOut i) : SV_Target {
+    float y = TexY.Sample(Samp0, i.uv).r;
+    float u = TexU.Sample(Samp0, i.uv).r - 0.5;
+    float v = TexV.Sample(Samp0, i.uv).r - 0.5;
+    float yy = (y - 16.0/255.0) * (255.0/219.0);
+    float r = saturate(yy + 1.5748 * v);
+    float g = saturate(yy - 0.1873 * u - 0.4681 * v);
+    float b = saturate(yy + 1.8556 * u);
+    return float4(r, g, b, 1.0);
+}
+`
+	if yuvPSO, yerr := h.CompileGraphicsPSO(yuvHLSL, "VSMain", yuvHLSL, "PSMain", nil); yerr == nil && yuvPSO != 0 {
+		h.YUVPSO = yuvPSO
+	}
 	// Buffers dynamiques persistants UPLOAD pour VB (32 MiB), IB (16 MiB), CB (16 MiB = 1024x16 KiB) et Staging Texture (32 MiB)
 	h.UploadVB, h.UploadVBPtr, h.UploadVBGPU = h.createUploadBuffer(32 << 20)
 	h.UploadIB, h.UploadIBPtr, h.UploadIBGPU = h.createUploadBuffer(16 << 20)

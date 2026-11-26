@@ -567,6 +567,75 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
+	var copyTexHits atomic.Uint64
+	cbListCopyTexRegion := syscall.NewCallback(func(this, pDst, dstX, dstY, dstZ, pSrc, pSrcBox uintptr) uintptr {
+		listSlotHits[16].Add(1)
+		n := copyTexHits.Add(1)
+		if pDst < 0x10000 || pSrc < 0x10000 {
+			return 0
+		}
+		dstRes := *(*uintptr)(osPtr(pDst))
+		dstType := *(*uint32)(osPtr(pDst + 8))
+		srcRes := *(*uintptr)(osPtr(pSrc))
+		srcType := *(*uint32)(osPtr(pSrc + 8))
+		st.mu.Lock()
+		dstVA := st.resGPUAddrs[dstRes]
+		dstDesc := st.resDescs[dstRes]
+		srcVA := st.resGPUAddrs[srcRes]
+		srcDesc := st.resDescs[srcRes]
+		st.mu.Unlock()
+		if n <= 8 {
+			slog.Info("ID3D12GraphicsCommandListX!CopyTextureRegion",
+				"n", n, "dstType", dstType, "srcType", srcType,
+				"dstVA", fmt.Sprintf("0x%X", dstVA), "dstW", dstDesc.Width, "dstH", dstDesc.Height, "dstFmt", dstDesc.Format,
+				"dstX", uint32(dstX), "dstY", uint32(dstY),
+				"srcVA", fmt.Sprintf("0x%X", srcVA))
+		}
+		if dstVA < 0x10000 || srcVA < 0x10000 {
+			return 0
+		}
+		// Copie PLACED_FOOTPRINT (Type=1) -> SUBRESOURCE_INDEX (Type=0) pour textures linéaires (ex: atlas glyphes Scaleform)
+		if dstType == 0 && srcType == 1 && dstDesc.Width > 0 && dstDesc.Height > 0 {
+			srcOff := *(*uint64)(osPtr(pSrc + 16))
+			fpFmt := *(*uint32)(osPtr(pSrc + 24))
+			fpW := *(*uint32)(osPtr(pSrc + 28))
+			fpH := *(*uint32)(osPtr(pSrc + 32))
+			fpPitch := *(*uint32)(osPtr(pSrc + 40))
+			if fpFmt == 0 {
+				fpFmt = dstDesc.Format
+			}
+			bpe, block, _ := gpu.DXGIFormatMetrics(fpFmt)
+			if block == 1 && bpe > 0 && fpW > 0 && fpH > 0 && fpPitch > 0 {
+				srcX0, srcY0 := uint32(0), uint32(0)
+				cpW, cpH := fpW, fpH
+				if pSrcBox >= 0x10000 {
+					left := *(*uint32)(osPtr(pSrcBox + 0))
+					top := *(*uint32)(osPtr(pSrcBox + 4))
+					right := *(*uint32)(osPtr(pSrcBox + 12))
+					bottom := *(*uint32)(osPtr(pSrcBox + 16))
+					if right > left && bottom > top {
+						srcX0, srcY0 = left, top
+						cpW, cpH = right-left, bottom-top
+					}
+				}
+				dstPitch := uint32(dstDesc.Width) * bpe
+				rowBytes := cpW * bpe
+				for row := uint32(0); row < cpH; row++ {
+					dy := uint32(dstY) + row
+					if dy >= dstDesc.Height {
+						break
+					}
+					sAddr := uintptr(srcVA+srcOff) + uintptr(srcY0+row)*uintptr(fpPitch) + uintptr(srcX0*bpe)
+					dAddr := uintptr(dstVA) + uintptr(dy)*uintptr(dstPitch) + uintptr(uint32(dstX)*bpe)
+					if isGuestReadable(sAddr, uint64(rowBytes)) && isGuestReadable(dAddr, uint64(rowBytes)) {
+						copy(unsafe.Slice((*byte)(osPtr(dAddr)), rowBytes), unsafe.Slice((*byte)(osPtr(sAddr)), rowBytes))
+					}
+				}
+			}
+		}
+		_ = srcDesc
+		return 0
+	})
 	cbListAllocUpload := syscall.NewCallback(func(this, size, align uintptr) uintptr {
 		if size == 0 || size > (256<<20) {
 			return 0
@@ -1189,6 +1258,7 @@ func newD3D12XDevice() uintptr {
 	cmdListSlots[12] = cbListDrawInst            // DrawInstanced
 	cmdListSlots[13] = cbListDrawIdx             // DrawIndexedInstanced
 	cmdListSlots[14] = cbListDispatch            // Dispatch
+	cmdListSlots[16] = cbListCopyTexRegion       // CopyTextureRegion
 	cmdListSlots[20] = cbListSetTopo             // IASetPrimitiveTopology
 	cmdListSlots[25] = cbListSetPSO              // SetPipelineState
 	cmdListSlots[35] = cbListSetComputeRootTable // SetComputeRootDescriptorTable (Xbox #35 = PC #31)

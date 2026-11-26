@@ -121,6 +121,7 @@ type HostD3D12 struct {
 	texUploadOff   uint64
 	ReplayRootSig  uintptr
 	ReplayPSO      uintptr
+	YUVPSO         uintptr
 	ComputeRootSig uintptr
 	ComputeUAVBuf  uintptr
 	ComputeUAVGPU  uint64
@@ -743,7 +744,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 							// Si ce draw est le composite plein écran (3 sommets) vers le backbuffer hôte,
 							// copier directement srcRT -> bb par CopyResource (évite la matrice de projection
 							// manquante du 2e CBV dans le VS composite 45/45 ins -> zéro écran noir !).
-							if curTargetVA == 0 && !d.Indexed && d.VertexCount <= 6 {
+							if curTargetVA == 0 && !d.Indexed && d.VertexCount == 3 {
 								if srcRT.state != 0x800 {
 									brSrc := d3d12ResourceBarrier{Resource: srcRT.res, Subresource: 0xFFFFFFFF, StateBefore: srcRT.state, StateAfter: 0x800 /* COPY_SOURCE */}
 									_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&brSrc)))
@@ -787,6 +788,17 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						if h.SRVGPUStart != 0 {
 							_ = comCall(h.CmdList, 32, paramIdx, h.SRVGPUStart)
 						}
+					}
+					// Passe vidéo Bink2 4K YUV420p (Y=t0 3840x2160, U=t1 1920x1080, V=t2 1920x1080 en R8_UNORM) :
+					// utiliser notre PSO BT.709 matériel dédié pour garantir un décodage couleur complet sans
+					// dépendre des 3 opcodes manquants du shader invité 73/76.
+					if h.YUVPSO != 0 && d.SRVTex != nil && d.ExtraSRVs[0] != nil && d.ExtraSRVs[1] != nil &&
+						d.SRVTex.Format == 61 && d.SRVTex.Width >= 1920 &&
+						d.ExtraSRVs[0].Width == d.SRVTex.Width/2 && d.ExtraSRVs[1].Width == d.SRVTex.Width/2 {
+						_ = comCall(h.CmdList, 20, 4)        // TRIANGLELIST
+						_ = comCall(h.CmdList, 25, h.YUVPSO) // SetPipelineState(YUVPSO)
+						_ = comCall(h.CmdList, 12, 3, 1, 0, 0)
+						continue
 					}
 					topo := d.Topology
 					if topo == 0 || topo == 17 || topo >= 32 {
