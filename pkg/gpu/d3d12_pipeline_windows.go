@@ -51,8 +51,9 @@ type HostDrawPass struct {
 	FrameNumber   uint32
 	HostPSO       uintptr
 	TargetVA      uint64 // Adresse GPU invitée du RenderTarget (0 ou presentVA = backbuffer)
-	SRVGuestVA    uint64 // Adresse GPU invitée du SRV t0 (pour liaison directe RenderTarget -> SRV)
-	VBData        []byte
+	SRVGuestVA       uint64 // Adresse GPU invitée du SRV t0 (pour liaison directe RenderTarget -> SRV)
+	ExtraSRVGuestVAs [3]uint64
+	VBData           []byte
 	VBStride      uint32
 	IBData        []byte
 	IBFormat      uint32 // 57 = R16_UINT, 42 = R32_UINT

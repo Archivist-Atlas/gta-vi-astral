@@ -872,6 +872,7 @@ func newD3D12XDevice() uintptr {
 							pass.SRVTex = cloneSRV(src)
 						}
 					} else if src != nil {
+						pass.ExtraSRVGuestVAs[si-1] = src.GuestVA
 						pass.ExtraSRVs[si-1] = cloneSRV(src)
 					}
 				}

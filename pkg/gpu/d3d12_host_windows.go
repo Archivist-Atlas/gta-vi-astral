@@ -799,9 +799,20 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						_ = comCall(h.CmdList, 32, 1, h.SRVGPUStart)
 					}
 				srvBound:
-					// Liaison des SRV supplémentaires t1..t3 (params 3..5)
+					// Liaison des SRV supplémentaires t1..t3 (params 3..5) — priorité aux RenderTargets offscreen (ex: masque scroll Scaleform)
 					for ei := 0; ei < 3; ei++ {
 						paramIdx := uintptr(3 + ei)
+						if va := d.ExtraSRVGuestVAs[ei]; va != 0 && va != curTargetVA {
+							if srcRT, ok := h.RTCache[va]; ok && srcRT != nil {
+								if srcRT.state != 0xC0 {
+									br := d3d12ResourceBarrier{Resource: srcRT.res, Subresource: 0xFFFFFFFF, StateBefore: srcRT.state, StateAfter: 0xC0}
+									_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&br)))
+									srcRT.state = 0xC0
+								}
+								_ = comCall(h.CmdList, 32, paramIdx, srcRT.srvGPU)
+								continue
+							}
+						}
 						if d.ExtraSRVs[ei] != nil {
 							if eg := h.ensureHostTexture(d.ExtraSRVs[ei]); eg != 0 {
 								_ = comCall(h.CmdList, 32, paramIdx, eg)
