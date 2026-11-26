@@ -624,8 +624,9 @@ VSOut VSMain(uint id : SV_VertexID) {
 }
 float4 PSMain(VSOut i) : SV_Target {
     float y = TexY.Sample(Samp0, i.uv).r;
-    float u = TexU.Sample(Samp0, i.uv).r - 0.5;
-    float v = TexV.Sample(Samp0, i.uv).r - 0.5;
+    // Bink2 (psSRVs=[2,1,3,4]) : t0=Y, t1=Cr(V), t2=Cb(U)
+    float v = TexU.Sample(Samp0, i.uv).r - 0.5;
+    float u = TexV.Sample(Samp0, i.uv).r - 0.5;
     float yy = (y - 16.0/255.0) * (255.0/219.0);
     float r = saturate(yy + 1.5748 * v);
     float g = saturate(yy - 0.1873 * u - 0.4681 * v);

@@ -738,7 +738,11 @@ func newD3D12XDevice() uintptr {
 					bpe, block, _ := gpu.DXGIFormatMetrics(tx.Format)
 					bw := (uint64(tx.Width) + uint64(block) - 1) / uint64(block)
 					bh := (uint64(tx.Height) + uint64(block) - 1) / uint64(block)
-					sz := bw * bh * uint64(bpe)
+					rowBytes := bw * uint64(bpe)
+					if tx.Swizzle&0xFF == 0 && bh > 1 {
+						rowBytes = (rowBytes + 255) &^ 255
+					}
+					sz := rowBytes * bh
 					if sz < 4096 && tx.Swizzle&0xFF != 0 {
 						sz = 4096
 					}

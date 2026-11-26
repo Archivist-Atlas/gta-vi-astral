@@ -172,6 +172,15 @@ func DetileRDNA2(src []byte, width, height, bpe, block, swizzle uint32) []byte {
 
 	kind, blockLog2, tiled := rdna2SwizzleInfo(swizzle)
 	if !tiled {
+		alignedRow := (linearRow + 255) &^ 255
+		if bh > 1 && alignedRow > linearRow && uint64(len(src)) >= uint64(alignedRow)*uint64(bh) {
+			for y := uint32(0); y < bh; y++ {
+				sOff := uint64(y) * uint64(alignedRow)
+				dOff := uint64(y) * uint64(linearRow)
+				copy(dst[dOff:dOff+uint64(linearRow)], src[sOff:sOff+uint64(linearRow)])
+			}
+			return dst
+		}
 		copy(dst, src)
 		return dst
 	}
