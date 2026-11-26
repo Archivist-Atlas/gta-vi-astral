@@ -817,19 +817,6 @@ func (h *HostD3D12) ensureHostTexture(tx *HostTextureUpload) uintptr {
 		uploaded: true,
 	}
 	slog.Info("Host D3D12 Texture2D SRV créée et uploadée", "va", fmt.Sprintf("0x%X", tx.GuestVA), "w", tx.Width, "h", tx.Height, "guestFmt", tx.Format, "fmt", fmtID, "swz", fmt.Sprintf("0x%X", tx.Swizzle), "slot", slot)
-	if fmtID == 56 && len(tx.Pixels) >= 32 {
-		lin := DetileRDNA2(tx.Pixels, tx.Width, tx.Height, bpe, block, tx.Swizzle)
-		var rawS, linS string
-		for i := 0; i < 16 && i*2+1 < len(tx.Pixels); i++ {
-			v := uint16(tx.Pixels[i*2]) | uint16(tx.Pixels[i*2+1])<<8
-			rawS += fmt.Sprintf("%04X ", v)
-		}
-		for i := 0; i < 16 && i*2+1 < len(lin); i++ {
-			v := uint16(lin[i*2]) | uint16(lin[i*2+1])<<8
-			linS += fmt.Sprintf("%04X ", v)
-		}
-		slog.Info("Diagnostic R16_UNORM pixels", "va", fmt.Sprintf("0x%X", tx.GuestVA), "raw16", rawS, "detiled16", linS)
-	}
 	return gpuHandle
 }
 

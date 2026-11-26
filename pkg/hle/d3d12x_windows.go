@@ -55,17 +55,25 @@ func isGuestReadable(addr uintptr, sz uint64) bool {
 	if addr < 0x10000 || addr >= 0x800000000000 || sz == 0 {
 		return false
 	}
-	var mbi winMemBasicInfo
-	r, _, _ := k32VirtualQuery.Call(addr, uintptr(unsafe.Pointer(&mbi)), unsafe.Sizeof(mbi))
-	if r == 0 || mbi.State != 0x1000 /* MEM_COMMIT */ {
-		return false
+	targetEnd := addr + uintptr(sz)
+	cur := addr
+	for steps := 0; cur < targetEnd && steps < 512; steps++ {
+		var mbi winMemBasicInfo
+		r, _, _ := k32VirtualQuery.Call(cur, uintptr(unsafe.Pointer(&mbi)), unsafe.Sizeof(mbi))
+		if r == 0 || mbi.State != 0x1000 /* MEM_COMMIT */ {
+			return false
+		}
+		prot := mbi.Protect & 0xFF
+		if prot == 0x01 /* NOACCESS */ || mbi.Protect&0x100 /* PAGE_GUARD */ != 0 {
+			return false
+		}
+		end := mbi.BaseAddress + mbi.RegionSize
+		if end <= cur {
+			return false
+		}
+		cur = end
 	}
-	prot := mbi.Protect & 0xFF
-	if prot == 0x01 /* NOACCESS */ || mbi.Protect&0x100 /* PAGE_GUARD */ != 0 {
-		return false
-	}
-	end := mbi.BaseAddress + mbi.RegionSize
-	return addr+uintptr(sz) <= end
+	return cur >= targetEnd
 }
 
 // d3d12xState centralise les objets COM Xbox Series D3D12.X créés pendant le boot.
@@ -930,14 +938,12 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
-	var multiSRVLogCount atomic.Uint32
 	cbListSetRootTable := syscall.NewCallback(func(this, rootIdx, baseDesc uintptr) uintptr {
 		listSlotHits[36].Add(1)
 		if baseDesc >= 0x10000 && baseDesc < 0x800000000000 {
 			st.mu.Lock()
 			foundSRV := false
-			srvSlots := 0
-			var srvSummary string
+			var newSRVs [16]*gpu.HostTextureUpload
 			for s := uintptr(0); s < 16; s++ {
 				slotPtr := baseDesc + s*32
 				if s >= 8 && !isGuestReadable(slotPtr, 32) {
@@ -974,11 +980,7 @@ func newD3D12XDevice() uintptr {
 							Format:  fmtID,
 							Swizzle: swz,
 						}
-						st.activeSRVSlots[s] = tx
-						srvSlots++
-						if multiSRVLogCount.Load() < 12 {
-							srvSummary += fmt.Sprintf("[s%d:va=0x%X %dx%d f=%d d=%d swz=0x%X] ", s, va, w, h, fmtID, dim, swz)
-						}
+						newSRVs[s] = tx
 						if !foundSRV {
 							st.activeSRVVA = va
 							st.activeSRVTex = tx
@@ -987,10 +989,10 @@ func newD3D12XDevice() uintptr {
 					}
 				}
 			}
-			st.mu.Unlock()
-			if srvSlots > 1 && multiSRVLogCount.Add(1) <= 12 {
-				slog.Info("RootTable multi-SRV détectée", "rootIdx", uint32(rootIdx), "count", srvSlots, "slots", srvSummary)
+			if foundSRV {
+				st.activeSRVSlots = newSRVs
 			}
+			st.mu.Unlock()
 		}
 		return 0
 	})

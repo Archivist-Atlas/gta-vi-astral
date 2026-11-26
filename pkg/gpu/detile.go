@@ -4,6 +4,14 @@ package gpu
 // pour les formats textures Xbox Series / PC courants.
 func DXGIFormatMetrics(dxgiFmt uint32) (bpe uint32, block uint32, hostFmt uint32) {
 	switch dxgiFmt {
+	case 1, 2, 3, 4: // R32G32B32A32_* (dégradés UI Scaleform 256x1 RGBA32F)
+		return 16, 1, 2 // DXGI_FORMAT_R32G32B32A32_FLOAT
+	case 15, 16, 17, 18: // R32G32_*
+		return 8, 1, 16 // DXGI_FORMAT_R32G32_FLOAT
+	case 33, 34, 35, 36, 37, 38: // R16G16_*
+		return 4, 1, 34 // DXGI_FORMAT_R16G16_FLOAT
+	case 39, 40, 41, 42, 43: // R32_* / D32_FLOAT
+		return 4, 1, 41 // DXGI_FORMAT_R32_FLOAT
 	case 60, 61, 62, 63, 64, 65: // R8_* / A8
 		return 1, 1, 61 // DXGI_FORMAT_R8_UNORM
 	case 48, 49, 50, 51, 52: // R8G8_*
