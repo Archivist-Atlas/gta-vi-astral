@@ -461,11 +461,138 @@ func bindXG(t *LiveTable) {
 		return hresultOK
 	})
 
+	// Slot 3 (0x18): GetResourceSizeBytes(this) -> uint64
+	cbGetSize := syscall.NewCallback(func(this uintptr) uintptr {
+		mu.Lock()
+		st := computers[this]
+		mu.Unlock()
+		if st == nil {
+			return 0
+		}
+		return uintptr(st.totalSize)
+	})
+
+	// Slot 4 (0x20): GetResourceBaseAlignmentBytes(this) -> uint64
+	cbGetAlign := syscall.NewCallback(func(this uintptr) uintptr {
+		mu.Lock()
+		st := computers[this]
+		mu.Unlock()
+		if st == nil {
+			return 4096
+		}
+		return uintptr(st.alignment)
+	})
+
+	// Slot 5 (0x28): GetMipLevelOffsetBytes(this, plane, mip) -> uint64
+	cbGetMipOffset := syscall.NewCallback(func(this, plane, mip uintptr) uintptr {
+		mu.Lock()
+		st := computers[this]
+		mu.Unlock()
+		if st == nil || len(st.mips) == 0 {
+			return 0
+		}
+		idx := int(uint32(mip))
+		if idx < 0 || idx >= len(st.mips) {
+			idx = len(st.mips) - 1
+		}
+		return uintptr(st.mips[idx].Offset)
+	})
+
+	// Slot 6 (0x30): GetTexelElementOffsetBytes(this, plane, mip, x, y, slice, sample, outBitOff*) -> uint64
+	cbGetTexelOffset := syscall.NewCallback(func(this, plane, mip, x, y, slice, sample, outBitOff uintptr) uintptr {
+		if outBitOff >= 0x10000 {
+			*(*uint32)(osPtr(outBitOff)) = 0
+		}
+		mu.Lock()
+		st := computers[this]
+		mu.Unlock()
+		if st == nil || len(st.mips) == 0 {
+			return 0
+		}
+		idx := int(uint32(mip))
+		if idx < 0 || idx >= len(st.mips) {
+			idx = len(st.mips) - 1
+		}
+		m := st.mips[idx]
+		blk := uint64(st.blockSize)
+		if blk == 0 {
+			blk = 1
+		}
+		bpe := uint64(st.bpe)
+		if bpe == 0 {
+			bpe = 1
+		}
+		bw := (uint64(m.Width) + blk - 1) / blk
+		bh := (uint64(m.Height) + blk - 1) / blk
+		bx := uint64(uint32(x)) / blk
+		by := uint64(uint32(y)) / blk
+		if bw > 0 && bx >= bw {
+			bx = bw - 1
+		}
+		if bh > 0 && by >= bh {
+			by = bh - 1
+		}
+		sl := uint64(uint32(slice))
+		off := m.Offset + sl*m.SliceSize + by*uint64(m.PitchBytes) + bx*bpe
+		if st.totalSize >= bpe && off > st.totalSize-bpe {
+			off = st.totalSize - bpe
+		}
+		return uintptr(off)
+	})
+
+	// Slot 7 (0x38): GetTexelCoordinate(this, offsetBytes, plane, mip, outX*, outY*, outSlice*, outSample*) -> HRESULT
+	cbGetTexelCoord := syscall.NewCallback(func(this, offsetBytes, plane, mip, outX, outY, outSlice, outSample uintptr) uintptr {
+		mu.Lock()
+		st := computers[this]
+		mu.Unlock()
+		var rx, ry, rsl uint32
+		if st != nil && len(st.mips) > 0 {
+			idx := int(uint32(mip))
+			if idx < 0 || idx >= len(st.mips) {
+				idx = len(st.mips) - 1
+			}
+			m := st.mips[idx]
+			off := uint64(offsetBytes)
+			if off >= m.Offset {
+				rel := off - m.Offset
+				if m.SliceSize > 0 {
+					rsl = uint32(rel / m.SliceSize)
+					rel %= m.SliceSize
+				}
+				if m.PitchBytes > 0 {
+					ry = uint32(rel/uint64(m.PitchBytes)) * st.blockSize
+					rem := rel % uint64(m.PitchBytes)
+					if st.bpe > 0 {
+						rx = uint32(rem/uint64(st.bpe)) * st.blockSize
+					}
+				}
+			}
+		}
+		if outX >= 0x10000 {
+			*(*uint32)(osPtr(outX)) = rx
+		}
+		if outY >= 0x10000 {
+			*(*uint32)(osPtr(outY)) = ry
+		}
+		if outSlice >= 0x10000 {
+			*(*uint32)(osPtr(outSlice)) = rsl
+		}
+		if outSample >= 0x10000 {
+			*(*uint32)(osPtr(outSample)) = 0
+		}
+		return hresultOK
+	})
+
 	// Vtable partagée pour tous les IXGTextureAddressComputer
 	proto := NewCOMObject("IXGTextureAddressComputer", 16, map[int]uintptr{
 		0:  cbAddRef,
 		1:  cbRelease,
 		2:  cbGetLayout,
+		3:  cbGetSize,
+		4:  cbGetAlign,
+		5:  cbGetMipOffset,
+		6:  cbGetTexelOffset,
+		7:  cbGetTexelCoord,
 		8:  cbCopyInto,
 		9:  cbCopyFrom,
 		10: cbTiling,
