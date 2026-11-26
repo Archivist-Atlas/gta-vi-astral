@@ -740,6 +740,23 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					// 2. Liaison du SRV t0 : priorité au RenderTarget offscreen hôte si SRVGuestVA correspond !
 					if d.SRVGuestVA != 0 && d.SRVGuestVA != curTargetVA {
 						if srcRT, ok := h.RTCache[d.SRVGuestVA]; ok && srcRT != nil {
+							// Si ce draw est le composite plein écran (3 sommets) vers le backbuffer hôte,
+							// copier directement srcRT -> bb par CopyResource (évite la matrice de projection
+							// manquante du 2e CBV dans le VS composite 45/45 ins -> zéro écran noir !).
+							if curTargetVA == 0 && !d.Indexed && d.VertexCount <= 6 {
+								if srcRT.state != 0x800 {
+									brSrc := d3d12ResourceBarrier{Resource: srcRT.res, Subresource: 0xFFFFFFFF, StateBefore: srcRT.state, StateAfter: 0x800 /* COPY_SOURCE */}
+									_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&brSrc)))
+									srcRT.state = 0x800
+								}
+								brDst1 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x4 /* RENDER_TARGET */, StateAfter: 0x400 /* COPY_DEST */}
+								_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&brDst1)))
+								// ID3D12GraphicsCommandList::CopyResource (slot 17)
+								_ = comCall(h.CmdList, 17, bb, srcRT.res)
+								brDst2 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x400 /* COPY_DEST */, StateAfter: 0x4 /* RENDER_TARGET */}
+								_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&brDst2)))
+								continue
+							}
 							if srcRT.state != 0xC0 {
 								br := d3d12ResourceBarrier{Resource: srcRT.res, Subresource: 0xFFFFFFFF, StateBefore: srcRT.state, StateAfter: 0xC0 /* NON_PIXEL | PIXEL_SHADER_RESOURCE */}
 								_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&br)))
