@@ -738,12 +738,7 @@ func newD3D12XDevice() uintptr {
 					bpe, block, _ := gpu.DXGIFormatMetrics(tx.Format)
 					bw := (uint64(tx.Width) + uint64(block) - 1) / uint64(block)
 					bh := (uint64(tx.Height) + uint64(block) - 1) / uint64(block)
-					rowBytes := bw * uint64(bpe)
-					if tx.Swizzle&0xFF == 0 && bh > 1 {
-						// Les textures linéaires Xbox (xg_xs.dll) alignent PitchBytes sur 256 octets (ex: 1920 -> 2048).
-						rowBytes = (rowBytes + 255) &^ 255
-					}
-					sz := rowBytes * bh
+					sz := bw * bh * uint64(bpe)
 					if sz < 4096 && tx.Swizzle&0xFF != 0 {
 						sz = 4096
 					}

@@ -732,13 +732,9 @@ func (h *HostD3D12) uploadTexturePixels(res uintptr, tx *HostTextureUpload, fmtI
 	if len(linear) == 0 {
 		return false
 	}
-	inRowPitch := srcRow
-	if tx.Swizzle&0xFF == 0 && bh > 1 && uint64(len(linear)) >= uint64(rowPitch)*uint64(bh) {
-		inRowPitch = rowPitch
-	}
 	dstSlice := unsafe.Slice((*byte)(*(*unsafe.Pointer)(unsafe.Pointer(&h.UploadTexPtr))), stagingCap)[off : off+needBytes]
 	for y := uint32(0); y < bh; y++ {
-		sOff := uintptr(y) * uintptr(inRowPitch)
+		sOff := uintptr(y) * uintptr(srcRow)
 		dOff := uintptr(y) * uintptr(rowPitch)
 		if sOff+uintptr(srcRow) <= uintptr(len(linear)) && dOff+uintptr(srcRow) <= uintptr(len(dstSlice)) {
 			copy(dstSlice[dOff:dOff+uintptr(srcRow)], linear[sOff:sOff+uintptr(srcRow)])
