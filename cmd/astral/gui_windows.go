@@ -234,7 +234,9 @@ func openGameWindowEarly(loadingSound bool) {
 func launchDirectGame(gameDir string) {
 	if lf, lerr := os.Create(filepath.Join(os.TempDir(), "astral_last.log")); lerr == nil {
 		defer lf.Close()
-		core.InitLogger(io.MultiWriter(os.Stderr, lf))
+		// En mode windowsgui, os.Stderr n'est pas attaché à une console : écrire directement dans lf
+		// (io.MultiWriter(os.Stderr, lf) échouerait sur os.Stderr avant d'écrire dans lf).
+		core.InitLogger(lf)
 	} else {
 		core.InitLogger(os.Stderr)
 	}

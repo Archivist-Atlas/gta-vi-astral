@@ -128,6 +128,12 @@ type d3d12xState struct {
 	psos            map[uintptr]*guestPSO
 	dxbcBlobs       map[[16]byte][]byte
 	lists           map[uintptr]*cmdListState
+	lastHostPSO     uintptr
+	lastCBSlot      uint32
+	lastPSCBSlot    uint32
+	lastPSSRVSlots  [4]uint32
+	lastPSSRVCount  int
+	lastRTVVA       uint64
 	frameDispatches []gpu.HostDispatchPass
 	frameDraws      []gpu.HostDrawPass
 	frameTexCache   map[uint64]*gpu.HostTextureUpload
@@ -613,6 +619,22 @@ func newD3D12XDevice() uintptr {
 	recordDrawPass := func(this uintptr, indexed bool, count, instCount, startLoc uint32, baseVtx int32, startInst uint32) {
 		st.mu.Lock()
 		cl := st.getList(this)
+		effPSO := cl.hostPSO
+		effCBSlot := cl.cbSlot
+		effPSCBSlot := cl.psCBSlot
+		effPSSRVSlots := cl.psSRVSlots
+		effPSSRVCount := cl.psSRVCount
+		if effPSO == 0 && st.lastHostPSO != 0 {
+			effPSO = st.lastHostPSO
+			effCBSlot = st.lastCBSlot
+			effPSCBSlot = st.lastPSCBSlot
+			effPSSRVSlots = st.lastPSSRVSlots
+			effPSSRVCount = st.lastPSSRVCount
+		}
+		effRTVVA := cl.rtvVA
+		if effRTVVA == 0 && st.lastRTVVA != 0 {
+			effRTVVA = st.lastRTVVA
+		}
 		if len(st.frameDraws) < 512 {
 			pass := gpu.HostDrawPass{
 				Indexed:       indexed,
@@ -622,8 +644,8 @@ func newD3D12XDevice() uintptr {
 				StartVertex:   startLoc,
 				BaseVertex:    baseVtx,
 				StartInstance: startInst,
-				HostPSO:       cl.hostPSO,
-				TargetVA:      cl.rtvVA,
+				HostPSO:       effPSO,
+				TargetVA:      effRTVVA,
 				SRVGuestVA:    cl.srvVA,
 				VBStride:      cl.vbStride,
 				IBFormat:      cl.ibFormat,
@@ -669,9 +691,9 @@ func newD3D12XDevice() uintptr {
 				copy(buf, unsafe.Slice((*byte)(osPtr(cbVA)), avail))
 				return buf
 			}
-			pass.CBData = readCB(cl.cbSlot)
-			if cl.psCBSlot != cl.cbSlot {
-				pass.PSCBData = readCB(cl.psCBSlot)
+			pass.CBData = readCB(effCBSlot)
+			if effPSCBSlot != effCBSlot {
+				pass.PSCBData = readCB(effPSCBSlot)
 			}
 			cloneSRV := func(src *gpu.HostTextureUpload) *gpu.HostTextureUpload {
 				if src == nil || st.rtvSeenVAs[src.GuestVA] {
@@ -699,9 +721,9 @@ func newD3D12XDevice() uintptr {
 				}
 				return nil
 			}
-			if cl.psSRVCount > 0 {
-				for si := 0; si < cl.psSRVCount && si < 4; si++ {
-					gSlot := cl.psSRVSlots[si]
+			if effPSSRVCount > 0 {
+				for si := 0; si < effPSSRVCount && si < 4; si++ {
+					gSlot := effPSSRVSlots[si]
 					var src *gpu.HostTextureUpload
 					if gSlot < 16 {
 						src = cl.srvSlots[gSlot]
@@ -948,30 +970,49 @@ func newD3D12XDevice() uintptr {
 			slog.Info("GPU_TRACE PSO missing ops", "guestPSO", fmt.Sprintf("0x%X", psoObj), "vsMissing", vsOut.MissingOps, "psMissing", psOut.MissingOps)
 		}
 	}
-	cbListSetPSO := syscall.NewCallback(func(this, pso uintptr) uintptr {
-		listSlotHits[25].Add(1)
-		if pso != 0 {
-			st.mu.Lock()
-			gp := st.psos[pso]
-			st.mu.Unlock()
-			if gp != nil {
-				if gp.compiled.CompareAndSwap(false, true) {
-					compileGuestPSO(pso, gp)
-				}
-				st.mu.Lock()
-				cl := st.getList(this)
-				if gp.hasCS && !gp.hasVS {
-					cl.hostCSPSO = gp.hostPSO
-				} else {
-					cl.hostPSO = gp.hostPSO
-					cl.cbSlot = gp.vsCBSlot
-					cl.psCBSlot = gp.psCBSlot
-					cl.psSRVSlots = gp.psSRVSlots
-					cl.psSRVCount = gp.psSRVCount
-				}
-				st.mu.Unlock()
+	applyPSOToList := func(this, pso uintptr) {
+		if pso == 0 {
+			return
+		}
+		st.mu.Lock()
+		gp := st.psos[pso]
+		st.mu.Unlock()
+		if gp == nil {
+			return
+		}
+		if gp.compiled.CompareAndSwap(false, true) {
+			compileGuestPSO(pso, gp)
+		}
+		st.mu.Lock()
+		cl := st.getList(this)
+		if gp.hasCS && !gp.hasVS {
+			cl.hostCSPSO = gp.hostPSO
+		} else {
+			cl.hostPSO = gp.hostPSO
+			cl.cbSlot = gp.vsCBSlot
+			cl.psCBSlot = gp.psCBSlot
+			cl.psSRVSlots = gp.psSRVSlots
+			cl.psSRVCount = gp.psSRVCount
+			if gp.hostPSO != 0 {
+				st.lastHostPSO = gp.hostPSO
+				st.lastCBSlot = gp.vsCBSlot
+				st.lastPSCBSlot = gp.psCBSlot
+				st.lastPSSRVSlots = gp.psSRVSlots
+				st.lastPSSRVCount = gp.psSRVCount
 			}
 		}
+		st.mu.Unlock()
+	}
+	cbListReset := syscall.NewCallback(func(this, alloc, initPSO uintptr) uintptr {
+		listSlotHits[10].Add(1)
+		if initPSO != 0 {
+			applyPSOToList(this, initPSO)
+		}
+		return hresultOK
+	})
+	cbListSetPSO := syscall.NewCallback(func(this, pso uintptr) uintptr {
+		listSlotHits[25].Add(1)
+		applyPSOToList(this, pso)
 		return 0
 	})
 	cbListSetRootTable := syscall.NewCallback(func(this, rootIdx, baseDesc uintptr) uintptr {
@@ -1125,6 +1166,7 @@ func newD3D12XDevice() uintptr {
 			cl.rtvVA = rtvVA
 			if rtvVA != 0 {
 				st.rtvSeenVAs[rtvVA] = true
+				st.lastRTVVA = rtvVA
 			}
 			st.mu.Unlock()
 			return 0
@@ -1199,6 +1241,7 @@ func newD3D12XDevice() uintptr {
 		}
 		return 0
 	})
+	cmdListSlots[10] = cbListReset               // Reset
 	cmdListSlots[12] = cbListDrawInst            // DrawInstanced
 	cmdListSlots[13] = cbListDrawIdx             // DrawIndexedInstanced
 	cmdListSlots[14] = cbListDispatch            // Dispatch
@@ -1669,7 +1712,11 @@ func newD3D12XDevice() uintptr {
 	cbCreateList := syscall.NewCallback(func(this, nodeMask, listType, alloc, pso, iid, outPtr uintptr) uintptr {
 		slog.Debug("D3D12DeviceX!CreateCommandList", "type", listType)
 		if outPtr != 0 {
-			*(*uintptr)(osPtr(outPtr)) = newCommandList()
+			clPtr := newCommandList()
+			*(*uintptr)(osPtr(outPtr)) = clPtr
+			if pso != 0 {
+				applyPSOToList(clPtr, pso)
+			}
 		}
 		return hresultOK
 	})
@@ -1982,24 +2029,8 @@ func newD3D12XDevice() uintptr {
 	var nextFrameToken atomic.Uint64
 	nextFrameToken.Store(1)
 
-	var (
-		winmmDLL            = syscall.NewLazyDLL("winmm.dll")
-		procTimeBeginPeriod = winmmDLL.NewProc("timeBeginPeriod")
-		framePacerMu        sync.Mutex
-		nextFrameDeadline   time.Time
-		framePeriod         = 16667 * time.Microsecond // 60 Hz par défaut
-	)
-	if procTimeBeginPeriod.Find() == nil {
-		_, _, _ = procTimeBeginPeriod.Call(1) // résolution timer Windows 1 ms (évite Sleep(16ms) -> 35ms = 28 FPS)
-	}
 	cbSetFrameInterval := syscall.NewCallback(func(this, output, interval, period, flags uintptr) uintptr {
-		p := uint32(period)
-		framePacerMu.Lock()
-		if p >= 4000 && p <= 50000 {
-			framePeriod = time.Duration(p) * time.Microsecond
-		}
-		framePacerMu.Unlock()
-		slog.Debug("D3D12DeviceX!SetFrameIntervalX", "interval", interval, "period", p)
+		slog.Debug("D3D12DeviceX!SetFrameIntervalX", "interval", interval, "period", uint32(period))
 		return hresultOK
 	})
 	cbScheduleFrameEvent := syscall.NewCallback(func(this, eventType, offset, flags uintptr) uintptr {
@@ -2007,19 +2038,7 @@ func newD3D12XDevice() uintptr {
 		return hresultOK
 	})
 	cbWaitFrameEvent := syscall.NewCallback(func(this, eventType, timeout, reserved, flags, outToken uintptr) uintptr {
-		now := time.Now()
-		framePacerMu.Lock()
-		period := framePeriod
-		if nextFrameDeadline.IsZero() || now.After(nextFrameDeadline.Add(period*2)) {
-			nextFrameDeadline = now.Add(period)
-		} else {
-			nextFrameDeadline = nextFrameDeadline.Add(period)
-		}
-		wait := time.Until(nextFrameDeadline)
-		framePacerMu.Unlock()
-		if wait > 0 {
-			time.Sleep(wait)
-		}
+		time.Sleep(16 * time.Millisecond)
 		tok := nextFrameToken.Add(1)
 		slog.Debug("D3D12DeviceX!WaitFrameEventX", "event", eventType, "token", tok)
 		if outToken != 0 {

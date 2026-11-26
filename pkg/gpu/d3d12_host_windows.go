@@ -584,6 +584,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 
 			// Rejeu matériel des appels DrawInstanced sur le GPU Windows hôte
 			h.texUploadOff = 0
+			skipHostPresent := false
 			if len(draws) > 0 && h.ReplayRootSig != 0 && h.ReplayPSO != 0 {
 				vp := d3d12Viewport{Width: float32(h.Width), Height: float32(h.Height), MinDepth: 0, MaxDepth: 1}
 				sc := d3d12Rect{Right: int32(h.Width), Bottom: int32(h.Height)}
@@ -618,12 +619,25 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					if d.HostPSO != 0 {
 						hasRealPSO = true
 					}
-					if d.TargetVA != 0 && isBackbuffer(d.TargetVA) {
+					if isBackbuffer(d.TargetVA) {
 						hasPresentTarget = true
 					}
 				}
-				// N'active les RenderTargets offscreen que si au moins un draw cible un backbuffer swapchain
-				useOffscreenRT := len(h.PresentVAs) > 0 && hasPresentTarget
+				// Si l'UI est déjà active et qu'aucun draw de cette trame ne cible le backbuffer,
+				// ne pas effacer ni présenter un backbuffer noir : mettre à jour uniquement les RT offscreen.
+				skipHostPresent = h.introReached && len(h.PresentVAs) > 0 && !hasPresentTarget
+				if len(draws) > 0 && draws[0].FrameNumber%120 == 0 {
+					slog.Info("HostD3D12 PresentClear",
+						"frame", draws[0].FrameNumber,
+						"draws", len(draws),
+						"presentVA", fmt.Sprintf("0x%X", presentVA),
+						"hasRealPSO", hasRealPSO,
+						"hasPresentTarget", hasPresentTarget,
+						"skipHostPresent", skipHostPresent,
+					)
+				}
+				// N'active les RenderTargets offscreen que si des backbuffers swapchain sont connus
+				useOffscreenRT := len(h.PresentVAs) > 0 && (hasPresentTarget || skipHostPresent)
 				clearedRT := make(map[uint64]bool)
 				curRTV := rtv
 				curTargetVA := uint64(0)
@@ -866,7 +880,17 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 				}
 			}
 			if !wantSnap {
+				if skipHostPresent {
+				// On met uniquement à jour les RenderTargets offscreen sans toucher au backbuffer affiché
 				b2 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x4 /* RENDER_TARGET */, StateAfter: 0 /* PRESENT */}
+				_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b2)))
+				_ = comCall(h.CmdList, 9) // CommandList::Close
+				lists := [1]uintptr{h.CmdList}
+				_ = comCall(h.Queue, 10, 1, uintptr(unsafe.Pointer(&lists[0])))
+				h.waitGPU()
+				return
+			}
+			b2 := d3d12ResourceBarrier{Resource: bb, Subresource: 0xFFFFFFFF, StateBefore: 0x4 /* RENDER_TARGET */, StateAfter: 0 /* PRESENT */}
 				_ = comCall(h.CmdList, 26, 1, uintptr(unsafe.Pointer(&b2)))
 			}
 		}

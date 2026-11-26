@@ -41,7 +41,7 @@ func main() {
 	if os.Args[1] == "run" {
 		if lf, lerr := os.Create(filepath.Join(os.TempDir(), "astral_last.log")); lerr == nil {
 			defer lf.Close()
-			core.InitLogger(io.MultiWriter(os.Stderr, lf))
+			core.InitLogger(io.MultiWriter(lf, os.Stderr))
 		} else {
 			core.InitLogger(os.Stderr)
 		}
