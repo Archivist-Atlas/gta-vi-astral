@@ -131,6 +131,7 @@ type HostD3D12 struct {
 	NextRTVSlot     uint32
 	TexCache        map[uint64]*hostTexEntry
 	RTCache         map[uint64]*hostRTEntry
+	PresentVAs      map[uint64]bool
 	ReadbackBuf     uintptr
 	ReadbackPtr     uintptr
 	ReadbackPitch   uint32
@@ -590,18 +591,27 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 					_ = comCall(h.CmdList, 32, 5, h.SRVGPUStart) // t3
 				}
 				total := uint32(len(draws))
+				if presentVA != 0 {
+					if h.PresentVAs == nil {
+						h.PresentVAs = make(map[uint64]bool)
+					}
+					h.PresentVAs[presentVA] = true
+				}
+				isBackbuffer := func(va uint64) bool {
+					return va == 0 || va == presentVA || h.PresentVAs[va]
+				}
 				hasRealPSO := false
 				hasPresentTarget := false
 				for _, d := range draws {
 					if d.HostPSO != 0 {
 						hasRealPSO = true
 					}
-					if presentVA != 0 && d.TargetVA == presentVA {
+					if d.TargetVA != 0 && isBackbuffer(d.TargetVA) {
 						hasPresentTarget = true
 					}
 				}
-				// N'active les RenderTargets offscreen que si au moins un draw cible explicitement le backbuffer final (presentVA)
-				useOffscreenRT := presentVA != 0 && hasPresentTarget
+				// N'active les RenderTargets offscreen que si au moins un draw cible un backbuffer swapchain
+				useOffscreenRT := len(h.PresentVAs) > 0 && hasPresentTarget
 				clearedRT := make(map[uint64]bool)
 				curRTV := rtv
 				curTargetVA := uint64(0)
@@ -618,10 +628,10 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						}
 						pso = h.ReplayPSO
 					}
-					// 1. Sélection de la cible RTV (backbuffer ou RenderTarget offscreen)
+					// 1. Sélection de la cible RTV (backbuffer swapchain ou RenderTarget offscreen)
 					wantRTV := rtv
 					wantTargetVA := uint64(0)
-					if useOffscreenRT && d.TargetVA != 0 && d.TargetVA != presentVA {
+					if useOffscreenRT && !isBackbuffer(d.TargetVA) {
 						if rt := h.ensureHostRT(d.TargetVA); rt != nil {
 							if rt.state != 0x4 {
 								if h.SRVGPUStart != 0 {
@@ -646,7 +656,7 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						curTargetVA = wantTargetVA
 					}
 					// 2. Liaison du SRV t0 : priorité au RenderTarget offscreen hôte si SRVGuestVA correspond !
-					if useOffscreenRT && d.SRVGuestVA != 0 && d.SRVGuestVA != curTargetVA {
+					if d.SRVGuestVA != 0 && d.SRVGuestVA != curTargetVA {
 						if srcRT, ok := h.RTCache[d.SRVGuestVA]; ok && srcRT != nil {
 							if srcRT.state != 0xC0 {
 								br := d3d12ResourceBarrier{Resource: srcRT.res, Subresource: 0xFFFFFFFF, StateBefore: srcRT.state, StateAfter: 0xC0 /* NON_PIXEL | PIXEL_SHADER_RESOURCE */}
