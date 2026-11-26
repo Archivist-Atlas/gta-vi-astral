@@ -1,39 +1,42 @@
-# Copiez ce fichier vers `astral.toml` (ignoré par git) et adaptez les chemins.
-# RÈGLE #1 : Tous les chemins ci-dessous doivent se trouver EN DEHORS du dépôt gta-vi-astral.
+# Exemple de configuration pour gta-vi-astral.
+# En mode normal, `astral.exe` génère automatiquement votre fichier local `astral.toml` (ignoré par Git)
+# dès le premier lancement. Vous pouvez aussi copier ce fichier vers `astral.toml` et l'adapter manuellement.
+#
+# RÈGLE : Tous les chemins ci-dessous doivent rester EN DEHORS du dépôt gta-vi-astral.
 # Les variables d'environnement (ASTRAL_*) ont priorité sur ce fichier.
 
 [paths]
-# Dossier contenant votre copie locale de GTA VI Xbox Series (avec MicrosoftGame.Config et les .rpf)
+# Dossier contenant votre copie locale de GTA VI Xbox Series v1.0.2.1 (avec MicrosoftGame.Config et les .rpf)
 # Variable d'environnement : ASTRAL_GAME_DIR
 game_dir = 'C:\GTA_VI'
 
-# Dossier de cache (shaders traduits, pipelines, données converties)
-# Par défaut : %LOCALAPPDATA%\gta-vi-astral\cache
-# Variable d'environnement : ASTRAL_CACHE_DIR
-# cache_dir = 'D:\astral-data\cache'
-
-# Dossier de données persistantes (sauvegardes, paramètres, crashes.log)
-# Par défaut : %LOCALAPPDATA%\gta-vi-astral\data
-# Variable d'environnement : ASTRAL_DATA_DIR
-# data_dir = 'D:\astral-data\data'
-
-# Dossier overlay copy-on-write pour garder le dossier du jeu en lecture seule
-# Par défaut : %LOCALAPPDATA%\gta-vi-astral\overlay
-# Variable d'environnement : ASTRAL_OVERLAY_DIR
-# overlay_dir = 'D:\astral-data\overlay'
+# Dossiers optionnels hors dépôt (par défaut dans %LOCALAPPDATA%\gta-vi-astral\...)
+# cache_dir   = 'C:\AstralData\cache'
+# data_dir    = 'C:\AstralData\data'
+# overlay_dir = 'C:\AstralData\overlay'
 
 [runtime]
-# Modèle de console émulé : "series-x" ou "series-s"
+# Mode de démarrage d'astral.exe :
+# - "normal" : configuration guidée au 1er lancement, puis ouverture directe de la fenêtre du jeu
+# - "dev"    : affiche le lanceur complet avec les outils de diagnostic (verify, inspect, census, logs)
+mode = 'normal'
+
+# Musique d'ambiance (loading.mp3) pendant l'écran de chargement : true ou false
+# (également basculable en un clic via l'icône haut-parleur en haut à droite ou la touche M)
+loading_sound = true
+
+# Profil matériel Xbox annoncé au jeu via l'API HLE (XSystemGetDeviceType, RAM dispo, profil graphique) :
+# - "series-x" : Xbox Series X (recommandé, profil 4K / 16 Go)
+# - "series-s" : Xbox Series S (profil plus léger / 10 Go)
+# (Il ne s'agit pas d'une émulation CPU/matérielle : le binaire x86-64 s'exécute nativement sur Windows.)
 console_profile = 'series-x'
 
-# Backend GPU : "auto", "d3d12" (natif Windows façon VIctory) ou "vulkan" (façon Leonida)
-gpu_backend = 'auto'
+# --- Options avancées (optionnelles, valeurs par défaut recommandées) ---
+# Backend GPU hôte : "auto" ou "d3d12" (natif Windows Direct3D 12)
+# gpu_backend = 'auto'
 
-# Politique face aux imports non implémentés : "log", "zero", "fail" ou "trap"
-unimplemented = 'log'
+# Politique face aux imports Xbox non implémentés : "log" (défaut), "zero", "fail" ou "trap"
+# unimplemented = 'log'
 
-# Mode d'émulation wave64 pour les GPU 32-wide (NVIDIA/Intel) : "auto", "on", "off"
-wave64_emulate = 'auto'
-
-# Nombre de workers parallèles (0 = automatique selon les cœurs CPU)
-jobs = 0
+# Nombre de workers parallèles pour l'analyse/traduction (0 = automatique selon les cœurs CPU)
+# jobs = 0
