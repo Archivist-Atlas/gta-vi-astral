@@ -45,8 +45,17 @@ type PathsConfig struct {
 	OverlayDir string
 }
 
+// LauncherMode définit le comportement au lancement d'astral.exe sans argument.
+type LauncherMode string
+
+const (
+	ModeNormal LauncherMode = "normal" // Configuration guidée au 1er lancement, puis démarrage direct d'Astral
+	ModeDev    LauncherMode = "dev"    // Affiche le lanceur complet avec outils de diagnostic
+)
+
 // RuntimeConfig regroupe les paramètres d'exécution et de traduction.
 type RuntimeConfig struct {
+	Mode           LauncherMode
 	ConsoleProfile ConsoleProfile
 	GPUBackend     GPUBackend
 	Unimplemented  UnimplementedPolicy
@@ -71,6 +80,7 @@ func DefaultConfig() Config {
 			OverlayDir: filepath.Join(base, "overlay"),
 		},
 		Runtime: RuntimeConfig{
+			Mode:           ModeNormal,
 			ConsoleProfile: ConsoleSeriesX,
 			GPUBackend:     BackendAuto,
 			Unimplemented:  UnimplLog,
@@ -130,6 +140,13 @@ func LoadConfig(explicitPath string) (Config, error) {
 	if v := os.Getenv("ASTRAL_OVERLAY_DIR"); v != "" {
 		cfg.Paths.OverlayDir = v
 	}
+	if v := os.Getenv("ASTRAL_MODE"); v != "" {
+		if strings.EqualFold(v, string(ModeDev)) {
+			cfg.Runtime.Mode = ModeDev
+		} else {
+			cfg.Runtime.Mode = ModeNormal
+		}
+	}
 	if v := os.Getenv("ASTRAL_CONSOLE"); v != "" {
 		cfg.Runtime.ConsoleProfile = ConsoleProfile(strings.ToLower(v))
 	}
@@ -155,16 +172,24 @@ func LoadConfig(explicitPath string) (Config, error) {
 	return cfg, nil
 }
 
-// SaveGameDir mémorise gameDir dans le fichier local astral.toml (ignoré par Git).
+// SaveGameDir mémorise gameDir en mode normal dans le fichier local astral.toml (ignoré par Git).
 func SaveGameDir(gameDir string) (string, error) {
+	return SaveLauncherConfig(gameDir, ModeNormal)
+}
+
+// SaveLauncherConfig mémorise gameDir et le mode (normal / dev) dans astral.toml (ignoré par Git).
+func SaveLauncherConfig(gameDir string, mode LauncherMode) (string, error) {
 	if err := EnsureOutsideRepo(gameDir); err != nil {
 		return "", err
+	}
+	if mode != ModeDev {
+		mode = ModeNormal
 	}
 	target := "astral.toml"
 	if exe, err := os.Executable(); err == nil {
 		target = filepath.Join(filepath.Dir(exe), "astral.toml")
 	}
-	content := fmt.Sprintf("# Configuration locale générée par gta-vi-astral (ignorée par Git)\n\n[paths]\ngame_dir = '%s'\n", gameDir)
+	content := fmt.Sprintf("# Configuration locale générée par gta-vi-astral (ignorée par Git)\n# Passez mode = 'dev' pour afficher le lanceur complet avec les outils de diagnostic.\n\n[paths]\ngame_dir = '%s'\n\n[runtime]\nmode = '%s'\n", gameDir, mode)
 	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
 		return "", err
 	}
@@ -234,6 +259,12 @@ func parseSimpleTOML(path string, cfg *Config) error {
 			}
 		case "runtime":
 			switch key {
+			case "mode":
+				if strings.EqualFold(val, string(ModeDev)) {
+					cfg.Runtime.Mode = ModeDev
+				} else {
+					cfg.Runtime.Mode = ModeNormal
+				}
 			case "console_profile":
 				cfg.Runtime.ConsoleProfile = ConsoleProfile(strings.ToLower(val))
 			case "gpu_backend":

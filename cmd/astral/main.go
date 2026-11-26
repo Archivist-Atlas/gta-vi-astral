@@ -116,6 +116,7 @@ func cmdConfig(args []string) error {
 	fmt.Printf("cache_dir      : %s\n", cfg.Paths.CacheDir)
 	fmt.Printf("data_dir       : %s\n", cfg.Paths.DataDir)
 	fmt.Printf("overlay_dir    : %s\n", cfg.Paths.OverlayDir)
+	fmt.Printf("mode           : %s\n", cfg.Runtime.Mode)
 	fmt.Printf("console        : %s\n", cfg.Runtime.ConsoleProfile)
 	fmt.Printf("gpu_backend    : %s\n", cfg.Runtime.GPUBackend)
 	fmt.Printf("unimplemented  : %s\n", cfg.Runtime.Unimplemented)

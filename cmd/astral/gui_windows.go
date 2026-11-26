@@ -32,9 +32,11 @@ var (
 	guiShell32  = syscall.NewLazyDLL("shell32.dll")
 	guiOle32    = syscall.NewLazyDLL("ole32.dll")
 	guiDwmApi   = syscall.NewLazyDLL("dwmapi.dll")
+	guiComCtl32 = syscall.NewLazyDLL("comctl32.dll")
 
 	procRegClassEx       = guiUser32.NewProc("RegisterClassExW")
 	procCreateWinEx      = guiUser32.NewProc("CreateWindowExW")
+	procDestroyWin       = guiUser32.NewProc("DestroyWindow")
 	procShowWin          = guiUser32.NewProc("ShowWindow")
 	procUpdateWin        = guiUser32.NewProc("UpdateWindow")
 	procDefWinProc       = guiUser32.NewProc("DefWindowProcW")
@@ -63,6 +65,7 @@ var (
 	procCoInitEx         = guiOle32.NewProc("CoInitializeEx")
 	procCoTaskMemFree    = guiOle32.NewProc("CoTaskMemFree")
 	procDwmSetWinAttr    = guiDwmApi.NewProc("DwmSetWindowAttribute")
+	procInitCommonCtrls  = guiComCtl32.NewProc("InitCommonControlsEx")
 )
 
 const (
@@ -73,6 +76,9 @@ const (
 	wmCtlColorEdit   = 0x0133
 	wmCtlColorStatic = 0x0138
 	wmAppUpdateUI    = 0x8001
+
+	pbmSetRange32 = 0x0406
+	pbmSetPos     = 0x0402
 
 	emSetSel       = 0x00B1
 	emReplaceSel   = 0x00C2
@@ -135,18 +141,20 @@ type launcherState struct {
 }
 
 type guiApp struct {
-	hwnd       uintptr
-	lblStatus  uintptr
-	edtGameDir uintptr
-	btnStart   uintptr
-	btnVerify  uintptr
-	btnInspect uintptr
-	btnCensus  uintptr
-	btnShaders uintptr
-	btnMap     uintptr
-	btnConfig  uintptr
-	btnBrowse  uintptr
-	edtLog     uintptr
+	hwnd        uintptr
+	lblStatus   uintptr
+	lblProgress uintptr
+	pbProgress  uintptr
+	edtGameDir  uintptr
+	btnStart    uintptr
+	btnVerify   uintptr
+	btnInspect  uintptr
+	btnCensus   uintptr
+	btnShaders  uintptr
+	btnMap      uintptr
+	btnConfig   uintptr
+	btnBrowse   uintptr
+	edtLog      uintptr
 
 	brushBg     uintptr
 	brushCard   uintptr
@@ -155,6 +163,9 @@ type guiApp struct {
 	fontUI      uintptr
 	fontBtnBold uintptr
 	fontMono    uintptr
+
+	normalMode             bool
+	launchDirectAfterClose bool
 
 	mu        sync.Mutex
 	cfg       core.Config
@@ -208,19 +219,51 @@ func hideStandaloneConsole() {
 	}
 }
 
+func launchDirectGame(gameDir string) {
+	if lf, lerr := os.Create(filepath.Join(os.TempDir(), "astral_last.log")); lerr == nil {
+		defer lf.Close()
+		core.InitLogger(io.MultiWriter(os.Stderr, lf))
+	} else {
+		core.InitLogger(os.Stderr)
+	}
+	exePath := filepath.Join(gameDir, game.ExpectedExecutable)
+	if err := cmdRun([]string{"-execute", "-unimplemented", "log", exePath}); err != nil {
+		titlePtr, _ := syscall.UTF16PtrFromString("GTA VI Astral — Erreur")
+		msgPtr, _ := syscall.UTF16PtrFromString(fmt.Sprintf("Impossible de lancer GTA VI :\n%v", err))
+		_, _, _ = procMessageBox.Call(0, uintptr(unsafe.Pointer(msgPtr)), uintptr(unsafe.Pointer(titlePtr)), 0x10 /* MB_ICONERROR */)
+	}
+}
+
 func runLauncherGUI() {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	_, _, _ = procCoInitEx.Call(0, 2 /* COINIT_APARTMENTTHREADED */)
-
 	cfg, _ := core.LoadConfig("")
+	isNormal := cfg.Runtime.Mode != core.ModeDev
+
 	app := &guiApp{
-		cfg:       cfg,
-		gameDir:   cfg.Paths.GameDir,
-		statePath: filepath.Join(cfg.Paths.DataDir, "launcher_state.json"),
+		normalMode: isNormal,
+		cfg:        cfg,
+		gameDir:    cfg.Paths.GameDir,
+		statePath:  filepath.Join(cfg.Paths.DataDir, "launcher_state.json"),
 	}
 	app.loadState()
+
+	// En mode normal, si le répertoire GTA VI est déjà configuré et vérifié, lancer directement la fenêtre Astral !
+	if isNormal && app.gameDir != "" && app.isCurrentDirVerified() {
+		if _, err := os.Stat(filepath.Join(app.gameDir, game.ExpectedExecutable)); err == nil {
+			launchDirectGame(app.gameDir)
+			return
+		}
+	}
+
+	runtime.LockOSThread()
+	_, _, _ = procCoInitEx.Call(0, 2 /* COINIT_APARTMENTTHREADED */)
+	if procInitCommonCtrls.Find() == nil {
+		type initCommonControlsEx struct {
+			Size uint32
+			ICC  uint32
+		}
+		ic := initCommonControlsEx{Size: 8, ICC: 0x00000020 /* ICC_PROGRESS_CLASS */}
+		_, _, _ = procInitCommonCtrls.Call(uintptr(unsafe.Pointer(&ic)))
+	}
 
 	// Couleurs sombres synthwave (BGR pour Win32 COLORREF : 0x00BBGGRR)
 	app.brushBg, _, _ = procCreateSolidBrush.Call(0x001C1312)   // #12131C
@@ -288,7 +331,10 @@ func runLauncherGUI() {
 	}
 	_, _, _ = procRegClassEx.Call(uintptr(unsafe.Pointer(&wc)))
 
-	const winW, winH = 860, 650
+	winW, winH := 860, 650
+	if app.normalMode {
+		winW, winH = 640, 285
+	}
 	scrW, _, _ := procGetSysMetrics.Call(0)
 	scrH, _, _ := procGetSysMetrics.Call(1)
 	posX := (int(scrW) - winW) / 2
@@ -307,10 +353,11 @@ func runLauncherGUI() {
 		uintptr(unsafe.Pointer(titlePtr)),
 		wsFixedWindow,
 		uintptr(posX), uintptr(posY),
-		winW, winH,
+		uintptr(winW), uintptr(winH),
 		0, 0, hInst, 0,
 	)
 	if hwnd == 0 {
+		runtime.UnlockOSThread()
 		return
 	}
 	app.hwnd = hwnd
@@ -325,19 +372,24 @@ func runLauncherGUI() {
 	dark := int32(1)
 	_, _, _ = procDwmSetWinAttr.Call(hwnd, 20, uintptr(unsafe.Pointer(&dark)), 4)
 
-	app.buildControls(hInst)
+	if app.normalMode {
+		app.buildNormalControls(hInst)
+	} else {
+		app.buildControls(hInst)
+	}
 	app.refreshStatusUI()
 
-	if app.gameDir == "" {
-		app.appendLog("Bienvenue dans GTA VI Astral !\r\n")
-		app.appendLog("Cliquez sur « Parcourir… » pour sélectionner le dossier de votre copie locale de GTA VI (Xbox Series).\r\n")
-		app.appendLog("Le chemin et la vérification seront mémorisés automatiquement.\r\n")
-	} else if app.isCurrentDirVerified() {
-		app.appendLog(fmt.Sprintf("Prêt : copie vérifiée le %s (%s).\r\n", app.state.VerifiedAt, app.state.Summary))
-		app.appendLog("Cliquez sur « DÉMARRER GTA VI » pour lancer le jeu immédiatement.\r\n")
-	} else {
-		app.appendLog(fmt.Sprintf("Dossier mémorisé : %s\r\n", app.gameDir))
-		app.appendLog("Une vérification unique sera effectuée automatiquement au premier lancement.\r\n")
+	if !app.normalMode {
+		if app.gameDir == "" {
+			app.appendLog("Bienvenue dans GTA VI Astral (mode dev) !\r\n")
+			app.appendLog("Cliquez sur « Parcourir… » pour sélectionner le dossier de votre copie locale de GTA VI (Xbox Series).\r\n")
+		} else if app.isCurrentDirVerified() {
+			app.appendLog(fmt.Sprintf("Prêt : copie vérifiée le %s (%s).\r\n", app.state.VerifiedAt, app.state.Summary))
+			app.appendLog("Cliquez sur « DÉMARRER GTA VI » pour lancer le jeu immédiatement.\r\n")
+		} else {
+			app.appendLog(fmt.Sprintf("Dossier mémorisé : %s\r\n", app.gameDir))
+			app.appendLog("Une vérification unique sera effectuée automatiquement au premier lancement.\r\n")
+		}
 	}
 
 	_, _, _ = procShowWin.Call(hwnd, 5 /* SW_SHOW */)
@@ -352,6 +404,39 @@ func runLauncherGUI() {
 		_, _, _ = procTransMsg.Call(uintptr(unsafe.Pointer(&m)))
 		_, _, _ = procDispMsg.Call(uintptr(unsafe.Pointer(&m)))
 	}
+	runtime.UnlockOSThread()
+
+	if app.launchDirectAfterClose && app.gameDir != "" {
+		launchDirectGame(app.gameDir)
+	}
+}
+
+func (a *guiApp) buildNormalControls(hInst uintptr) {
+	const (
+		wsChild    = 0x40000000
+		wsVisible  = 0x10000000
+		wsTabStop  = 0x00010000
+		wsBorder   = 0x00800000
+		esReadOnly = 0x0800
+		bsPush     = 0x0000
+		bsDefPush  = 0x0001
+		pbsSmooth  = 0x0001
+	)
+	_ = createCtrl(a.hwnd, hInst, "STATIC", "GTA VI Astral", wsChild|wsVisible, 24, 16, 400, 32, 0, a.fontTitle)
+	a.lblStatus = createCtrl(a.hwnd, hInst, "STATIC", "", wsChild|wsVisible, 24, 50, 576, 22, 0, a.fontSub)
+
+	_ = createCtrl(a.hwnd, hInst, "STATIC", "Répertoire de GTA VI (Xbox Series v1.0.2.1) :", wsChild|wsVisible, 24, 82, 460, 20, 0, a.fontSub)
+	a.edtGameDir = createCtrl(a.hwnd, hInst, "EDIT", orNone(a.gameDir), wsChild|wsVisible|wsBorder|esReadOnly, 24, 106, 446, 28, 0, a.fontUI)
+	a.btnBrowse = createCtrl(a.hwnd, hInst, "BUTTON", "Parcourir…", wsChild|wsVisible|wsTabStop|bsPush, 480, 105, 120, 30, idBtnBrowse, a.fontUI)
+
+	a.lblProgress = createCtrl(a.hwnd, hInst, "STATIC", "", wsChild, 24, 146, 576, 20, 0, a.fontSub)
+	a.pbProgress = createCtrl(a.hwnd, hInst, "msctls_progress32", "", wsChild|pbsSmooth, 24, 168, 576, 18, 0, 0)
+	if a.pbProgress != 0 {
+		_, _, _ = procSendMsg.Call(a.pbProgress, pbmSetRange32, 0, 100)
+		_, _, _ = procSendMsg.Call(a.pbProgress, pbmSetPos, 0, 0)
+	}
+
+	a.btnStart = createCtrl(a.hwnd, hInst, "BUTTON", "▶   VALIDER ET DÉMARRER GTA VI", wsChild|wsVisible|wsTabStop|bsDefPush, 24, 196, 576, 40, idBtnStart, a.fontBtnBold)
 }
 
 func (a *guiApp) buildControls(hInst uintptr) {
@@ -453,7 +538,16 @@ func (a *guiApp) pickGameFolder(autoLaunchAfter bool) bool {
 	if dir == "" {
 		return false
 	}
-	savedPath, err := core.SaveGameDir(dir)
+	if a.normalMode {
+		a.gameDir = dir
+		setText(a.edtGameDir, dir)
+		a.refreshStatusUI()
+		if autoLaunchAfter {
+			a.runVerifyAsync(true)
+		}
+		return true
+	}
+	savedPath, err := core.SaveLauncherConfig(dir, core.ModeDev)
 	if err != nil {
 		a.appendLog(fmt.Sprintf("Erreur sauvegarde astral.toml : %v\r\n", err))
 		return false
@@ -476,12 +570,34 @@ func (a *guiApp) startGameFlow() {
 		a.pickGameFolder(true)
 		return
 	}
+	if a.normalMode {
+		a.runVerifyAsync(true)
+		return
+	}
 	if !a.isCurrentDirVerified() {
 		a.appendLog("Première exécution pour ce dossier : vérification unique de la copie du jeu…\r\n")
 		a.runVerifyAsync(true)
 		return
 	}
 	a.launchGameProcess()
+}
+
+func (a *guiApp) setNormalProgress(visible bool, pct int, text string) {
+	if !a.normalMode {
+		return
+	}
+	sw := uintptr(0)
+	if visible {
+		sw = 5 // SW_SHOW
+	}
+	if a.lblProgress != 0 {
+		setText(a.lblProgress, text)
+		_, _, _ = procShowWin.Call(a.lblProgress, sw)
+	}
+	if a.pbProgress != 0 {
+		_, _, _ = procShowWin.Call(a.pbProgress, sw)
+		_, _, _ = procSendMsg.Call(a.pbProgress, pbmSetPos, uintptr(pct), 0)
+	}
 }
 
 func (a *guiApp) runVerifyAsync(launchAfter bool) {
@@ -495,9 +611,19 @@ func (a *guiApp) runVerifyAsync(launchAfter bool) {
 	a.setToolsEnabled(false)
 
 	dir := a.gameDir
+	a.setNormalProgress(true, 10, "Analyse du jeu et de sa version...")
 	a.appendLog(fmt.Sprintf("\r\n--- Vérification de la copie du jeu (%s) ---\r\n", dir))
 	go func() {
+		if a.normalMode {
+			a.postUI(func() { a.setNormalProgress(true, 25, "Analyse du jeu et de sa version — lecture MicrosoftGame.Config...") })
+			time.Sleep(180 * time.Millisecond)
+			a.postUI(func() { a.setNormalProgress(true, 55, "Analyse du jeu et de sa version — vérification des archives et exécutable...") })
+		}
 		rep, err := game.VerifyPackage(dir)
+		if a.normalMode {
+			a.postUI(func() { a.setNormalProgress(true, 85, "Analyse du jeu et de sa version — contrôle d'intégrité...") })
+			time.Sleep(150 * time.Millisecond)
+		}
 		var out strings.Builder
 		if rep != nil {
 			fmt.Fprintf(&out, "Dossier jeu    : %s\r\n", rep.GameDir)
@@ -512,16 +638,27 @@ func (a *guiApp) runVerifyAsync(launchAfter bool) {
 			}
 		}
 		ok := err == nil && rep != nil && len(rep.MissingFiles) == 0
+		var saveErr error
 		if ok {
 			out.WriteString("Statut         : VALIDE (mémorisé, ne sera plus redemandé pour ce dossier)\r\n")
-			a.mu.Lock()
-			a.state = launcherState{
-				VerifiedDir: normalizeDir(dir),
-				VerifiedAt:  time.Now().Format("02/01/2006 15:04"),
-				Summary:     fmt.Sprintf("%d/%d fichiers, %.2f GiB", len(rep.PresentFiles), len(game.CorePackageFiles), float64(rep.TotalBytes)/(1024*1024*1024)),
+			mode := core.ModeNormal
+			if !a.normalMode {
+				mode = core.ModeDev
 			}
-			a.saveState()
-			a.mu.Unlock()
+			_, saveErr = core.SaveLauncherConfig(dir, mode)
+			if saveErr == nil {
+				a.mu.Lock()
+				a.state = launcherState{
+					VerifiedDir: normalizeDir(dir),
+					VerifiedAt:  time.Now().Format("02/01/2006 15:04"),
+					Summary:     fmt.Sprintf("%d/%d fichiers, %.2f GiB", len(rep.PresentFiles), len(game.CorePackageFiles), float64(rep.TotalBytes)/(1024*1024*1024)),
+				}
+				a.saveState()
+				a.mu.Unlock()
+			} else {
+				ok = false
+				err = saveErr
+			}
 		} else {
 			if err != nil {
 				fmt.Fprintf(&out, "Erreur         : %v\r\n", err)
@@ -537,8 +674,27 @@ func (a *guiApp) runVerifyAsync(launchAfter bool) {
 			a.mu.Unlock()
 			a.setToolsEnabled(true)
 			a.refreshStatusUI()
-			if ok && launchAfter {
-				a.launchGameProcess()
+			if ok {
+				if a.normalMode {
+					a.setNormalProgress(true, 100, "Jeu validé ! Lancement d'Astral...")
+					a.launchDirectAfterClose = true
+					_, _, _ = procDestroyWin.Call(a.hwnd)
+					return
+				}
+				if launchAfter {
+					a.launchGameProcess()
+				}
+			} else if a.normalMode {
+				a.setNormalProgress(false, 0, "")
+				errMsg := "Ce répertoire ne contient pas une copie valide de GTA VI (Xbox Series v1.0.2.1)."
+				if err != nil {
+					errMsg += fmt.Sprintf("\n\nDétail : %v", err)
+				} else if rep != nil && len(rep.MissingFiles) > 0 {
+					errMsg += fmt.Sprintf("\n\nFichiers manquants : %s", strings.Join(rep.MissingFiles, ", "))
+				}
+				titlePtr, _ := syscall.UTF16PtrFromString("GTA VI Astral — Vérification échouée")
+				msgPtr, _ := syscall.UTF16PtrFromString(errMsg)
+				_, _, _ = procMessageBox.Call(a.hwnd, uintptr(unsafe.Pointer(msgPtr)), uintptr(unsafe.Pointer(titlePtr)), 0x30 /* MB_ICONWARNING */)
 			}
 		})
 	}()
