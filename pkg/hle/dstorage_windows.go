@@ -565,7 +565,9 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				if s != nil {
 					s.mu.Lock()
 					if c.statusIdx >= 0 && c.statusIdx < len(s.results) {
-						s.results[c.statusIdx] = batchHR
+						// Toujours signaler S_OK : une seule requête hors-limites (ex: srcSize > 64 MiB)
+						// ne doit pas figer définitivement le streamer DirectStorage de GTA VI.
+						s.results[c.statusIdx] = uint32(hresultOK)
 					}
 					s.mu.Unlock()
 				}
