@@ -36,6 +36,7 @@ type dsPendingCmd struct {
 	kind             dsCmdKind
 	opts             uint64
 	dstPtr           uintptr
+	pagesSnap        []uintptr
 	pageOff          int
 	dstSize          uint32
 	srcPtr           uintptr
@@ -443,7 +444,10 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		if isPageDst && written > 0 {
 			nPages := (pageOff + int(dstSize) + int(xmemPageSize) - 1) / int(xmemPageSize)
 			if nPages > 0 && nPages <= 4096 {
-				pages := unsafe.Slice((*uintptr)(osPtr(dstPtr)), nPages)
+				pages := r.pagesSnap
+				if len(pages) < nPages || pages[0] == 0 {
+					pages = unsafe.Slice((*uintptr)(osPtr(dstPtr)), nPages)
+				}
 				if xmemWritePhysical(pages, pageOff, dst[:written]) {
 					if pw := ds.pageWrites.Add(1); pw == 1 || pw%250 == 0 {
 						slog.Info("IDStorageQueueX!PAGE_DESTINATION écriture pages physiques active", "count", pw, "pages", nPages, "written", written)
@@ -560,11 +564,22 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				slog.Warn("IDStorageQueueX!EnqueueRequest ignoré (null/zero)", "opts", opts, "dst", dstPtr, "dstSize", dstSize, "src", srcPtr, "srcSize", srcSize)
 				return 0
 			}
-			// Toutes les requêtes sont exécutées dans l'ordre FIFO exact lors de Submit() :
-			// sur Xbox Series, le jeu peut remplir les tables de pages et buffers source après EnqueueRequest.
+			// Capture immédiate du tableau de pages PAGE_DESTINATION si déjà rempli (évite qu'un tampon
+			// temporaire ne soit remis à zéro avant Submit(), tout en conservant le repli Submit() sinon).
+			var pagesSnap []uintptr
+			if opts&(1<<21) != 0 {
+				nPages := (pageOff + int(dstSize) + int(xmemPageSize) - 1) / int(xmemPageSize)
+				if nPages > 0 && nPages <= 4096 {
+					srcPages := unsafe.Slice((*uintptr)(osPtr(dstPtr)), nPages)
+					if srcPages[0] != 0 {
+						pagesSnap = make([]uintptr, nPages)
+						copy(pagesSnap, srcPages)
+					}
+				}
+			}
 			ds.mu.Lock()
 			ds.pending[this] = append(ds.pending[this], dsPendingCmd{
-				kind: dsCmdRead, opts: opts, dstPtr: dstPtr, pageOff: pageOff, dstSize: dstSize,
+				kind: dsCmdRead, opts: opts, dstPtr: dstPtr, pagesSnap: pagesSnap, pageOff: pageOff, dstSize: dstSize,
 				srcPtr: srcPtr, srcOff: srcOff, srcSize: srcSize, intermediateSize: interSize,
 			})
 			ds.mu.Unlock()

@@ -676,6 +676,21 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 							)
 						}
 					}
+					if draws[0].FrameNumber >= 1800 && draws[0].FrameNumber < 2000 && len(draws) <= 12 {
+						for i, d := range draws {
+							texInfo := "none"
+							if d.SRVTex != nil {
+								texInfo = fmt.Sprintf("%dx%d:fmt%d", d.SRVTex.Width, d.SRVTex.Height, d.SRVTex.Format)
+							}
+							slog.Info("HostD3D12 LoadDraw",
+								"i", i, "clr", d.IsClear, "idx", d.Indexed, "topo", d.Topology,
+								"pso", fmt.Sprintf("0x%X", d.HostPSO),
+								"tgt", fmt.Sprintf("0x%X", d.TargetVA),
+								"srv", fmt.Sprintf("0x%X", d.SRVGuestVA),
+								"cnt", d.VertexCount, "tex", texInfo,
+							)
+						}
+					}
 				}
 				// N'active les RenderTargets offscreen que si des backbuffers swapchain sont connus
 				useOffscreenRT := len(h.PresentVAs) > 0 && (hasPresentTarget || skipHostPresent)
