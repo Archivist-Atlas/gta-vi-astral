@@ -126,6 +126,47 @@ func isGuestReadable(addr uintptr, sz uint64) bool {
 	return guestReadableLen(addr, sz) >= sz
 }
 
+func isGuestWritable(addr uintptr, sz uint64) bool {
+	if addr < 0x10000 || sz == 0 {
+		return false
+	}
+	targetEnd := addr + uintptr(sz)
+	if targetEnd < addr {
+		return false
+	}
+	type memoryBasicInfo struct {
+		BaseAddress       uintptr
+		AllocationBase    uintptr
+		AllocationProtect uint32
+		PartitionID       uint16
+		_pad0             uint16
+		RegionSize        uintptr
+		State             uint32
+		Protect           uint32
+		Type              uint32
+		_pad1             uint32
+	}
+	cur := addr
+	for cur < targetEnd {
+		var mbi memoryBasicInfo
+		r, _, _ := k32VirtualQuery.Call(cur, uintptr(unsafe.Pointer(&mbi)), unsafe.Sizeof(mbi))
+		if r == 0 || mbi.State != 0x1000 /* MEM_COMMIT */ {
+			return false
+		}
+		prot := mbi.Protect & 0xFF
+		writable := prot == 0x04 /* RW */ || prot == 0x08 /* WRITECOPY */ || prot == 0x40 /* ERW */ || prot == 0x80 /* EWC */
+		if !writable || mbi.Protect&0x100 /* PAGE_GUARD */ != 0 {
+			return false
+		}
+		end := mbi.BaseAddress + mbi.RegionSize
+		if end <= cur {
+			return false
+		}
+		cur = end
+	}
+	return true
+}
+
 // d3d12xState centralise les objets COM Xbox Series D3D12.X créés pendant le boot.
 type d3d12xState struct {
 	mu              sync.Mutex

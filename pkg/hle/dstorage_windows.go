@@ -227,7 +227,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		)
 		var raw []byte
 		if opts&optMemSrc != 0 {
-			if srcSize > 0 && srcSize <= (64<<20) {
+			if srcSize > 0 && srcSize <= (64<<20) && isGuestReadable(srcPtr, uint64(srcSize)) {
 				raw = make([]byte, srcSize)
 				copy(raw, unsafe.Slice((*byte)(osPtr(srcPtr)), srcSize))
 			}
@@ -239,7 +239,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				raw = make([]byte, srcSize)
 				n, _ := fh.ReadAt(raw, int64(srcOff))
 				raw = raw[:n]
-			} else if fh == nil && srcSize > 0 && srcSize <= (64<<20) {
+			} else if fh == nil && srcSize > 0 && srcSize <= (64<<20) && isGuestReadable(srcPtr, uint64(srcSize)) {
 				raw = make([]byte, srcSize)
 				copy(raw, unsafe.Slice((*byte)(osPtr(srcPtr)), srcSize))
 			}
@@ -254,6 +254,11 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		if isPageDst {
 			dst = make([]byte, dstSize)
 		} else {
+			if !isGuestWritable(dstPtr, uint64(dstSize)) {
+				slog.Warn("IDStorageQueueX!EnqueueRequest destination non inscriptible ignorée",
+					"dst", fmt.Sprintf("0x%X", dstPtr), "dstSize", dstSize, "opts", fmt.Sprintf("0x%x", opts))
+				return uint32(hresultOK)
+			}
 			dst = unsafe.Slice((*byte)(osPtr(dstPtr)), dstSize)
 		}
 		headHex := func(b []byte) string {
