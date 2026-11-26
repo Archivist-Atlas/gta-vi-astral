@@ -1,10 +1,9 @@
 @echo off
-chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 
 echo ============================================
-echo   GTA VI Astral — Compilation de astral.exe
+echo   GTA VI Astral - Compilation de astral.exe
 echo ============================================
 echo.
 
