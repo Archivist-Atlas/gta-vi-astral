@@ -479,6 +479,12 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	tStart := time.Now()
+	defer func() {
+		if dt := time.Since(tStart); dt > 500*time.Millisecond {
+			slog.Warn("HostD3D12 PresentClear lent", "ms", dt.Milliseconds(), "draws", len(draws), "dispatches", len(dispatches), "removedReason", fmt.Sprintf("0x%08X", h.DeviceRemovedReason()))
+		}
+	}()
 
 	if h.Ready {
 		// Enregistre systématiquement chaque backbuffer swapchain dès la trame 1 (y compris pendant le splash)
@@ -511,12 +517,10 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 			h.introReached = true
 			markIntroReached()
 			ReportBootProgress(1.0)
-			// Ne quitte l'écran de chargement du monde qu'une fois le streaming story000 terminé
-			// (>= 44 000 requêtes depuis story000.rpf) ET que la vraie scène 3D dessine (>= 20 draws).
-			// Sans ce seuil DirectStorage, 3-4 trames de chargement (5 draws chacune) fusionnées pendant
-			// une rafale I/O dépassaient realDraws >= 16 et coupaient la barre trop tôt.
-			if worldLoadingActive.Load() && worldLoadingEntered.Load() && realDraws >= 20 &&
-				bootDSReads.Load() >= worldLoadBaseReads.Load()+44000 {
+			// Quitte l'écran de chargement du monde dès que la vraie scène 3D dessine (>= 25 draws,
+			// ou >= 18 draws après 30 000 requêtes story000) pour ne pas rester bloqué sur l'overlay.
+			if worldLoadingActive.Load() && worldLoadingEntered.Load() &&
+				(realDraws >= 25 || (realDraws >= 18 && bootDSReads.Load() >= worldLoadBaseReads.Load()+30000)) {
 				worldLoadingActive.Store(false)
 			}
 		} else if len(dispatches) > 0 {

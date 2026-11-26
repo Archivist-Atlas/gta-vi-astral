@@ -1015,47 +1015,9 @@ func newD3D12XDevice() uintptr {
 	psoCompileSem := make(chan struct{}, psoWorkers)
 	compileGuestPSO := func(psoObj uintptr, gp *guestPSO) {
 		if gp.hasCS && !gp.hasVS {
-			st.mu.Lock()
-			csData := st.dxbcBlobs[gp.csHash]
-			st.mu.Unlock()
-			if len(csData) < 32 {
-				return
-			}
-			// Compile les Compute PSO en arrière-plan : ne jamais bloquer le thread de rendu du jeu
-			// pendant 15-20s sur D3DCompile (déclenchait le watchdog RAGE 0x4D8BD421).
-			go func(psoObj uintptr, gp *guestPSO, csData []byte) {
-				psoCompileSem <- struct{}{}
-				defer func() { <-psoCompileSem }()
-				csC, err := shader.ParseDXBC(csData)
-				if err != nil {
-					return
-				}
-				csProgs, err := shader.ExtractNativePrograms(csC)
-				if err != nil || len(csProgs) == 0 {
-					return
-				}
-				csOut, err := shader.EmitHLSL(csC, csProgs[0])
-				if err != nil {
-					return
-				}
-				if dumpFrame {
-					_ = os.WriteFile(fmt.Sprintf("%s\\astral_cs_%X.hlsl", os.TempDir(), psoObj), []byte(csOut.Source), 0o644)
-				}
-				hPSO, cerr := gpu.CompileHostComputePSO(csOut.Source, csOut.EntryPoint)
-				if cerr != nil {
-					slog.Warn("Recompilation Compute PSO RDNA2->HLSL->D3D12 échouée", "pso", fmt.Sprintf("0x%X", psoObj), "err", cerr)
-					return
-				}
-				st.mu.Lock()
-				gp.hostPSO = hPSO
-				st.mu.Unlock()
-				gpu.ReportWorldShaderCompiled()
-				slog.Info("Compute PSO RDNA2 recompilé en ID3D12PipelineState matériel",
-					"guestPSO", fmt.Sprintf("0x%X", psoObj),
-					"hostPSO", fmt.Sprintf("0x%X", hPSO),
-					"cs", fmt.Sprintf("%d/%d ins", csOut.LoweredInsts, csOut.TotalInsts),
-				)
-			}(psoObj, gp, csData)
+			// Ne pas compiler/exécuter les Compute PSO invités sur le GPU hôte tant que leur UAV
+			// n'est pas relié aux passes graphiques : les gros CS 3D (2000-4000 ins) saturaient
+			// D3DCompile et provoquaient des TDR GPU (2s/trame -> watchdog 0x4D8BD421).
 			return
 		}
 		if !gp.hasVS || !gp.hasPS {

@@ -272,8 +272,8 @@ func (h *HostD3D12) renderWorldLoadingRGBA() []byte {
 	if curReads > baseReads {
 		delta = curReads - baseReads
 	}
-	// story000 streame ~46 500 requêtes DirectStorage (de ~19 500 à ~66 000)
-	pct := float32(delta) / 46500.0
+	// story000 streame ~35 000 requêtes DirectStorage avant le fondu vers la scène 3D
+	pct := float32(delta) / 35000.0
 	if pct > 0.99 {
 		pct = 0.99
 	}
