@@ -476,6 +476,13 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 	defer h.mu.Unlock()
 
 	if h.Ready {
+		// Enregistre systématiquement chaque backbuffer swapchain dès la trame 1 (y compris pendant le splash)
+		if presentVA != 0 {
+			if h.PresentVAs == nil {
+				h.PresentVAs = make(map[uint64]bool)
+			}
+			h.PresentVAs[presentVA] = true
+		}
 		// Après l'apparition de l'UI (introReached), ne jamais écraser l'écran par un Present vide tout noir
 		if h.introReached && len(draws) == 0 && len(srcRGBA) == 0 {
 			return
@@ -487,9 +494,15 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 		_ = comCall(h.CmdAlloc, 8)                // Allocator::Reset
 		_ = comCall(h.CmdList, 10, h.CmdAlloc, 0) // CommandList::Reset
 
-		// Pendant le chargement initial (avant l'arrivée de l'interface Scaleform à 8+ draws/trame),
+		// Pendant le chargement initial (avant l'arrivée de l'interface Scaleform à 8+ vrais draws/trame),
 		// affiche le logo GTA VI Astral + barre de progression néon animée sur le backbuffer.
-		if len(draws) >= 8 {
+		realDraws := 0
+		for _, d := range draws {
+			if !d.IsClear && d.VertexCount > 0 {
+				realDraws++
+			}
+		}
+		if realDraws >= 8 {
 			h.introReached = true
 			markIntroReached()
 			ReportBootProgress(1.0)
