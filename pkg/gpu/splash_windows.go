@@ -256,11 +256,11 @@ func (h *HostD3D12) renderWorldLoadingRGBA() []byte {
 	if len(h.splashBuf) != need {
 		h.splashBuf = make([]byte, need)
 	}
-	// Fond noir profond
+	// Fond noir pur identique au fond du logo (aucune bordure carrée visible)
 	for i := 0; i < need; i += 4 {
-		h.splashBuf[i+0] = 6
-		h.splashBuf[i+1] = 4
-		h.splashBuf[i+2] = 12
+		h.splashBuf[i+0] = 0
+		h.splashBuf[i+1] = 0
+		h.splashBuf[i+2] = 0
 		h.splashBuf[i+3] = 255
 	}
 	h.splashFrame++
@@ -374,13 +374,11 @@ func (h *HostD3D12) renderWorldLoadingRGBA() []byte {
 	}
 
 	// Texte de statut centré sous la barre : titre + pourcentage + télémétrie temps réel
-	dots := strings.Repeat(".", int((h.splashFrame/15)%4))
-	title := fmt.Sprintf("CHARGEMENT DU MONDE  %d%%%s", int(pct*100), dots)
+	title := fmt.Sprintf("CHARGEMENT DU MONDE  %d%%", int(pct*100))
 	sub := fmt.Sprintf("DIRECTSTORAGE %d   SHADERS 3D %d", curReads, worldShadersCompiled.Load())
 	drawSplashTextCentered(h.splashBuf, w, ht, w/2, barY+barH+22, 3, title, 245, 240, 255)
 	drawSplashTextCentered(h.splashBuf, w, ht, w/2, barY+barH+56, 2, sub, 192, 168, 245)
 
-	drawFullscreenButton(h.splashBuf, w, ht, IsWindowFullscreen())
 	return h.splashBuf
 }
 
