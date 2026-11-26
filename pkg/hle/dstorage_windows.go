@@ -5,6 +5,8 @@ package hle
 import (
 	"bytes"
 	"compress/zlib"
+	"encoding/hex"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -17,29 +19,46 @@ import (
 	"github.com/Archivist-Atlas/gta-vi-astral/pkg/gpu"
 )
 
-// dstorageState implémente un moteur DirectStorage console (XCRDAPI.dll)
-// adossé à VirtualFS avec lecture réelle de fichiers .rpf et décompression zlib.
-type dsPendingPageReq struct {
-	opts    uint64
-	dstPtr  uintptr
-	pageOff int
-	dstSize uint32
-	srcPtr  uintptr
-	srcOff  uint64
-	srcSize uint32
+const hresultPending uint32 = 0x8000000A
+
+type dsCmdKind uint8
+
+const (
+	dsCmdRead dsCmdKind = iota
+	dsCmdStatus
+	dsCmdSignal
+)
+
+// dsPendingCmd mémorise une commande DirectStorage en attente jusqu'à Submit()
+// (en ordre FIFO strict : GTA VI remplit les tables de pages juste avant Submit).
+type dsPendingCmd struct {
+	kind             dsCmdKind
+	opts             uint64
+	dstPtr           uintptr
+	pageOff          int
+	dstSize          uint32
+	srcPtr           uintptr
+	srcOff           uint64
+	srcSize          uint32
+	intermediateSize uint32
+	statusArr        uintptr
+	statusIdx        int
+	fence            uintptr
+	fenceVal         uintptr
 }
 
 type dstorageState struct {
-	vfs          *VirtualFS
-	mu           sync.Mutex
-	files        map[uintptr]*os.File
-	statuses     map[uintptr]*dstorageStatus
-	pendingPages map[uintptr][]dsPendingPageReq
+	vfs           *VirtualFS
+	mu            sync.Mutex
+	files         map[uintptr]*os.File
+	statuses      map[uintptr]*dstorageStatus
+	pending       map[uintptr][]dsPendingCmd
 	readCount     atomic.Uint64
 	bytesRead     atomic.Uint64
 	pageWrites    atomic.Uint64
 	bcpackDecoded atomic.Uint64
 	bcpackWarns   atomic.Int32
+	zlibWarns     atomic.Int32
 }
 
 type dstorageStatus struct {
@@ -49,10 +68,10 @@ type dstorageStatus struct {
 
 func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 	ds := &dstorageState{
-		vfs:          vfs,
-		files:        make(map[uintptr]*os.File),
-		statuses:     make(map[uintptr]*dstorageStatus),
-		pendingPages: make(map[uintptr][]dsPendingPageReq),
+		vfs:      vfs,
+		files:    make(map[uintptr]*os.File),
+		statuses: make(map[uintptr]*dstorageStatus),
+		pending:  make(map[uintptr][]dsPendingCmd),
 	}
 
 	cbOK := syscall.NewCallback(func() uintptr { return hresultOK })
@@ -103,14 +122,34 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 	}
 
 	dsStatusProto := NewCOMObject("IDStorageStatusArrayX", 16, map[int]uintptr{
-		3: syscall.NewCallback(func(this, index uintptr) uintptr { return 1 }), // IsComplete -> TRUE
+		3: syscall.NewCallback(func(this, index uintptr) uintptr { // IsComplete
+			idx := int(uint32(index))
+			ds.mu.Lock()
+			s := ds.statuses[this]
+			ds.mu.Unlock()
+			if s != nil {
+				s.mu.Lock()
+				done := idx < 0 || idx >= len(s.results) || s.results[idx] != hresultPending
+				s.mu.Unlock()
+				if !done {
+					return 0
+				}
+			}
+			return 1
+		}),
 		4: syscall.NewCallback(func(this, index uintptr) uintptr { // GetHResult
 			idx := int(uint32(index))
 			ds.mu.Lock()
 			s := ds.statuses[this]
 			ds.mu.Unlock()
-			if s != nil && idx >= 0 && idx < len(s.results) {
-				return uintptr(s.results[idx])
+			if s != nil {
+				s.mu.Lock()
+				res := uint32(hresultOK)
+				if idx >= 0 && idx < len(s.results) {
+					res = s.results[idx]
+				}
+				s.mu.Unlock()
+				return uintptr(res)
 			}
 			return hresultOK
 		}),
@@ -131,7 +170,8 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		return obj
 	}
 
-	execDSReq := func(opts uint64, dstPtr uintptr, pageOff int, dstSize uint32, srcPtr uintptr, srcOff uint64, srcSize uint32) {
+	execDSReq := func(r dsPendingCmd) {
+		opts, dstPtr, pageOff, dstSize, srcPtr, srcOff, srcSize, interSize := r.opts, r.dstPtr, r.pageOff, r.dstSize, r.srcPtr, r.srcOff, r.srcSize, r.intermediateSize
 		if dstPtr == 0 || dstSize == 0 || srcPtr == 0 {
 			return
 		}
@@ -161,7 +201,7 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			}
 		}
 		if len(raw) == 0 {
-			slog.Warn("IDStorageQueueX!EnqueueRequest raw vide", "opts", opts, "srcSize", srcSize, "dstSize", dstSize)
+			slog.Warn("IDStorageQueueX!EnqueueRequest raw vide", "opts", fmt.Sprintf("0x%x", opts), "srcSize", srcSize, "dstSize", dstSize)
 			return
 		}
 		bcFmt := (opts & optBCPack) >> 1
@@ -172,28 +212,63 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 		} else {
 			dst = unsafe.Slice((*byte)(osPtr(dstPtr)), dstSize)
 		}
+		headHex := func(b []byte) string {
+			if len(b) > 8 {
+				b = b[:8]
+			}
+			return hex.EncodeToString(b)
+		}
 		var written int
 		if bcFmt != 0 {
 			// Ordre matériel Xbox Series : ZLIB d'abord (si combiné), puis BCPack (BC1/BC3/BC4/BC5/BC6H/BC7)
 			packed := raw
+			zlibOK := true
 			if opts&optZlib != 0 {
-				if zr, err := zlib.NewReader(bytes.NewReader(raw)); err == nil {
-					if dec, rerr := io.ReadAll(zr); rerr == nil && len(dec) > 0 {
-						packed = dec
+				zr, err := zlib.NewReader(bytes.NewReader(raw))
+				if err != nil {
+					zlibOK = false
+					if ds.bcpackWarns.Add(1) <= 8 {
+						slog.Warn("IDStorageQueueX!BCPack+ZLIB en-tête zlib invalide",
+							"opts", fmt.Sprintf("0x%x", opts), "bcFmt", bcFmt, "srcSize", len(raw),
+							"interSize", interSize, "dstSize", dstSize, "srcOff", srcOff, "head", headHex(raw), "err", err)
+					}
+				} else {
+					if interSize > 0 && interSize <= (64<<20) {
+						dec := make([]byte, interSize)
+						n, _ := io.ReadFull(zr, dec)
+						if n > 0 {
+							packed = dec[:n]
+						} else {
+							zlibOK = false
+						}
+					} else {
+						dec, _ := io.ReadAll(zr)
+						if len(dec) > 0 {
+							packed = dec
+						} else {
+							zlibOK = false
+						}
 					}
 					_ = zr.Close()
 				}
 			}
-			if err := formats.DecodeBCPack(uint8(bcFmt), packed, dst, nil); err == nil {
-				written = int(dstSize)
-				ds.bytesRead.Add(uint64(written))
-				if n := ds.bcpackDecoded.Add(1); n == 1 || n%250 == 0 {
-					slog.Info("IDStorageQueueX!BCPack décodage matériel pur Go actif", "count", n, "bcFmt", bcFmt, "srcSize", len(packed), "dstSize", dstSize)
+			if zlibOK {
+				if err := formats.DecodeBCPack(uint8(bcFmt), packed, dst, nil); err == nil {
+					written = int(dstSize)
+					ds.bytesRead.Add(uint64(written))
+					if n := ds.bcpackDecoded.Add(1); n == 1 || n%250 == 0 {
+						slog.Info("IDStorageQueueX!BCPack décodage matériel pur Go actif", "count", n, "bcFmt", bcFmt, "srcSize", len(packed), "dstSize", dstSize)
+					}
+				} else {
+					if ds.bcpackWarns.Add(1) <= 8 {
+						slog.Warn("IDStorageQueueX!EnqueueRequest BCPack erreur décodage (repli zéro)",
+							"opts", fmt.Sprintf("0x%x", opts), "bcFmt", bcFmt, "srcSize", len(packed),
+							"interSize", interSize, "dstSize", dstSize, "srcOff", srcOff, "head", headHex(packed), "err", err)
+					}
+					clear(dst)
+					written = int(dstSize)
 				}
 			} else {
-				if ds.bcpackWarns.Add(1) <= 5 {
-					slog.Warn("IDStorageQueueX!EnqueueRequest BCPack erreur décodage (repli zéro)", "bcFmt", bcFmt, "srcSize", len(packed), "dstSize", dstSize, "err", err)
-				}
 				clear(dst)
 				written = int(dstSize)
 			}
@@ -204,10 +279,17 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 				_ = zr.Close()
 				ds.bytesRead.Add(uint64(written))
 				if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
-					slog.Warn("IDStorageQueueX!EnqueueRequest zlib read err", "err", rerr, "written", written, "dstSize", dstSize)
+					if ds.zlibWarns.Add(1) <= 8 {
+						slog.Warn("IDStorageQueueX!EnqueueRequest zlib read err",
+							"opts", fmt.Sprintf("0x%x", opts), "err", rerr, "written", written, "dstSize", dstSize)
+					}
 				}
 			} else {
-				slog.Warn("IDStorageQueueX!EnqueueRequest zlib err", "err", err, "srcSize", srcSize, "dstSize", dstSize)
+				if ds.zlibWarns.Add(1) <= 8 {
+					slog.Warn("IDStorageQueueX!EnqueueRequest zlib err",
+						"opts", fmt.Sprintf("0x%x", opts), "err", err, "srcSize", srcSize, "dstSize", dstSize,
+						"interSize", interSize, "srcOff", srcOff, "head", headHex(raw))
+				}
 			}
 		} else {
 			written = copy(dst, raw)
@@ -234,15 +316,39 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			slog.Info("IDStorageQueueX!EnqueueRequest", "count", rc, "opts", opts, "srcSize", srcSize, "dstSize", dstSize, "written", written)
 		}
 	}
-	flushPendingPages := func(q uintptr) {
+	flushQueue := func(q uintptr) {
 		ds.mu.Lock()
-		reqs := ds.pendingPages[q]
-		if len(reqs) > 0 {
-			delete(ds.pendingPages, q)
+		cmds := ds.pending[q]
+		if len(cmds) > 0 {
+			delete(ds.pending, q)
 		}
 		ds.mu.Unlock()
-		for _, r := range reqs {
-			execDSReq(r.opts, r.dstPtr, r.pageOff, r.dstSize, r.srcPtr, r.srcOff, r.srcSize)
+		for _, c := range cmds {
+			switch c.kind {
+			case dsCmdRead:
+				execDSReq(c)
+			case dsCmdStatus:
+				ds.mu.Lock()
+				s := ds.statuses[c.statusArr]
+				ds.mu.Unlock()
+				if s != nil {
+					s.mu.Lock()
+					if c.statusIdx >= 0 && c.statusIdx < len(s.results) {
+						s.results[c.statusIdx] = uint32(hresultOK)
+					}
+					s.mu.Unlock()
+				}
+			case dsCmdSignal:
+				if c.fence >= 0x10000 {
+					vtbl := *(*uintptr)(osPtr(c.fence))
+					if vtbl >= 0x10000 {
+						fn := *(*uintptr)(osPtr(vtbl + 10*8)) // ID3D12Fence::Signal (slot 10)
+						if fn >= 0x10000 {
+							_, _, _ = syscall.SyscallN(fn, c.fence, c.fenceVal)
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -258,44 +364,48 @@ func bindDirectStorage(t *LiveTable, vfs *VirtualFS) {
 			srcPtr := *(*uintptr)(osPtr(reqPtr + 0x20))
 			srcOff := *(*uint64)(osPtr(reqPtr + 0x28))
 			srcSize := *(*uint32)(osPtr(reqPtr + 0x30))
+			interSize := *(*uint32)(osPtr(reqPtr + 0x34))
 
 			if dstPtr == 0 || dstSize == 0 || srcPtr == 0 {
 				slog.Warn("IDStorageQueueX!EnqueueRequest ignoré (null/zero)", "opts", opts, "dst", dstPtr, "dstSize", dstSize, "src", srcPtr, "srcSize", srcSize)
 				return 0
 			}
-			// Les requêtes PAGE_DESTINATION peuvent avoir leur tableau de pages rempli entre EnqueueRequest et Submit
-			if opts&(1<<21) != 0 {
-				ds.mu.Lock()
-				ds.pendingPages[this] = append(ds.pendingPages[this], dsPendingPageReq{
-					opts: opts, dstPtr: dstPtr, pageOff: pageOff, dstSize: dstSize,
-					srcPtr: srcPtr, srcOff: srcOff, srcSize: srcSize,
-				})
-				ds.mu.Unlock()
-				return 0
-			}
-			execDSReq(opts, dstPtr, 0, dstSize, srcPtr, srcOff, srcSize)
+			// Toutes les requêtes sont exécutées dans l'ordre FIFO exact lors de Submit() :
+			// sur Xbox Series, le jeu peut remplir les tables de pages et buffers source après EnqueueRequest.
+			ds.mu.Lock()
+			ds.pending[this] = append(ds.pending[this], dsPendingCmd{
+				kind: dsCmdRead, opts: opts, dstPtr: dstPtr, pageOff: pageOff, dstSize: dstSize,
+				srcPtr: srcPtr, srcOff: srcOff, srcSize: srcSize, intermediateSize: interSize,
+			})
+			ds.mu.Unlock()
 			return 0
 		}),
 		4: syscall.NewCallback(func(this, statusArr, index uintptr) uintptr { // EnqueueStatus (0x20)
-			flushPendingPages(this)
+			idx := int(uint32(index))
+			ds.mu.Lock()
+			if s := ds.statuses[statusArr]; s != nil {
+				s.mu.Lock()
+				if idx >= 0 && idx < len(s.results) {
+					s.results[idx] = hresultPending
+				}
+				s.mu.Unlock()
+			}
+			ds.pending[this] = append(ds.pending[this], dsPendingCmd{
+				kind: dsCmdStatus, statusArr: statusArr, statusIdx: idx,
+			})
+			ds.mu.Unlock()
 			return hresultOK
 		}),
 		5: syscall.NewCallback(func(this, fence, val uintptr) uintptr { // EnqueueSignal (0x28)
-			flushPendingPages(this)
-			if fence >= 0x10000 {
-				vtbl := *(*uintptr)(osPtr(fence))
-				if vtbl >= 0x10000 {
-					fn := *(*uintptr)(osPtr(vtbl + 10*8)) // ID3D12Fence::Signal (slot 10)
-					if fn >= 0x10000 {
-						_, _, _ = syscall.SyscallN(fn, fence, val)
-					}
-				}
-			}
-			slog.Info("IDStorageQueueX!EnqueueSignal", "fence", fence, "val", uint64(val))
+			ds.mu.Lock()
+			ds.pending[this] = append(ds.pending[this], dsPendingCmd{
+				kind: dsCmdSignal, fence: fence, fenceVal: val,
+			})
+			ds.mu.Unlock()
 			return hresultOK
 		}),
 		6: syscall.NewCallback(func(this uintptr) uintptr { // Submit (0x30)
-			flushPendingPages(this)
+			flushQueue(this)
 			return hresultOK
 		}),
 		8:  cbOK, // Close (0x40)
