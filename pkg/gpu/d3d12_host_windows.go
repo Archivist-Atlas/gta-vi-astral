@@ -141,6 +141,8 @@ type HostD3D12 struct {
 	introReached    bool
 	introLogged     bool
 	yuvFrameCount   uint32
+	lastYUVTargetVA uint64
+	framesSinceYUV  uint32
 	splashBuf       []byte
 	splashFrame     uint64
 	splashPct       float32
@@ -842,6 +844,10 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						_ = comCall(h.CmdList, 12, 3, 1, 0, 0)
 						// Affiche aussi directement la vidéo 4K sur le backbuffer hôte (rtv) et garantit Present.
 						yuvRenderedThisFrame = true
+						h.framesSinceYUV = 0
+						if curTargetVA != 0 {
+							h.lastYUVTargetVA = curTargetVA
+						}
 						skipHostPresent = false
 						if curTargetVA != 0 {
 							_ = comCall(h.CmdList, 46, 1, uintptr(unsafe.Pointer(&rtv)), 0, 0)
@@ -989,6 +995,15 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 						}
 					}
 					_ = comCall(h.CmdList, 12, uintptr(drawCnt), uintptr(d.InstanceCount), uintptr(d.StartVertex), uintptr(d.StartInstance))
+				}
+				if !yuvRenderedThisFrame && h.lastYUVTargetVA != 0 {
+					h.framesSinceYUV++
+					// Pendant la lecture vidéo Bink2 (<= 10 vrais draws, contre 15-35 pour les menus),
+					// si un PresentX tombe entre deux trames YUV, ne pas présenter une trame noire intermédiaire :
+					// garder la dernière image vidéo affichée à l'écran (0 clignotement).
+					if h.framesSinceYUV <= 10 && realDraws <= 10 {
+						skipHostPresent = true
+					}
 				}
 			}
 
