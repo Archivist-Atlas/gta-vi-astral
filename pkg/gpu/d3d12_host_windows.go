@@ -511,7 +511,9 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 			h.introReached = true
 			markIntroReached()
 			ReportBootProgress(1.0)
-			if worldLoadingActive.Load() {
+			// Ne quitte l'écran de chargement du monde qu'une fois la phase de chargement réellement
+			// entrée ET la vraie scène 3D démarrée (évite la coupure sur le fondu de sortie des menus).
+			if worldLoadingActive.Load() && worldLoadingEntered.Load() && realDraws >= 16 {
 				worldLoadingActive.Store(false)
 			}
 		} else if len(dispatches) > 0 {
@@ -524,12 +526,17 @@ func (h *HostD3D12) PresentClear(syncInterval uint32, clearColor [4]float32, pre
 				srcH = h.Height
 				srcPitch = h.Width * 4
 			}
-		} else if h.introReached && worldLoadingActive.Load() && realDraws < 8 && len(srcRGBA) == 0 && h.UploadBuf != 0 && h.UploadPtr != 0 {
-			if wl := h.renderWorldLoadingRGBA(); len(wl) > 0 {
-				srcRGBA = wl
-				srcW = h.Width
-				srcH = h.Height
-				srcPitch = h.Width * 4
+		} else if h.introReached && worldLoadingActive.Load() && realDraws < 16 && len(srcRGBA) == 0 && h.UploadBuf != 0 && h.UploadPtr != 0 {
+			if realDraws < 8 {
+				worldLoadingEntered.Store(true)
+			}
+			if worldLoadingEntered.Load() {
+				if wl := h.renderWorldLoadingRGBA(); len(wl) > 0 {
+					srcRGBA = wl
+					srcW = h.Width
+					srcH = h.Height
+					srcPitch = h.Width * 4
+				}
 			}
 		}
 

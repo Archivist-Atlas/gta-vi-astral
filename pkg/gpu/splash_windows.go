@@ -21,6 +21,7 @@ var (
 	bootProgressMilli    atomic.Int32 // 0..1000 (0.0% .. 100.0%)
 	bootDSReads          atomic.Uint64
 	worldLoadingActive   atomic.Bool
+	worldLoadingEntered  atomic.Bool
 	worldLoadBaseReads   atomic.Uint64
 	worldShadersCompiled atomic.Uint64
 
@@ -33,6 +34,7 @@ var (
 // ReportWorldLoadingStarted active l'écran de chargement du monde (story000) avec progression en direct.
 func ReportWorldLoadingStarted(curReads uint64) {
 	if worldLoadingActive.CompareAndSwap(false, true) {
+		worldLoadingEntered.Store(false)
 		worldLoadBaseReads.Store(curReads)
 	}
 }
@@ -373,11 +375,9 @@ func (h *HostD3D12) renderWorldLoadingRGBA() []byte {
 		}
 	}
 
-	// Texte de statut centré sous la barre : titre + pourcentage + télémétrie temps réel
+	// Texte de statut centré sous la barre : uniquement le texte de chargement et le pourcentage
 	title := fmt.Sprintf("CHARGEMENT DU MONDE  %d%%", int(pct*100))
-	sub := fmt.Sprintf("DIRECTSTORAGE %d   SHADERS 3D %d", curReads, worldShadersCompiled.Load())
-	drawSplashTextCentered(h.splashBuf, w, ht, w/2, barY+barH+22, 3, title, 245, 240, 255)
-	drawSplashTextCentered(h.splashBuf, w, ht, w/2, barY+barH+56, 2, sub, 192, 168, 245)
+	drawSplashTextCentered(h.splashBuf, w, ht, w/2, barY+barH+26, 3, title, 245, 240, 255)
 
 	return h.splashBuf
 }
